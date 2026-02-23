@@ -22,6 +22,7 @@ from rllm.trainer.verl.ray_runtime_env import get_ppo_ray_runtime_env
 
 # Import our custom trainer
 from trainers.multi_episode_trainer import MultiEpisodeAgentPPOTrainer
+from trainers.sdpo_self_distill_trainer import JointSDPOSelfDistillTrainer
 
 
 def run_ppo_agent(
@@ -237,8 +238,15 @@ class MultiEpisodeTaskRunner:
             if config.rllm.agent.get("agent_args") is not None:
                 agent_args.update(config.rllm.agent.get("agent_args"))
 
-            # Use MultiEpisodeAgentPPOTrainer instead of AgentPPOTrainer
-            trainer = MultiEpisodeAgentPPOTrainer(
+            use_distill = bool(
+                hasattr(config, "rllm")
+                and config.rllm.get("distill") is not None
+                and config.rllm.distill.get("enable", False)
+            )
+            trainer_cls = JointSDPOSelfDistillTrainer if use_distill else MultiEpisodeAgentPPOTrainer
+
+            # Use custom trainer instead of AgentPPOTrainer
+            trainer = trainer_cls(
                 config=config,
                 tokenizer=tokenizer,
                 role_worker_mapping=role_worker_mapping,
