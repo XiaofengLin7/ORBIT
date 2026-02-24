@@ -41,6 +41,7 @@ class DistillSettings:
     context_limit: int | None = None
     context_overflow_policy: str = "skip_loss"
     min_distill_tokens: int = 1
+    teacher_context_attempts: int | None = None
 
 
 @dataclass
@@ -55,25 +56,71 @@ class DistillPayload:
     kept_samples: int
 
 
-def serialize_retry_feedback(step_records: Sequence[dict[str, Any]]) -> str:
-    """Serialize retry attempts into a compact feedback text.
+def build_hindsight_prompt_tokens_first_n_complete_attempts(
+    step_records: Sequence[dict[str, Any]],
+    teacher_context_attempts: int | None,
+) -> torch.Tensor | None:
+    """Construct hindsight context from first-N complete attempts.
 
     Args:
         step_records: Step-level records from rollout engine.
+        teacher_context_attempts: Number of complete attempts to include. If
+            ``None``, include all transition-confirmed complete attempts.
 
     Returns:
-        Serialized feedback text built from episodes with index > 0.
+        Tensor prompt tokens for denominator context, or ``None`` when records
+        are malformed, non-cumulative, or insufficient complete attempts exist.
     """
-    lines: list[str] = []
-    for idx, step in enumerate(step_records):
-        episode_index = int(step.get("episode_index", 0))
-        if episode_index <= 0:
-            continue
-        response = str(step.get("response", "")).strip()
-        if not response:
-            continue
-        lines.append(f"[Episode {episode_index + 1} Step {idx + 1}] {response}")
-    return "\n".join(lines)
+    if not step_records:
+        return None
+
+    first_prompt_ids = step_records[0].get("prompt_ids", [])
+    first_completion_ids = step_records[0].get("completion_ids", [])
+    if not isinstance(first_prompt_ids, list) or not isinstance(first_completion_ids, list):
+        return None
+
+    first_episode_index = step_records[0].get("episode_index", 0)
+    try:
+        prev_episode_index = int(first_episode_index)
+    except (TypeError, ValueError):
+        return None
+
+    accumulated = list(first_prompt_ids) + list(first_completion_ids)
+    complete_attempt_contexts: list[list[int]] = []
+    for step in step_records[1:]:
+        current_prompt_ids = step.get("prompt_ids", [])
+        current_completion_ids = step.get("completion_ids", [])
+        current_episode_index_raw = step.get("episode_index", prev_episode_index)
+        if not isinstance(current_prompt_ids, list) or not isinstance(current_completion_ids, list):
+            return None
+        try:
+            current_episode_index = int(current_episode_index_raw)
+        except (TypeError, ValueError):
+            return None
+        if current_episode_index < prev_episode_index:
+            return None
+        if len(current_prompt_ids) < len(accumulated):
+            return None
+        if current_prompt_ids[: len(accumulated)] != accumulated:
+            return None
+
+        if current_episode_index > prev_episode_index:
+            complete_attempt_contexts.append(list(current_prompt_ids))
+
+        accumulated = current_prompt_ids + list(current_completion_ids)
+        prev_episode_index = current_episode_index
+
+    if not complete_attempt_contexts:
+        return None
+
+    if teacher_context_attempts is None:
+        selected_context = complete_attempt_contexts[-1]
+    else:
+        if len(complete_attempt_contexts) < teacher_context_attempts:
+            return None
+        selected_context = complete_attempt_contexts[teacher_context_attempts - 1]
+
+    return torch.as_tensor(selected_context, dtype=torch.long)
 
 
 def estimate_student_context_len(step_records: Sequence[dict[str, Any]]) -> int:
@@ -161,10 +208,18 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
     def _load_distill_settings(self) -> DistillSettings:
         """Load distillation settings from config with robust defaults."""
-        default_limit = int(self.config.data.max_prompt_length)
+        default_limit = int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length)
         cfg = self.config.rllm.get("distill", {})
         if cfg is None:
             cfg = {}
+        teacher_context_attempts_raw = cfg.get("teacher_context_attempts", None)
+        teacher_context_attempts = (
+            int(teacher_context_attempts_raw) if teacher_context_attempts_raw is not None else None
+        )
+        if teacher_context_attempts is not None and teacher_context_attempts < 1:
+            raise ValueError(
+                f"rllm.distill.teacher_context_attempts must be >= 1 when provided, got {teacher_context_attempts}"
+            )
         return DistillSettings(
             enable=bool(cfg.get("enable", False)),
             lambda_coef=float(cfg.get("lambda", 0.1)),
@@ -173,6 +228,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             context_limit=int(cfg.get("context_limit", default_limit)) if cfg.get("context_limit", None) is not None else default_limit,
             context_overflow_policy=str(cfg.get("context_overflow_policy", "skip_loss")),
             min_distill_tokens=int(cfg.get("min_distill_tokens", 1)),
+            teacher_context_attempts=teacher_context_attempts,
         )
 
     def _transform_agent_trajectories(
@@ -203,14 +259,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         final_gen_batch_output.batch["first_attempt_response_mask"] = first_attempt_masks
         return final_gen_batch_output, metrics
 
-    @staticmethod
-    def _extract_prompt_tokens(prompt_row: torch.Tensor, pad_token_id: int) -> torch.Tensor:
-        """Return non-padding prompt tokens from a left-padded prompt row."""
-        non_pad = prompt_row != pad_token_id
-        if not torch.any(non_pad):
-            return torch.empty(0, dtype=torch.long)
-        return prompt_row[non_pad]
-
     def _prepare_distill_payload(self, batch: DataProto) -> tuple[DistillPayload | None, dict[str, float]]:
         """Prepare numerator/denominator batches and token masks for distillation."""
         if not self.distill_settings.enable:
@@ -218,6 +266,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         if not self._latest_token_trajectories:
             return None, {
                 "distill/skipped_context_overflow": 0.0,
+                "distill/skipped_hindsight_unavailable": 0.0,
                 "distill/kept_ratio": 0.0,
             }
 
@@ -226,6 +275,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         if first_attempt_mask is None:
             return None, {
                 "distill/skipped_context_overflow": 0.0,
+                "distill/skipped_hindsight_unavailable": 0.0,
                 "distill/kept_ratio": 0.0,
             }
         first_attempt_mask = first_attempt_mask.float()
@@ -233,10 +283,15 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         total_samples = min(len(self._latest_token_trajectories), batch.batch["responses"].shape[0])
         kept_indices: list[int] = []
-        feedback_tokens_per_sample: list[torch.Tensor] = []
+        teacher_prompt_tokens_per_sample: list[torch.Tensor] = []
         skipped_context_overflow = 0
+        skipped_hindsight_unavailable = 0
 
-        limit = int(self.distill_settings.context_limit or self.config.data.max_prompt_length)
+        limit = int(
+            self.distill_settings.context_limit
+            if self.distill_settings.context_limit is not None
+            else (int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length))
+        )
         if self.distill_settings.context_overflow_policy != "skip_loss":
             raise ValueError(
                 f"Unsupported context_overflow_policy={self.distill_settings.context_overflow_policy}. "
@@ -249,17 +304,18 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
             step_records = self._latest_token_trajectories[i].get("step_records", [])
             if not isinstance(step_records, list):
+                skipped_hindsight_unavailable += 1
                 continue
 
             student_context_len = estimate_student_context_len(step_records)
-            feedback_text = serialize_retry_feedback(step_records)
-            if feedback_text:
-                feedback_text = f"\n\n[Retry Feedback]\n{feedback_text}"
-            feedback_tokens = torch.as_tensor(
-                self.tokenizer.encode(feedback_text, add_special_tokens=False),
-                dtype=torch.long,
+            teacher_prompt_tokens = build_hindsight_prompt_tokens_first_n_complete_attempts(
+                step_records=step_records,
+                teacher_context_attempts=self.distill_settings.teacher_context_attempts,
             )
-            teacher_context_len = student_context_len + int(feedback_tokens.numel())
+            if teacher_prompt_tokens is None:
+                skipped_hindsight_unavailable += 1
+                continue
+            teacher_context_len = int(teacher_prompt_tokens.numel())
 
             if should_skip_context_overflow(
                 student_context_len=student_context_len,
@@ -270,11 +326,12 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 continue
 
             kept_indices.append(i)
-            feedback_tokens_per_sample.append(feedback_tokens)
+            teacher_prompt_tokens_per_sample.append(teacher_prompt_tokens)
 
         if not kept_indices:
             return None, {
                 "distill/skipped_context_overflow": float(skipped_context_overflow),
+                "distill/skipped_hindsight_unavailable": float(skipped_hindsight_unavailable),
                 "distill/kept_ratio": 0.0,
             }
 
@@ -282,32 +339,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         selected_den = batch.select_idxs(np.array(kept_indices))
 
         pad_token_id = int(self.tokenizer.pad_token_id)
-        max_prompt_len = int(self.config.data.max_prompt_length)
-        prompt_rows: list[torch.Tensor] = []
-        keep_mask_after_prompt_check: list[bool] = []
-        for row_idx in range(selected.batch["prompts"].shape[0]):
-            base_prompt_tokens = self._extract_prompt_tokens(
-                selected.batch["prompts"][row_idx],
-                pad_token_id=pad_token_id,
-            )
-            den_prompt_tokens = torch.cat([base_prompt_tokens, feedback_tokens_per_sample[row_idx]], dim=0)
-            if int(den_prompt_tokens.numel()) > max_prompt_len:
-                keep_mask_after_prompt_check.append(False)
-                skipped_context_overflow += 1
-                continue
-            keep_mask_after_prompt_check.append(True)
-            prompt_rows.append(den_prompt_tokens)
-
-        if not any(keep_mask_after_prompt_check):
-            return None, {
-                "distill/skipped_context_overflow": float(skipped_context_overflow),
-                "distill/kept_ratio": 0.0,
-            }
-
-        keep_local_indices = np.nonzero(np.asarray(keep_mask_after_prompt_check, dtype=bool))[0]
-        selected = selected.select_idxs(keep_local_indices)
-        selected_den = selected_den.select_idxs(keep_local_indices)
-        selected_distill_mask = distill_mask[np.array(kept_indices)][keep_local_indices]
+        prompt_rows: list[torch.Tensor] = teacher_prompt_tokens_per_sample
+        selected_distill_mask = distill_mask[np.array(kept_indices)]
+        max_prompt_len = max(int(x.numel()) for x in prompt_rows)
 
         denom_prompts = torch.full(
             (len(prompt_rows), max_prompt_len),
@@ -342,6 +376,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         )
         metrics = {
             "distill/skipped_context_overflow": float(skipped_context_overflow),
+            "distill/skipped_hindsight_unavailable": float(skipped_hindsight_unavailable),
             "distill/kept_ratio": float(kept_samples / max(1, total_samples)),
         }
         return payload, metrics

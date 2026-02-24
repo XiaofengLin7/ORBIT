@@ -26,6 +26,7 @@ from trainers.sdpo_self_distill_trainer import (
     DistillPayload,
     DistillSettings,
     JointSDPOSelfDistillTrainer,
+    build_hindsight_prompt_tokens_first_n_complete_attempts,
     compute_sdpo_advantages,
     should_skip_context_overflow,
 )
@@ -35,15 +36,8 @@ class _DummyTokenizer:
     pad_token_id = 0
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        if not text:
-            return []
-        if "fb_over" in text:
-            return [1, 2]
-        if "fb_eq" in text:
-            return [1]
-        if "fb_keep" in text:
-            return [1]
-        return [1]
+        del text, add_special_tokens
+        return []
 
 
 class _FakeDataProto:
@@ -94,6 +88,7 @@ def _build_trainer_for_unit_tests() -> JointSDPOSelfDistillTrainer:
         lambda_coef=0.1,
         context_limit=7,
         min_distill_tokens=1,
+        teacher_context_attempts=None,
     )
     trainer._latest_token_trajectories = []
     return trainer
@@ -102,6 +97,49 @@ def _build_trainer_for_unit_tests() -> JointSDPOSelfDistillTrainer:
 def test_context_overflow_guard_gt_and_eq() -> None:
     assert should_skip_context_overflow(3, 5, 7) is True
     assert should_skip_context_overflow(3, 4, 7) is False
+
+
+def test_build_hindsight_prompt_tokens_first_n_complete_attempts_success() -> None:
+    step_records = [
+        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
+        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
+        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 2},
+        {"prompt_ids": [1, 2, 3, 4, 5, 6, 7], "completion_ids": [8], "episode_index": 2},
+    ]
+    hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=2,
+    )
+    assert hindsight is not None
+    assert hindsight.tolist() == [1, 2, 3, 4, 5]
+
+
+def test_build_hindsight_prompt_tokens_first_n_complete_attempts_insufficient_returns_none() -> None:
+    step_records = [
+        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
+        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
+        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 1},
+    ]
+    hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=2,
+    )
+    assert hindsight is None
+
+
+def test_build_hindsight_prompt_tokens_first_n_complete_attempts_null_uses_all_complete_only() -> None:
+    step_records = [
+        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
+        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
+        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 2},
+        {"prompt_ids": [1, 2, 3, 4, 5, 6, 7], "completion_ids": [8], "episode_index": 2},
+    ]
+    hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=None,
+    )
+    assert hindsight is not None
+    assert hindsight.tolist() == [1, 2, 3, 4, 5]
 
 
 def test_sdpo_advantages_are_detached_and_masked() -> None:
@@ -124,23 +162,43 @@ def test_sdpo_advantages_are_detached_and_masked() -> None:
 
 def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     trainer = _build_trainer_for_unit_tests()
+    trainer.distill_settings.context_limit = 12
+    trainer.distill_settings.teacher_context_attempts = 2
     trainer._latest_token_trajectories = [
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2, 3, 4], "response": "first"},
-                {"episode_index": 1, "prompt_ids": [1], "response": "fb_over"},
+                {"episode_index": 0, "prompt_ids": [1, 2, 3, 4], "completion_ids": [10], "response": "first"},
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 3, 4, 10, 11, 12],
+                    "completion_ids": [13],
+                    "response": "retry",
+                },
+                {
+                    "episode_index": 2,
+                    "prompt_ids": [1, 2, 3, 4, 10, 11, 12, 13, 14, 15],
+                    "completion_ids": [16],
+                    "response": "retry",
+                },
             ]
         },
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2, 3], "response": "first"},
-                {"episode_index": 1, "prompt_ids": [1], "response": "fb_eq"},
+                {"episode_index": 0, "prompt_ids": [8, 9], "completion_ids": [10], "response": "first"},
+                {"episode_index": 1, "prompt_ids": [8, 9, 10, 11], "completion_ids": [12], "response": "retry"},
             ]
         },
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2], "response": "first"},
-                {"episode_index": 1, "prompt_ids": [1], "response": "fb_keep"},
+                {"episode_index": 0, "prompt_ids": [1, 2], "completion_ids": [3], "response": "first"},
+                {"episode_index": 1, "prompt_ids": [1, 2, 3, 4], "completion_ids": [5], "response": "retry"},
+                {"episode_index": 2, "prompt_ids": [1, 2, 3, 4, 5, 6], "completion_ids": [7], "response": "retry"},
+                {
+                    "episode_index": 2,
+                    "prompt_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+                    "completion_ids": [9],
+                    "response": "retry",
+                },
             ]
         },
     ]
@@ -194,11 +252,13 @@ def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
 
     assert payload is not None
     assert payload.total_samples == 3
-    assert payload.kept_samples == 2
+    assert payload.kept_samples == 1
     assert payload.skipped_context_overflow == 1
-    assert payload.distill_mask.shape[0] == 2
+    assert payload.distill_mask.shape[0] == 1
     assert metrics["distill/skipped_context_overflow"] == 1.0
-    assert abs(metrics["distill/kept_ratio"] - (2.0 / 3.0)) < 1e-6
+    assert metrics["distill/skipped_hindsight_unavailable"] == 1.0
+    assert abs(metrics["distill/kept_ratio"] - (1.0 / 3.0)) < 1e-6
+    assert payload.denominator_batch.batch["prompts"][0, -6:].tolist() == [1, 2, 3, 4, 5, 6]
 
 
 def test_run_distill_update_only_runs_on_nonempty_payload() -> None:

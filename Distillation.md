@@ -8,7 +8,7 @@ At each training step:
 1. Run the normal teacher PPO update on full rollout data.
 2. Run one auxiliary distillation actor update on first-attempt tokens only.
 
-Distillation is skipped per sample when the context-overflow guard is triggered.
+Distillation can be skipped when context-overflow is triggered, hindsight context is unavailable, or the batch has insufficient valid distill tokens.
 
 ## Scope
 
@@ -31,6 +31,7 @@ rllm:
     lambda: 0.1
     mode: sdpo_self
     denominator_mode: teacher_adapted_feedback
+    teacher_context_attempts: null
     context_limit: null
     context_overflow_policy: skip_loss
     min_distill_tokens: 1
@@ -41,7 +42,8 @@ Semantics:
 - `lambda`: scales distill advantages.
 - `mode`: currently supports `sdpo_self`.
 - `denominator_mode`: currently `teacher_adapted_feedback`.
-- `context_limit`: if `null`, defaults to `data.max_prompt_length`.
+- `teacher_context_attempts`: if set to `N`, require at least `N` transition-confirmed complete attempts and use only the first `N`; if `null`, use all transition-confirmed complete attempts.
+- `context_limit`: if `null`, defaults to `data.max_prompt_length + data.max_response_length`.
 - `context_overflow_policy`: currently supports only `skip_loss`.
 - `min_distill_tokens`: skip auxiliary update when valid token count is below threshold.
 
@@ -58,7 +60,7 @@ These are produced in `AgentExecutionEngine` token mode.
 For valid tokens, compute:
 
 - Numerator log-prob: `log πθ(a_t | x, y<t)`
-- Denominator log-prob: `log πθ(a_t | x, f, y<t)`
+- Denominator log-prob: `log πθ(a_t | x, c_{N+1}, y<t)` (practical prompt-context approximation)
 - Coefficient:
   - `c_t = stopgrad(logp_num - logp_den)`
 - Distill advantage:
@@ -74,19 +76,30 @@ Per sample:
 
 1. Estimate student context length `L_s` from first-attempt `step_records` as:
    - max prompt length over `episode_index == 0` steps.
-2. Serialize retry feedback `f` from `episode_index > 0` steps.
-3. Tokenize feedback and estimate teacher context length:
-   - `L_t = L_s + len(tokenize(f))`
+2. Reconstruct teacher hindsight context from raw `step_records` using transition-confirmed complete attempts:
+   - validate cumulative token consistency across steps
+   - detect completion only when `episode_index` increases between adjacent steps
+   - each detected completion contributes a candidate context equal to the next step `prompt_ids`
+   - if `teacher_context_attempts = N`, select candidate `N`
+   - if `teacher_context_attempts = null`, select the last candidate (all complete attempts)
+   - trailing partial attempt is excluded because it has no later episode transition
+3. Estimate teacher context length:
+   - `L_t = len(selected_teacher_context_tokens)`
 4. Determine limit:
-   - `limit = rllm.distill.context_limit or data.max_prompt_length`
+   - `limit = rllm.distill.context_limit or (data.max_prompt_length + data.max_response_length)`
 5. Guard:
    - if `L_s + L_t > limit`, skip distillation for this sample.
+   - if hindsight reconstruction is invalid/malformed or complete attempts are insufficient, skip distillation for this sample.
 
 Boundary behavior:
 - `L_s + L_t > limit`: skip.
 - `L_s + L_t == limit`: keep.
 
-Overflow policy is strict skip-only (no truncation fallback).
+Overflow policy is strict skip-only (no truncation fallback), while preserving raw trajectory tokens for teacher context.
+
+Note:
+- The method target is exact reverse-KL.
+- The implementation uses the existing practical SDPO-style detached log-ratio surrogate (`compute_sdpo_advantages`) and does not add exact per-token reverse-KL recomputation.
 
 ## Training Flow
 
@@ -104,6 +117,7 @@ Primary distill metrics:
 - `distill/sdpo_loss`
 - `distill/token_count`
 - `distill/skipped_context_overflow`
+- `distill/skipped_hindsight_unavailable`
 - `distill/kept_ratio`
 
 Additional diagnostics:
@@ -116,6 +130,8 @@ Additional diagnostics:
 
 Added tests:
 - `tests/test_sdpo_self_distill.py`
+  - full hindsight `c_{N+1}` reconstruction from raw step tokens
+  - malformed hindsight reconstruction skip path
   - overflow guard (`>` vs `==`)
   - SDPO detach + masking behavior
   - mixed batch partial skip + metric counts
@@ -131,4 +147,3 @@ Run in project environment:
 conda activate icx
 pytest -q tests/test_sdpo_self_distill.py tests/test_agent_execution_engine_distill.py
 ```
-
