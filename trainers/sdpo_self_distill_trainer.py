@@ -5,9 +5,9 @@ performs:
 1. Standard teacher RL update on full multi-episode rollouts.
 2. SDPO-style auxiliary actor update over first-attempt tokens only.
 
-Distillation uses a strict context-overflow guard: if
-``student_context_len + teacher_context_len > context_limit``,
-the sample is excluded from distillation.
+Distillation uses a strict context-overflow guard on denominator scoring length:
+``L_den = len(teacher_prompt_tokens) + len(first_attempt_sequence_tokens)``.
+If ``L_den > context_limit``, the sample is excluded from distillation.
 """
 
 from __future__ import annotations
@@ -123,36 +123,51 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
     return torch.as_tensor(selected_context, dtype=torch.long)
 
 
-def estimate_student_context_len(step_records: Sequence[dict[str, Any]]) -> int:
-    """Estimate student context length for first-attempt rollout tokens.
-
-    We approximate ``len(tokenize(x, y<t_max))`` using the largest prompt length
-    observed among first-attempt steps.
-
-    Args:
-        step_records: Step-level records from rollout engine.
-
-    Returns:
-        Estimated context length in tokens.
-    """
-    prompt_lens: list[int] = []
-    for step in step_records:
-        episode_index = int(step.get("episode_index", 0))
-        if episode_index != 0:
-            continue
-        prompt_ids = step.get("prompt_ids", [])
-        if isinstance(prompt_ids, list):
-            prompt_lens.append(len(prompt_ids))
-    return max(prompt_lens, default=0)
-
-
-def should_skip_context_overflow(
-    student_context_len: int,
-    teacher_context_len: int,
+def should_skip_denominator_overflow(
+    teacher_prompt_len: int,
+    first_attempt_sequence_len: int,
     context_limit: int,
 ) -> bool:
-    """Return whether SDPO distillation should be skipped for overflow."""
-    return (student_context_len + teacher_context_len) > context_limit
+    """Return whether SDPO distillation should be skipped for overflow.
+
+    The denominator-scored sequence length is:
+    ``L_den = len(teacher_prompt_tokens) + len(first_attempt_sequence_tokens)``.
+    """
+    return (teacher_prompt_len + first_attempt_sequence_len) > context_limit
+
+
+def extract_first_attempt_prefix(
+    response_tokens: torch.Tensor,
+    response_mask: torch.Tensor,
+    first_attempt_response_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Extract first-attempt prefix sequence and aligned masks.
+
+    The prefix ends at the last token position where
+    ``first_attempt_response_mask == 1`` (and valid by ``response_mask``). This
+    keeps interleaved env/model tokens that appear before that endpoint.
+
+    Args:
+        response_tokens: Response token row for one sample.
+        response_mask: Valid response-token mask for one sample.
+        first_attempt_response_mask: First-attempt model-token mask for one sample.
+
+    Returns:
+        Tuple ``(prefix_tokens, prefix_response_mask, prefix_distill_mask)`` or
+        ``None`` when no valid first-attempt token exists.
+    """
+    valid_first_attempt = (first_attempt_response_mask > 0) & (response_mask > 0)
+    valid_positions = torch.nonzero(valid_first_attempt, as_tuple=False).flatten()
+    if valid_positions.numel() == 0:
+        return None
+
+    prefix_len = int(valid_positions[-1].item()) + 1
+    prefix_tokens = response_tokens[:prefix_len]
+    prefix_response_mask = response_mask[:prefix_len].long()
+    prefix_distill_mask = (
+        response_mask[:prefix_len].float() * first_attempt_response_mask[:prefix_len].float()
+    )
+    return prefix_tokens, prefix_response_mask, prefix_distill_mask
 
 
 def compute_sdpo_advantages(
@@ -284,6 +299,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         total_samples = min(len(self._latest_token_trajectories), batch.batch["responses"].shape[0])
         kept_indices: list[int] = []
         teacher_prompt_tokens_per_sample: list[torch.Tensor] = []
+        first_attempt_prefix_response_tokens_per_sample: list[torch.Tensor] = []
+        first_attempt_prefix_response_masks_per_sample: list[torch.Tensor] = []
+        first_attempt_prefix_distill_masks_per_sample: list[torch.Tensor] = []
         skipped_context_overflow = 0
         skipped_hindsight_unavailable = 0
 
@@ -307,7 +325,19 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 skipped_hindsight_unavailable += 1
                 continue
 
-            student_context_len = estimate_student_context_len(step_records)
+            first_attempt_prefix = extract_first_attempt_prefix(
+                response_tokens=batch.batch["responses"][i],
+                response_mask=response_mask[i],
+                first_attempt_response_mask=first_attempt_mask[i],
+            )
+            if first_attempt_prefix is None:
+                continue
+            (
+                prefix_response_tokens,
+                prefix_response_mask,
+                prefix_distill_mask,
+            ) = first_attempt_prefix
+
             teacher_prompt_tokens = build_hindsight_prompt_tokens_first_n_complete_attempts(
                 step_records=step_records,
                 teacher_context_attempts=self.distill_settings.teacher_context_attempts,
@@ -316,10 +346,11 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 skipped_hindsight_unavailable += 1
                 continue
             teacher_context_len = int(teacher_prompt_tokens.numel())
+            first_attempt_prefix_len = int(prefix_response_tokens.numel())
 
-            if should_skip_context_overflow(
-                student_context_len=student_context_len,
-                teacher_context_len=teacher_context_len,
+            if should_skip_denominator_overflow(
+                teacher_prompt_len=teacher_context_len,
+                first_attempt_sequence_len=first_attempt_prefix_len,
                 context_limit=limit,
             ):
                 skipped_context_overflow += 1
@@ -327,6 +358,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
             kept_indices.append(i)
             teacher_prompt_tokens_per_sample.append(teacher_prompt_tokens)
+            first_attempt_prefix_response_tokens_per_sample.append(prefix_response_tokens)
+            first_attempt_prefix_response_masks_per_sample.append(prefix_response_mask)
+            first_attempt_prefix_distill_masks_per_sample.append(prefix_distill_mask)
 
         if not kept_indices:
             return None, {
@@ -340,8 +374,10 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         pad_token_id = int(self.tokenizer.pad_token_id)
         prompt_rows: list[torch.Tensor] = teacher_prompt_tokens_per_sample
-        selected_distill_mask = distill_mask[np.array(kept_indices)]
         max_prompt_len = max(int(x.numel()) for x in prompt_rows)
+        max_response_len = max(
+            int(x.numel()) for x in first_attempt_prefix_response_tokens_per_sample
+        )
 
         denom_prompts = torch.full(
             (len(prompt_rows), max_prompt_len),
@@ -351,19 +387,53 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         for i, row in enumerate(prompt_rows):
             denom_prompts[i, -row.numel() :] = row
 
-        responses = selected_den.batch["responses"]
-        response_attention = selected_den.batch["attention_mask"][:, -responses.shape[1] :]
+        responses = torch.full(
+            (len(prompt_rows), max_response_len),
+            fill_value=pad_token_id,
+            dtype=torch.long,
+        )
+        prefix_response_mask = torch.zeros(
+            (len(prompt_rows), max_response_len),
+            dtype=torch.long,
+        )
+        selected_distill_mask = torch.zeros(
+            (len(prompt_rows), max_response_len),
+            dtype=torch.float32,
+        )
+        for i, row in enumerate(first_attempt_prefix_response_tokens_per_sample):
+            row_len = int(row.numel())
+            responses[i, :row_len] = row
+            prefix_response_mask[i, :row_len] = first_attempt_prefix_response_masks_per_sample[i]
+            selected_distill_mask[i, :row_len] = first_attempt_prefix_distill_masks_per_sample[i]
+
+        # Numerator batch uses original prompt context with first-attempt prefix responses.
+        numerator_prompts = selected.batch["prompts"]
+        original_response_len = int(selected.batch["responses"].shape[1])
+        numerator_prompt_attention = selected.batch["attention_mask"][:, :-original_response_len]
+        numerator_attention_mask = torch.cat([numerator_prompt_attention.long(), prefix_response_mask], dim=1)
+        numerator_position_ids = (torch.cumsum(numerator_attention_mask, dim=1) - 1) * numerator_attention_mask
+        numerator_input_ids = torch.cat([numerator_prompts, responses], dim=1)
+
+        selected.batch["responses"] = responses
+        selected.batch["response_mask"] = prefix_response_mask
+        selected.batch["input_ids"] = numerator_input_ids
+        selected.batch["attention_mask"] = numerator_attention_mask
+        selected.batch["position_ids"] = numerator_position_ids
+
+        # Denominator batch uses teacher hindsight prompt with same first-attempt prefix responses.
         prompt_lens = torch.as_tensor([int(x.numel()) for x in prompt_rows], dtype=torch.long)
         prompt_pos = torch.arange(max_prompt_len).unsqueeze(0)
-        prompt_attention = (prompt_pos >= (max_prompt_len - prompt_lens.unsqueeze(1))).long()
-        attention_mask = torch.cat([prompt_attention, response_attention], dim=1)
-        position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask
-        input_ids = torch.cat([denom_prompts, responses], dim=1)
+        denominator_prompt_attention = (prompt_pos >= (max_prompt_len - prompt_lens.unsqueeze(1))).long()
+        denominator_attention_mask = torch.cat([denominator_prompt_attention, prefix_response_mask], dim=1)
+        denominator_position_ids = (torch.cumsum(denominator_attention_mask, dim=1) - 1) * denominator_attention_mask
+        denominator_input_ids = torch.cat([denom_prompts, responses], dim=1)
 
         selected_den.batch["prompts"] = denom_prompts
-        selected_den.batch["input_ids"] = input_ids
-        selected_den.batch["attention_mask"] = attention_mask
-        selected_den.batch["position_ids"] = position_ids
+        selected_den.batch["responses"] = responses
+        selected_den.batch["response_mask"] = prefix_response_mask
+        selected_den.batch["input_ids"] = denominator_input_ids
+        selected_den.batch["attention_mask"] = denominator_attention_mask
+        selected_den.batch["position_ids"] = denominator_position_ids
 
         kept_samples = int(selected.batch["responses"].shape[0])
         payload = DistillPayload(
@@ -395,6 +465,45 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             batch.batch["returns"][original_size:] = 0
         return batch
 
+    def _pad_distill_inputs_to_world_size(
+        self,
+        numerator_batch: DataProto,
+        denominator_batch: DataProto,
+        distill_mask: torch.Tensor,
+        world_size: int,
+    ) -> tuple[DataProto, DataProto, torch.Tensor]:
+        """Pad distillation inputs to world-size divisor and zero out padded mask rows."""
+        if len(numerator_batch) != len(denominator_batch):
+            raise ValueError(
+                "Numerator and denominator batch sizes must match for distillation. "
+                f"Got {len(numerator_batch)} and {len(denominator_batch)}."
+            )
+        if int(distill_mask.shape[0]) != len(numerator_batch):
+            raise ValueError(
+                "distill_mask first dimension must match distill batch size. "
+                f"Got {int(distill_mask.shape[0])} and {len(numerator_batch)}."
+            )
+
+        numerator_batch, num_pad_size = pad_dataproto_to_divisor(numerator_batch, world_size)
+        denominator_batch, den_pad_size = pad_dataproto_to_divisor(denominator_batch, world_size)
+        if num_pad_size != den_pad_size:
+            raise RuntimeError(
+                "Numerator/denominator padding mismatch. "
+                f"Got num_pad_size={num_pad_size}, den_pad_size={den_pad_size}."
+            )
+        if num_pad_size <= 0:
+            return numerator_batch, denominator_batch, distill_mask
+
+        mask_pad_shape = (num_pad_size, *distill_mask.shape[1:])
+        distill_mask = torch.cat(
+            [
+                distill_mask,
+                torch.zeros(mask_pad_shape, dtype=distill_mask.dtype, device=distill_mask.device),
+            ],
+            dim=0,
+        )
+        return numerator_batch, denominator_batch, distill_mask
+
     def _run_distill_update(
         self,
         payload: DistillPayload | None,
@@ -420,21 +529,28 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 "distill/skipped_batches": 1.0,
             }
 
+        numerator_batch, denominator_batch, distill_mask = self._pad_distill_inputs_to_world_size(
+            numerator_batch=payload.numerator_batch,
+            denominator_batch=payload.denominator_batch,
+            distill_mask=payload.distill_mask,
+            world_size=self.actor_rollout_wg.world_size,
+        )
+
         with marked_timer("distill_num_log_prob", timing_raw):
-            numerator_log_prob = self.actor_rollout_wg.compute_log_prob(payload.numerator_batch)
+            numerator_log_prob = self.actor_rollout_wg.compute_log_prob(numerator_batch)
         with marked_timer("distill_den_log_prob", timing_raw):
-            denominator_log_prob = self.actor_rollout_wg.compute_log_prob(payload.denominator_batch)
+            denominator_log_prob = self.actor_rollout_wg.compute_log_prob(denominator_batch)
 
         num_lp = numerator_log_prob.batch["old_log_probs"]
         den_lp = denominator_log_prob.batch["old_log_probs"]
         distill_adv, stats = compute_sdpo_advantages(
             numerator_log_probs=num_lp,
             denominator_log_probs=den_lp,
-            distill_mask=payload.distill_mask,
+            distill_mask=distill_mask,
             lambda_coef=self.distill_settings.lambda_coef,
         )
 
-        distill_batch = payload.numerator_batch.union(numerator_log_prob)
+        distill_batch = numerator_batch.union(numerator_log_prob)
         distill_batch.batch["advantages"] = distill_adv
         distill_batch.batch["returns"] = distill_adv
 

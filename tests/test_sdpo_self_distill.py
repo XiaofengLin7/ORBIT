@@ -28,7 +28,8 @@ from trainers.sdpo_self_distill_trainer import (
     JointSDPOSelfDistillTrainer,
     build_hindsight_prompt_tokens_first_n_complete_attempts,
     compute_sdpo_advantages,
-    should_skip_context_overflow,
+    extract_first_attempt_prefix,
+    should_skip_denominator_overflow,
 )
 
 
@@ -67,6 +68,7 @@ class _FakeActorRolloutWG:
     def __init__(self) -> None:
         self.world_size = 1
         self.update_calls = 0
+        self.last_update_batch: _FakeDataProto | None = None
 
     def compute_log_prob(self, batch: _FakeDataProto) -> _FakeDataProto:
         responses = batch.batch["responses"].float()
@@ -74,6 +76,7 @@ class _FakeActorRolloutWG:
 
     def update_actor(self, batch: _FakeDataProto) -> _FakeActorOutput:
         self.update_calls += 1
+        self.last_update_batch = batch
         return _FakeActorOutput(meta_info={"metrics": {"loss": 1.0}})
 
 
@@ -94,9 +97,36 @@ def _build_trainer_for_unit_tests() -> JointSDPOSelfDistillTrainer:
     return trainer
 
 
-def test_context_overflow_guard_gt_and_eq() -> None:
-    assert should_skip_context_overflow(3, 5, 7) is True
-    assert should_skip_context_overflow(3, 4, 7) is False
+def test_denominator_overflow_guard_gt_and_eq() -> None:
+    assert (
+        should_skip_denominator_overflow(
+            teacher_prompt_len=5,
+            first_attempt_sequence_len=3,
+            context_limit=7,
+        )
+        is True
+    )
+    assert (
+        should_skip_denominator_overflow(
+            teacher_prompt_len=4,
+            first_attempt_sequence_len=3,
+            context_limit=7,
+        )
+        is False
+    )
+
+
+def test_extract_first_attempt_prefix_uses_last_first_attempt_index() -> None:
+    extracted = extract_first_attempt_prefix(
+        response_tokens=torch.tensor([10, 90, 11, 91, 12, 0], dtype=torch.long),
+        response_mask=torch.tensor([1, 1, 1, 1, 1, 0], dtype=torch.long),
+        first_attempt_response_mask=torch.tensor([1, 0, 0, 1, 0, 0], dtype=torch.float32),
+    )
+    assert extracted is not None
+    prefix_tokens, prefix_response_mask, prefix_distill_mask = extracted
+    assert prefix_tokens.tolist() == [10, 90, 11, 91]
+    assert prefix_response_mask.tolist() == [1, 1, 1, 1]
+    assert prefix_distill_mask.tolist() == [1.0, 0.0, 0.0, 1.0]
 
 
 def test_build_hindsight_prompt_tokens_first_n_complete_attempts_success() -> None:
@@ -162,22 +192,16 @@ def test_sdpo_advantages_are_detached_and_masked() -> None:
 
 def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     trainer = _build_trainer_for_unit_tests()
-    trainer.distill_settings.context_limit = 12
-    trainer.distill_settings.teacher_context_attempts = 2
+    trainer.distill_settings.context_limit = 10
+    trainer.distill_settings.teacher_context_attempts = 1
     trainer._latest_token_trajectories = [
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2, 3, 4], "completion_ids": [10], "response": "first"},
+                {"episode_index": 0, "prompt_ids": [1, 2], "completion_ids": [3], "response": "first"},
                 {
                     "episode_index": 1,
-                    "prompt_ids": [1, 2, 3, 4, 10, 11, 12],
-                    "completion_ids": [13],
-                    "response": "retry",
-                },
-                {
-                    "episode_index": 2,
-                    "prompt_ids": [1, 2, 3, 4, 10, 11, 12, 13, 14, 15],
-                    "completion_ids": [16],
+                    "prompt_ids": [1, 2, 3, 4, 5, 6],
+                    "completion_ids": [7],
                     "response": "retry",
                 },
             ]
@@ -185,63 +209,57 @@ def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
         {
             "step_records": [
                 {"episode_index": 0, "prompt_ids": [8, 9], "completion_ids": [10], "response": "first"},
-                {"episode_index": 1, "prompt_ids": [8, 9, 10, 11], "completion_ids": [12], "response": "retry"},
-            ]
-        },
-        {
-            "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2], "completion_ids": [3], "response": "first"},
-                {"episode_index": 1, "prompt_ids": [1, 2, 3, 4], "completion_ids": [5], "response": "retry"},
-                {"episode_index": 2, "prompt_ids": [1, 2, 3, 4, 5, 6], "completion_ids": [7], "response": "retry"},
                 {
-                    "episode_index": 2,
-                    "prompt_ids": [1, 2, 3, 4, 5, 6, 7, 8],
-                    "completion_ids": [9],
+                    "episode_index": 1,
+                    "prompt_ids": [8, 9, 10, 11, 12, 13, 14],
+                    "completion_ids": [15],
                     "response": "retry",
                 },
             ]
         },
+        {"step_records": "malformed"},
     ]
 
     batch = _FakeDataProto(
         {
             "prompts": torch.tensor(
                 [
-                    [0, 0, 0, 0, 1, 2],
-                    [0, 0, 0, 0, 2, 3],
-                    [0, 0, 0, 0, 3, 4],
+                    [0, 0, 0, 1, 2, 3],
+                    [0, 0, 0, 4, 5, 6],
+                    [0, 0, 0, 7, 8, 9],
                 ],
                 dtype=torch.long,
             ),
             "responses": torch.tensor(
                 [
-                    [11, 12, 0],
-                    [21, 22, 0],
-                    [31, 32, 0],
+                    [11, 90, 12, 91, 13, 0],
+                    [21, 80, 22, 81, 23, 0],
+                    [31, 70, 32, 71, 33, 0],
                 ],
                 dtype=torch.long,
             ),
             "response_mask": torch.tensor(
                 [
-                    [1, 1, 0],
-                    [1, 1, 0],
-                    [1, 1, 0],
+                    [1, 1, 1, 1, 1, 0],
+                    [1, 1, 1, 1, 1, 0],
+                    [1, 1, 1, 1, 1, 0],
                 ],
                 dtype=torch.long,
             ),
             "first_attempt_response_mask": torch.tensor(
                 [
-                    [1, 1, 0],
-                    [1, 1, 0],
-                    [1, 1, 0],
+                    # last first-attempt index is 3 (prefix length 4), while sum(mask)=2
+                    [1, 0, 0, 1, 0, 0],
+                    [1, 0, 0, 1, 0, 0],
+                    [1, 0, 0, 1, 0, 0],
                 ],
                 dtype=torch.float32,
             ),
             "attention_mask": torch.tensor(
                 [
-                    [0, 0, 0, 0, 1, 1, 1, 1, 0],
-                    [0, 0, 0, 0, 1, 1, 1, 1, 0],
-                    [0, 0, 0, 0, 1, 1, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                    [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0],
                 ],
                 dtype=torch.long,
             ),
@@ -259,6 +277,9 @@ def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     assert metrics["distill/skipped_hindsight_unavailable"] == 1.0
     assert abs(metrics["distill/kept_ratio"] - (1.0 / 3.0)) < 1e-6
     assert payload.denominator_batch.batch["prompts"][0, -6:].tolist() == [1, 2, 3, 4, 5, 6]
+    assert payload.numerator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
+    assert payload.denominator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
+    assert payload.distill_mask[0].tolist() == [1.0, 0.0, 0.0, 1.0]
 
 
 def test_run_distill_update_only_runs_on_nonempty_payload() -> None:
@@ -269,6 +290,13 @@ def test_run_distill_update_only_runs_on_nonempty_payload() -> None:
         actor_rollout_ref=SimpleNamespace(actor=SimpleNamespace(use_kl_loss=False)),
     )
     trainer._pad_to_world_size = lambda batch, world_size: batch
+    trainer._pad_distill_inputs_to_world_size = (
+        lambda numerator_batch, denominator_batch, distill_mask, world_size: (
+            numerator_batch,
+            denominator_batch,
+            distill_mask,
+        )
+    )
 
     skipped = trainer._run_distill_update(payload=None, timing_raw={})
     assert skipped["distill/skipped_batches"] == 1.0
@@ -285,3 +313,61 @@ def test_run_distill_update_only_runs_on_nonempty_payload() -> None:
     kept = trainer._run_distill_update(payload=payload, timing_raw={})
     assert kept["distill/skipped_batches"] == 0.0
     assert trainer.actor_rollout_wg.update_calls == 1
+
+
+def test_run_distill_update_zero_masks_padded_rows() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer.use_reference_policy = False
+    trainer.config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(actor=SimpleNamespace(use_kl_loss=False)),
+    )
+    trainer._pad_to_world_size = lambda batch, world_size: batch
+    trainer._pad_distill_inputs_to_world_size = (
+        lambda numerator_batch, denominator_batch, distill_mask, world_size: (
+            _FakeDataProto(
+                {
+                    "responses": torch.tensor(
+                        [
+                            [10.0, 20.0],
+                            [100.0, 200.0],
+                        ]
+                    )
+                }
+            ),
+            _FakeDataProto(
+                {
+                    "responses": torch.tensor(
+                        [
+                            [8.0, 15.0],
+                            [80.0, 190.0],
+                        ]
+                    )
+                }
+            ),
+            torch.tensor(
+                [
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                ]
+            ),
+        )
+    )
+
+    payload = DistillPayload(
+        numerator_batch=_FakeDataProto({"responses": torch.tensor([[10.0, 20.0]])}),
+        denominator_batch=_FakeDataProto({"responses": torch.tensor([[8.0, 15.0]])}),
+        distill_mask=torch.tensor([[1.0, 1.0]]),
+        skipped_context_overflow=0,
+        total_samples=1,
+        kept_samples=1,
+    )
+    metrics = trainer._run_distill_update(payload=payload, timing_raw={})
+
+    assert metrics["distill/skipped_batches"] == 0.0
+    assert metrics["distill/token_count"] == 2.0
+    assert trainer.actor_rollout_wg.last_update_batch is not None
+    assert torch.allclose(
+        trainer.actor_rollout_wg.last_update_batch.batch["advantages"][1],
+        torch.zeros(2),
+    )

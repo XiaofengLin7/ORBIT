@@ -6,7 +6,7 @@ This document describes the implemented shared-weight SDPO self-distillation pat
 
 At each training step:
 1. Run the normal teacher PPO update on full rollout data.
-2. Run one auxiliary distillation actor update on first-attempt tokens only.
+2. Run one auxiliary distillation actor update on the first-attempt prefix sequence, with loss applied on first-attempt model tokens only.
 
 Distillation can be skipped when context-overflow is triggered, hindsight context is unavailable, or the batch has insufficient valid distill tokens.
 
@@ -60,40 +60,44 @@ These are produced in `AgentExecutionEngine` token mode.
 For valid tokens, compute:
 
 - Numerator log-prob: `log πθ(a_t | x, y<t)`
-- Denominator log-prob: `log πθ(a_t | x, c_{N+1}, y<t)` (practical prompt-context approximation)
+- Denominator log-prob: `log πθ(a_t | c_N, y<t)` where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts (practical prompt-context approximation)
 - Coefficient:
   - `c_t = stopgrad(logp_num - logp_den)`
 - Distill advantage:
   - `A_t^distill = lambda * c_t`
 
-Masking:
-- Only tokens with `response_mask=1` and `first_attempt_response_mask=1` are used.
+Scoring and masking:
+- Distill `responses` are the first-attempt prefix sequence: response-token prefix ending at the last index where `first_attempt_response_mask==1`.
+- This prefix keeps interleaved env/model tokens that appear before that endpoint.
+- Distill loss applies only where `response_mask=1` and `first_attempt_response_mask=1`.
 - Invalid token-mismatch trajectories are fully masked by engine mismatch filtering.
 
 ## Context-Overflow Guard
 
 Per sample:
 
-1. Estimate student context length `L_s` from first-attempt `step_records` as:
-   - max prompt length over `episode_index == 0` steps.
-2. Reconstruct teacher hindsight context from raw `step_records` using transition-confirmed complete attempts:
+1. Reconstruct teacher hindsight context from raw `step_records` using transition-confirmed complete attempts:
    - validate cumulative token consistency across steps
    - detect completion only when `episode_index` increases between adjacent steps
    - each detected completion contributes a candidate context equal to the next step `prompt_ids`
    - if `teacher_context_attempts = N`, select candidate `N`
    - if `teacher_context_attempts = null`, select the last candidate (all complete attempts)
    - trailing partial attempt is excluded because it has no later episode transition
-3. Estimate teacher context length:
-   - `L_t = len(selected_teacher_context_tokens)`
+2. Extract first-attempt prefix response sequence from batch masks:
+   - find `last_first_attempt_idx = max{i | first_attempt_response_mask[i]==1 and response_mask[i]==1}`
+   - set `first_attempt_prefix = responses[: last_first_attempt_idx + 1]`
+   - let `L_prefix = len(first_attempt_prefix)`
+3. Estimate denominator scoring length:
+   - `L_den = len(selected_teacher_context_tokens) + L_prefix`
 4. Determine limit:
    - `limit = rllm.distill.context_limit or (data.max_prompt_length + data.max_response_length)`
 5. Guard:
-   - if `L_s + L_t > limit`, skip distillation for this sample.
+   - if `L_den > limit`, skip distillation for this sample.
    - if hindsight reconstruction is invalid/malformed or complete attempts are insufficient, skip distillation for this sample.
 
 Boundary behavior:
-- `L_s + L_t > limit`: skip.
-- `L_s + L_t == limit`: keep.
+- `L_den > limit`: skip.
+- `L_den == limit`: keep.
 
 Overflow policy is strict skip-only (no truncation fallback), while preserving raw trajectory tokens for teacher context.
 
@@ -130,9 +134,10 @@ Additional diagnostics:
 
 Added tests:
 - `tests/test_sdpo_self_distill.py`
-  - full hindsight `c_{N+1}` reconstruction from raw step tokens
+  - first-attempt prefix extraction correctness (last-`1` index, not mask sum)
+  - first-N complete-attempt hindsight reconstruction from raw step tokens
   - malformed hindsight reconstruction skip path
-  - overflow guard (`>` vs `==`)
+  - denominator overflow guard (`L_den > limit` vs `==`)
   - SDPO detach + masking behavior
   - mixed batch partial skip + metric counts
   - distill update execution gating
