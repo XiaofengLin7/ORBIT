@@ -169,6 +169,12 @@ class MultiEpisodeEnv(BaseEnv):
             done: True only when total_steps >= total_step_cap.
             info: Augmented info dictionary with multi-episode metadata.
         """
+        # Boundary metadata is injected every step to avoid stale values.
+        boundary_transition = False
+        boundary_has_combined_observation = False
+        boundary_terminal_observation = ""
+        boundary_next_initial_observation = ""
+
         # Handle reflection step if waiting for reflection
         if self._waiting_for_reflection:
             self._waiting_for_reflection = False
@@ -180,6 +186,10 @@ class MultiEpisodeEnv(BaseEnv):
             self._episode_step = 0
             observation = self._format_observation(observation, self._episode_index)
 
+            boundary_transition = True
+            if isinstance(observation, str):
+                boundary_next_initial_observation = observation
+
             augmented_info = self._augment_info(
                 base_info=info,
                 episode_index=self._episode_index,
@@ -187,6 +197,10 @@ class MultiEpisodeEnv(BaseEnv):
                 total_step=self._total_steps,
                 episode_start=True,
                 episode_done=False,
+                boundary_transition=boundary_transition,
+                boundary_has_combined_observation=boundary_has_combined_observation,
+                boundary_terminal_observation=boundary_terminal_observation,
+                boundary_next_initial_observation=boundary_next_initial_observation,
             )
             return observation, 0.0, False, augmented_info
         
@@ -244,9 +258,16 @@ class MultiEpisodeEnv(BaseEnv):
                     self._episode_step = 0
                     next_obs = self._format_observation(next_obs, self._episode_index)
 
+                    boundary_transition = True
+                    if isinstance(terminal_observation, str):
+                        boundary_terminal_observation = terminal_observation
+                    if isinstance(next_obs, str):
+                        boundary_next_initial_observation = next_obs
+
                     # Combine terminal obs and the next-episode header/obs when using
                     # string observations (the GEM adapter always returns strings).
                     if isinstance(terminal_observation, str) and isinstance(next_obs, str):
+                        boundary_has_combined_observation = True
                         observation = f"{terminal_observation}\n\n{next_obs}"
                     else:
                         # Fallback: just expose the terminal observation.
@@ -273,6 +294,10 @@ class MultiEpisodeEnv(BaseEnv):
             success=success if inner_done else None,
             raw_reward=env_reward,
             trajectory_done=outer_done,
+            boundary_transition=boundary_transition,
+            boundary_has_combined_observation=boundary_has_combined_observation,
+            boundary_terminal_observation=boundary_terminal_observation,
+            boundary_next_initial_observation=boundary_next_initial_observation,
         )
 
         return observation, shaped_reward, outer_done, augmented_info
@@ -562,6 +587,10 @@ class MultiEpisodeEnv(BaseEnv):
         success: Optional[bool] = None,
         raw_reward: Optional[float] = None,
         trajectory_done: bool = False,
+        boundary_transition: bool = False,
+        boundary_has_combined_observation: bool = False,
+        boundary_terminal_observation: str = "",
+        boundary_next_initial_observation: str = "",
     ) -> dict:
         """Inject multi-episode metadata into the info dict.
 
@@ -575,6 +604,13 @@ class MultiEpisodeEnv(BaseEnv):
             success: Whether the episode succeeded (if episode_done).
             raw_reward: Raw reward from inner environment.
             trajectory_done: Whether the outer trajectory is complete.
+            boundary_transition: Whether this step crosses an attempt boundary.
+            boundary_has_combined_observation: Whether observation was composed as
+                terminal + next-initial in one string.
+            boundary_terminal_observation: Terminal observation from previous
+                attempt at a boundary step.
+            boundary_next_initial_observation: Initial observation of next
+                attempt at a boundary step.
 
         Returns:
             Augmented info dictionary.
@@ -591,6 +627,10 @@ class MultiEpisodeEnv(BaseEnv):
                 "step_cap": self.total_step_cap,
                 "episode_successes": list(self._episode_successes),
                 "episode_lengths": list(self._episode_lengths),
+                "boundary_transition": boundary_transition,
+                "boundary_has_combined_observation": boundary_has_combined_observation,
+                "boundary_terminal_observation": boundary_terminal_observation,
+                "boundary_next_initial_observation": boundary_next_initial_observation,
             }
         )
         if success is not None:
@@ -732,4 +772,3 @@ class MultiEpisodeEnv(BaseEnv):
             thread safety should be verified separately.
         """
         return True
-

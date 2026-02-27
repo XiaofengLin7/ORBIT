@@ -43,6 +43,7 @@ python scripts/train_multi_episode.py \
     rllm.distill.enable=True \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=sdpo_self \
+    +rllm.distill.context_limit=32768 \
     +rllm.distill.denominator_mode=teacher_adapted_feedback \
     +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
@@ -89,7 +90,7 @@ python scripts/train_multi_episode.py \
     trainer.project_name='rllm-agent' \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.val_before_train=False \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=10 \

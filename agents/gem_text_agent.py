@@ -56,8 +56,32 @@ class GEMTextAgent(BaseAgent):
         self._trajectory = Trajectory()
 
     def update_from_env(self, observation: Any, reward: float, done: bool, info: dict, **kwargs):
-        """Record env feedback and add observation as user message."""
-        self._messages.append({"role": "user", "content": str(observation)})
+        """Record env feedback and add observation messages.
+
+        For multi-episode boundary transitions, the environment can provide
+        explicit terminal/next-initial observation fields in ``info``. When
+        available, we append them as two separate user messages to preserve an
+        exact token boundary between attempts.
+        """
+        info = info or {}
+        if bool(info.get("boundary_transition", False)):
+            terminal_obs = info.get("boundary_terminal_observation", "")
+            next_initial_obs = info.get("boundary_next_initial_observation", "")
+
+            appended_any = False
+            if isinstance(terminal_obs, str) and terminal_obs:
+                self._messages.append({"role": "user", "content": terminal_obs})
+                appended_any = True
+            if isinstance(next_initial_obs, str) and next_initial_obs:
+                self._messages.append({"role": "user", "content": next_initial_obs})
+                appended_any = True
+
+            # Fallback for malformed boundary metadata.
+            if not appended_any:
+                self._messages.append({"role": "user", "content": str(observation)})
+        else:
+            self._messages.append({"role": "user", "content": str(observation)})
+
         if self._trajectory.steps:
             last_step = self._trajectory.steps[-1]
             last_step.reward = float(reward)
@@ -88,5 +112,4 @@ class GEMTextAgent(BaseAgent):
         if not self._trajectory.steps:
             return Step(chat_completions=copy.deepcopy(self._messages))
         return self._trajectory.steps[-1]
-
 

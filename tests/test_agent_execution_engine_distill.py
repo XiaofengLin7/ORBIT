@@ -14,6 +14,7 @@ for _extra_path in (_ROOT, _ROOT / "third_party" / "rllm"):
         sys.path.insert(0, _path_str)
 
 from rllm.agents.agent import Action, Step, Trajectory
+from rllm.agents.utils import convert_messages_to_tokens_and_masks
 from rllm.engine.agent_execution_engine import AgentExecutionEngine
 from rllm.engine.rollout.rollout_engine import ModelOutput
 
@@ -85,6 +86,30 @@ class _DummyAgent:
         return self._trajectory.steps[-1]
 
 
+class _BoundaryAwareAgent(_DummyAgent):
+    def update_from_env(self, observation: Any, reward: float, done: bool, info: dict, **kwargs) -> None:
+        info = info or {}
+        if bool(info.get("boundary_transition", False)):
+            terminal_obs = info.get("boundary_terminal_observation", "")
+            next_initial_obs = info.get("boundary_next_initial_observation", "")
+            appended_any = False
+            if isinstance(terminal_obs, str) and terminal_obs:
+                self._messages.append({"role": "user", "content": terminal_obs})
+                appended_any = True
+            if isinstance(next_initial_obs, str) and next_initial_obs:
+                self._messages.append({"role": "user", "content": next_initial_obs})
+                appended_any = True
+            if not appended_any:
+                self._messages.append({"role": "user", "content": str(observation)})
+        else:
+            self._messages.append({"role": "user", "content": str(observation)})
+
+
+class _BoundaryRawAgent(_DummyAgent):
+    def update_from_env(self, observation: Any, reward: float, done: bool, info: dict, **kwargs) -> None:
+        self._messages.append({"role": "user", "content": str(observation)})
+
+
 class _DummyEnv:
     def __init__(self) -> None:
         self.idx = 0
@@ -104,10 +129,44 @@ class _DummyEnv:
         return
 
 
-def _make_engine(filter_token_mismatch: bool = False) -> AgentExecutionEngine:
+class _BoundaryEnv:
+    def __init__(self) -> None:
+        self.idx = 0
+        self._step = 0
+
+    def reset(self) -> tuple[str, dict[str, Any]]:
+        self._step = 0
+        return "obs0", {"episode_index": 0}
+
+    def step(self, action: Any) -> tuple[str, float, bool, dict[str, Any]]:
+        self._step += 1
+        if self._step == 1:
+            return (
+                "terminal-0\n\nnext-init-1",
+                0.0,
+                False,
+                {
+                    "episode_index": 1,
+                    "boundary_transition": True,
+                    "boundary_has_combined_observation": True,
+                    "boundary_terminal_observation": "terminal-0",
+                    "boundary_next_initial_observation": "next-init-1",
+                },
+            )
+        return "obs2", 1.0, True, {"episode_index": 1}
+
+    def close(self) -> None:
+        return
+
+
+def _make_engine(
+    filter_token_mismatch: bool = False,
+    agent: _DummyAgent | None = None,
+    env: Any | None = None,
+) -> AgentExecutionEngine:
     engine = AgentExecutionEngine.__new__(AgentExecutionEngine)
-    engine.agents = [_DummyAgent()]
-    engine.envs = [_DummyEnv()]
+    engine.agents = [agent if agent is not None else _DummyAgent()]
+    engine.envs = [env if env is not None else _DummyEnv()]
     engine.executor = ThreadPoolExecutor(max_workers=1)
     engine.max_steps = 2
     engine.max_response_length = 128
@@ -188,3 +247,83 @@ def test_token_mode_returns_step_records_with_episode_indices() -> None:
     assert [int(step["episode_index"]) for step in step_records] == [0, 1]
     assert "first_attempt_response_mask" in token_result
     assert token_result["first_attempt_response_mask"].tolist() == [1, 0]
+
+
+def test_token_mode_step_records_include_boundary_token_lengths() -> None:
+    engine = _make_engine(filter_token_mismatch=False, agent=_BoundaryAwareAgent(), env=_BoundaryEnv())
+    scripted_outputs = [
+        ModelOutput(text="a0", prompt_ids=[1, 2], completion_ids=[3], logprobs=[-0.1]),
+        ModelOutput(text="a1", prompt_ids=[1, 2, 3, 9, 10], completion_ids=[4], logprobs=[-0.2]),
+    ]
+
+    async def _fake_get_model_response(prompt_messages: Any, application_id: str, **kwargs: Any) -> ModelOutput:
+        return scripted_outputs.pop(0)
+
+    engine.get_model_response = _fake_get_model_response  # type: ignore[method-assign]
+
+    try:
+        token_result = asyncio.run(
+            engine.run_agent_trajectory_async(
+                idx=0,
+                application_id="app",
+                mode="Token",
+                meta_info={},
+            )
+        )
+    finally:
+        engine.executor.shutdown(wait=False, cancel_futures=True)
+
+    step_records = token_result["step_records"]
+    assert len(step_records) == 2
+    assert step_records[0]["boundary_transition"] is True
+
+    terminal_tokens, _ = convert_messages_to_tokens_and_masks(
+        [{"role": "user", "content": "terminal-0"}],
+        tokenizer=engine.tokenizer,
+        parser=engine.chat_parser,
+        contains_first_msg=False,
+        contains_generation_msg=False,
+    )
+    next_initial_tokens, _ = convert_messages_to_tokens_and_masks(
+        [{"role": "user", "content": "next-init-1"}],
+        tokenizer=engine.tokenizer,
+        parser=engine.chat_parser,
+        contains_first_msg=False,
+        contains_generation_msg=True,
+    )
+    assert step_records[0]["boundary_terminal_env_token_len"] == len(terminal_tokens)
+    assert step_records[0]["boundary_next_initial_env_token_len"] == len(next_initial_tokens)
+    assert step_records[1]["boundary_transition"] is False
+    assert step_records[1]["boundary_terminal_env_token_len"] == 0
+    assert step_records[1]["boundary_next_initial_env_token_len"] == 0
+
+
+def test_token_mode_boundary_mismatch_marks_invalid_token_lengths() -> None:
+    engine = _make_engine(filter_token_mismatch=False, agent=_BoundaryRawAgent(), env=_BoundaryEnv())
+    scripted_outputs = [
+        ModelOutput(text="a0", prompt_ids=[1, 2], completion_ids=[3], logprobs=[-0.1]),
+        ModelOutput(text="a1", prompt_ids=[1, 2, 3, 9, 10], completion_ids=[4], logprobs=[-0.2]),
+    ]
+
+    async def _fake_get_model_response(prompt_messages: Any, application_id: str, **kwargs: Any) -> ModelOutput:
+        return scripted_outputs.pop(0)
+
+    engine.get_model_response = _fake_get_model_response  # type: ignore[method-assign]
+
+    try:
+        token_result = asyncio.run(
+            engine.run_agent_trajectory_async(
+                idx=0,
+                application_id="app",
+                mode="Token",
+                meta_info={},
+            )
+        )
+    finally:
+        engine.executor.shutdown(wait=False, cancel_futures=True)
+
+    step_records = token_result["step_records"]
+    assert len(step_records) == 2
+    assert step_records[0]["boundary_transition"] is True
+    assert step_records[0]["boundary_terminal_env_token_len"] == -1
+    assert step_records[0]["boundary_next_initial_env_token_len"] == -1

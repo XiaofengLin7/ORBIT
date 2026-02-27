@@ -100,7 +100,7 @@ def _build_trainer_for_unit_tests() -> JointSDPOSelfDistillTrainer:
 def test_denominator_overflow_guard_gt_and_eq() -> None:
     assert (
         should_skip_denominator_overflow(
-            teacher_prompt_len=5,
+            denominator_prompt_len=5,
             first_attempt_sequence_len=3,
             context_limit=7,
         )
@@ -108,11 +108,24 @@ def test_denominator_overflow_guard_gt_and_eq() -> None:
     )
     assert (
         should_skip_denominator_overflow(
-            teacher_prompt_len=4,
+            denominator_prompt_len=4,
             first_attempt_sequence_len=3,
             context_limit=7,
         )
         is False
+    )
+
+
+def test_denominator_overflow_guard_counts_prompt_in_denominator_context() -> None:
+    # Regression: denominator prompt length already includes concat(c_N, prompts).
+    # If prompts were omitted from denominator length, this case would not overflow.
+    assert (
+        should_skip_denominator_overflow(
+            denominator_prompt_len=7,
+            first_attempt_sequence_len=3,
+            context_limit=9,
+        )
+        is True
     )
 
 
@@ -129,26 +142,167 @@ def test_extract_first_attempt_prefix_uses_last_first_attempt_index() -> None:
     assert prefix_distill_mask.tolist() == [1.0, 0.0, 0.0, 1.0]
 
 
+def test_complete_trajectory_extracts_first_attempt_and_first_n_attempt_contexts() -> None:
+    step_records = [
+        {
+            "prompt_ids": [1, 2],
+            "completion_ids": [11, 12],
+            "episode_index": 0,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 11, 12, 21],
+            "completion_ids": [13],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 11, 12, 21, 13, 22, 220],
+            "completion_ids": [31],
+            "episode_index": 1,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 11, 12, 21, 13, 22, 220, 31, 23],
+            "completion_ids": [32],
+            "episode_index": 1,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 11, 12, 21, 13, 22, 220, 31, 23, 32, 24, 240],
+            "completion_ids": [41],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 11, 12, 21, 13, 22, 220, 31, 23, 32, 24, 240, 41, 25],
+            "completion_ids": [42],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+    ]
+    # Full assembled response stream across all attempts:
+    # completion + prompt delta + completion + ...
+    response_tokens = torch.tensor([11, 12, 21, 13, 22, 31, 23, 32, 24, 41, 25, 42], dtype=torch.long)
+    response_mask = torch.tensor([1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.long)
+    first_attempt_response_mask = torch.tensor(
+        [1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+        dtype=torch.float32,
+    )
+
+    extracted = extract_first_attempt_prefix(
+        response_tokens=response_tokens,
+        response_mask=response_mask,
+        first_attempt_response_mask=first_attempt_response_mask,
+    )
+    assert extracted is not None
+    first_attempt_tokens, first_attempt_seq_mask, first_attempt_distill_mask = extracted
+    assert first_attempt_tokens.tolist() == [11, 12, 21, 13]
+    assert first_attempt_seq_mask.tolist() == [1, 1, 0, 1]
+    assert first_attempt_distill_mask.tolist() == [1.0, 1.0, 0.0, 1.0]
+
+    first_1 = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=1,
+    )
+    first_2 = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=2,
+    )
+    all_complete = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=None,
+    )
+
+    assert first_1 is not None
+    assert first_1.tolist() == [1, 2, 11, 12, 21, 13, 22]
+    assert first_2 is not None
+    assert first_2.tolist() == [1, 2, 11, 12, 21, 13, 22, 220, 31, 23, 32, 24]
+    assert all_complete is not None
+    assert all_complete.tolist() == [1, 2, 11, 12, 21, 13, 22, 220, 31, 23, 32, 24]
+
+
 def test_build_hindsight_prompt_tokens_first_n_complete_attempts_success() -> None:
     step_records = [
-        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
-        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
-        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 2},
-        {"prompt_ids": [1, 2, 3, 4, 5, 6, 7], "completion_ids": [8], "episode_index": 2},
+        {
+            "prompt_ids": [1],
+            "completion_ids": [2],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30],
+            "completion_ids": [4],
+            "episode_index": 1,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30, 4, 5, 50],
+            "completion_ids": [6],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30, 4, 5, 50, 6, 7],
+            "completion_ids": [8],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
     ]
     hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
         step_records=step_records,
         teacher_context_attempts=2,
     )
     assert hindsight is not None
-    assert hindsight.tolist() == [1, 2, 3, 4, 5]
+    assert hindsight.tolist() == [1, 2, 3, 30, 4, 5]
 
 
 def test_build_hindsight_prompt_tokens_first_n_complete_attempts_insufficient_returns_none() -> None:
     step_records = [
-        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
-        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
-        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 1},
+        {
+            "prompt_ids": [1],
+            "completion_ids": [2],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 3],
+            "completion_ids": [4],
+            "episode_index": 1,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 4, 5],
+            "completion_ids": [6],
+            "episode_index": 1,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
     ]
     hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
         step_records=step_records,
@@ -159,17 +313,71 @@ def test_build_hindsight_prompt_tokens_first_n_complete_attempts_insufficient_re
 
 def test_build_hindsight_prompt_tokens_first_n_complete_attempts_null_uses_all_complete_only() -> None:
     step_records = [
-        {"prompt_ids": [1], "completion_ids": [2], "episode_index": 0},
-        {"prompt_ids": [1, 2, 3], "completion_ids": [4], "episode_index": 1},
-        {"prompt_ids": [1, 2, 3, 4, 5], "completion_ids": [6], "episode_index": 2},
-        {"prompt_ids": [1, 2, 3, 4, 5, 6, 7], "completion_ids": [8], "episode_index": 2},
+        {
+            "prompt_ids": [1],
+            "completion_ids": [2],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30],
+            "completion_ids": [4],
+            "episode_index": 1,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30, 4, 5, 50],
+            "completion_ids": [6],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 3, 30, 4, 5, 50, 6, 7],
+            "completion_ids": [8],
+            "episode_index": 2,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
     ]
     hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
         step_records=step_records,
         teacher_context_attempts=None,
     )
     assert hindsight is not None
-    assert hindsight.tolist() == [1, 2, 3, 4, 5]
+    assert hindsight.tolist() == [1, 2, 3, 30, 4, 5]
+
+
+def test_build_hindsight_prompt_tokens_first_n_complete_attempts_malformed_boundary_returns_none() -> None:
+    step_records = [
+        {
+            "prompt_ids": [1],
+            "completion_ids": [2],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 2,
+            "boundary_next_initial_env_token_len": 0,
+        },
+        {
+            "prompt_ids": [1, 2, 3],
+            "completion_ids": [4],
+            "episode_index": 1,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+        },
+    ]
+    hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=1,
+    )
+    assert hindsight is None
 
 
 def test_sdpo_advantages_are_detached_and_masked() -> None:
@@ -192,28 +400,50 @@ def test_sdpo_advantages_are_detached_and_masked() -> None:
 
 def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     trainer = _build_trainer_for_unit_tests()
-    trainer.distill_settings.context_limit = 10
+    trainer.distill_settings.context_limit = 13
     trainer.distill_settings.teacher_context_attempts = 1
     trainer._latest_token_trajectories = [
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [1, 2], "completion_ids": [3], "response": "first"},
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [3],
+                    "response": "first",
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 2,
+                    "boundary_next_initial_env_token_len": 1,
+                },
                 {
                     "episode_index": 1,
                     "prompt_ids": [1, 2, 3, 4, 5, 6],
                     "completion_ids": [7],
                     "response": "retry",
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
                 },
             ]
         },
         {
             "step_records": [
-                {"episode_index": 0, "prompt_ids": [8, 9], "completion_ids": [10], "response": "first"},
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [8, 9],
+                    "completion_ids": [10],
+                    "response": "first",
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 4,
+                    "boundary_next_initial_env_token_len": 0,
+                },
                 {
                     "episode_index": 1,
                     "prompt_ids": [8, 9, 10, 11, 12, 13, 14],
                     "completion_ids": [15],
                     "response": "retry",
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
                 },
             ]
         },
@@ -276,7 +506,7 @@ def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     assert metrics["distill/skipped_context_overflow"] == 1.0
     assert metrics["distill/skipped_hindsight_unavailable"] == 1.0
     assert abs(metrics["distill/kept_ratio"] - (1.0 / 3.0)) < 1e-6
-    assert payload.denominator_batch.batch["prompts"][0, -6:].tolist() == [1, 2, 3, 4, 5, 6]
+    assert payload.denominator_batch.batch["prompts"][0].tolist() == [1, 2, 3, 4, 5, 1, 2, 3]
     assert payload.numerator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
     assert payload.denominator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
     assert payload.distill_mask[0].tolist() == [1.0, 0.0, 0.0, 1.0]

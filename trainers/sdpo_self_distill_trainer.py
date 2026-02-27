@@ -6,7 +6,8 @@ performs:
 2. SDPO-style auxiliary actor update over first-attempt tokens only.
 
 Distillation uses a strict context-overflow guard on denominator scoring length:
-``L_den = len(teacher_prompt_tokens) + len(first_attempt_sequence_tokens)``.
+``L_den = len(denominator_prompt_tokens) + len(first_attempt_sequence_tokens)``,
+where ``denominator_prompt_tokens = concat(c_N, prompts)``.
 If ``L_den > context_limit``, the sample is excluded from distillation.
 """
 
@@ -69,7 +70,8 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
 
     Returns:
         Tensor prompt tokens for denominator context, or ``None`` when records
-        are malformed, non-cumulative, or insufficient complete attempts exist.
+        are malformed, non-cumulative, missing/invalid boundary metadata at
+        transitions, or insufficient complete attempts exist.
     """
     if not step_records:
         return None
@@ -86,6 +88,7 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
         return None
 
     accumulated = list(first_prompt_ids) + list(first_completion_ids)
+    prev_step = step_records[0]
     complete_attempt_contexts: list[list[int]] = []
     for step in step_records[1:]:
         current_prompt_ids = step.get("prompt_ids", [])
@@ -105,10 +108,26 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
             return None
 
         if current_episode_index > prev_episode_index:
-            complete_attempt_contexts.append(list(current_prompt_ids))
+            delta_prompt_tokens = current_prompt_ids[len(accumulated) :]
+            boundary_transition = bool(prev_step.get("boundary_transition", False))
+            terminal_len_raw = prev_step.get("boundary_terminal_env_token_len", None)
+            next_initial_len_raw = prev_step.get("boundary_next_initial_env_token_len", None)
+            try:
+                terminal_len = int(terminal_len_raw)
+                next_initial_len = int(next_initial_len_raw)
+            except (TypeError, ValueError):
+                return None
+            if not boundary_transition:
+                return None
+            if terminal_len < 0 or next_initial_len < 0:
+                return None
+            if terminal_len + next_initial_len != len(delta_prompt_tokens):
+                return None
+            complete_attempt_contexts.append(list(accumulated) + list(delta_prompt_tokens[:terminal_len]))
 
         accumulated = current_prompt_ids + list(current_completion_ids)
         prev_episode_index = current_episode_index
+        prev_step = step
 
     if not complete_attempt_contexts:
         return None
@@ -124,16 +143,16 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
 
 
 def should_skip_denominator_overflow(
-    teacher_prompt_len: int,
+    denominator_prompt_len: int,
     first_attempt_sequence_len: int,
     context_limit: int,
 ) -> bool:
     """Return whether SDPO distillation should be skipped for overflow.
 
     The denominator-scored sequence length is:
-    ``L_den = len(teacher_prompt_tokens) + len(first_attempt_sequence_tokens)``.
+    ``L_den = len(denominator_prompt_tokens) + len(first_attempt_sequence_tokens)``.
     """
-    return (teacher_prompt_len + first_attempt_sequence_len) > context_limit
+    return (denominator_prompt_len + first_attempt_sequence_len) > context_limit
 
 
 def extract_first_attempt_prefix(
@@ -297,8 +316,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         distill_mask = response_mask * first_attempt_mask
 
         total_samples = min(len(self._latest_token_trajectories), batch.batch["responses"].shape[0])
+        original_response_len = int(batch.batch["responses"].shape[1])
         kept_indices: list[int] = []
-        teacher_prompt_tokens_per_sample: list[torch.Tensor] = []
+        denominator_prompt_tokens_per_sample: list[torch.Tensor] = []
         first_attempt_prefix_response_tokens_per_sample: list[torch.Tensor] = []
         first_attempt_prefix_response_masks_per_sample: list[torch.Tensor] = []
         first_attempt_prefix_distill_masks_per_sample: list[torch.Tensor] = []
@@ -345,11 +365,19 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             if teacher_prompt_tokens is None:
                 skipped_hindsight_unavailable += 1
                 continue
-            teacher_context_len = int(teacher_prompt_tokens.numel())
+
+            prompt_attention_row = batch.batch["attention_mask"][i, :-original_response_len]
+            student_prompt_tokens = batch.batch["prompts"][i][prompt_attention_row > 0].long()
+            denominator_prompt_tokens = torch.cat(
+                [teacher_prompt_tokens.long(), student_prompt_tokens],
+                dim=0,
+            )
+
+            denominator_prompt_len = int(denominator_prompt_tokens.numel())
             first_attempt_prefix_len = int(prefix_response_tokens.numel())
 
             if should_skip_denominator_overflow(
-                teacher_prompt_len=teacher_context_len,
+                denominator_prompt_len=denominator_prompt_len,
                 first_attempt_sequence_len=first_attempt_prefix_len,
                 context_limit=limit,
             ):
@@ -357,7 +385,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 continue
 
             kept_indices.append(i)
-            teacher_prompt_tokens_per_sample.append(teacher_prompt_tokens)
+            denominator_prompt_tokens_per_sample.append(denominator_prompt_tokens)
             first_attempt_prefix_response_tokens_per_sample.append(prefix_response_tokens)
             first_attempt_prefix_response_masks_per_sample.append(prefix_response_mask)
             first_attempt_prefix_distill_masks_per_sample.append(prefix_distill_mask)
@@ -373,7 +401,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         selected_den = batch.select_idxs(np.array(kept_indices))
 
         pad_token_id = int(self.tokenizer.pad_token_id)
-        prompt_rows: list[torch.Tensor] = teacher_prompt_tokens_per_sample
+        prompt_rows: list[torch.Tensor] = denominator_prompt_tokens_per_sample
         max_prompt_len = max(int(x.numel()) for x in prompt_rows)
         max_response_len = max(
             int(x.numel()) for x in first_attempt_prefix_response_tokens_per_sample
@@ -408,7 +436,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         # Numerator batch uses original prompt context with first-attempt prefix responses.
         numerator_prompts = selected.batch["prompts"]
-        original_response_len = int(selected.batch["responses"].shape[1])
         numerator_prompt_attention = selected.batch["attention_mask"][:, :-original_response_len]
         numerator_attention_mask = torch.cat([numerator_prompt_attention.long(), prefix_response_mask], dim=1)
         numerator_position_ids = (torch.cumsum(numerator_attention_mask, dim=1) - 1) * numerator_attention_mask

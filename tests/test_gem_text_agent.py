@@ -15,10 +15,26 @@ def test_update_flow():
     action = agent.update_from_model("try \\boxed{5}")
 
     assert isinstance(action, Action)
-    assert action.action == "5"
+    assert action.action == "\\boxed{5}"
     state = agent.get_current_state()
-    assert state.action.action == "5"
+    assert state.action.action == "\\boxed{5}"
     assert state.observation == "hello"
     assert len(agent.chat_completions) >= 2
 
+
+def test_update_from_env_boundary_transition_splits_messages():
+    agent = GEMTextAgent(system_prompt="sys", max_steps=5)
+    agent.update_from_env(
+        observation="terminal\n\nnext",
+        reward=0.0,
+        done=False,
+        info={
+            "boundary_transition": True,
+            "boundary_terminal_observation": "terminal",
+            "boundary_next_initial_observation": "next",
+        },
+    )
+    messages = agent.chat_completions
+    assert messages[-2] == {"role": "user", "content": "terminal"}
+    assert messages[-1] == {"role": "user", "content": "next"}
 

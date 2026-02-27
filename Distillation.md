@@ -51,7 +51,16 @@ Semantics:
 
 To support distillation, token rollouts now include:
 - `first_attempt_response_mask`: token-level mask selecting attempt-0 completion tokens.
-- `step_records`: per-step list containing prompt/completion ids, logprobs, text fields, and `episode_index`.
+- `step_records`: per-step list containing prompt/completion ids, logprobs, text fields, `episode_index`, and boundary metadata:
+  - `boundary_transition`
+  - `boundary_terminal_env_token_len`
+  - `boundary_next_initial_env_token_len`
+
+Additionally, multi-episode env info provides boundary observation split fields:
+- `boundary_transition`
+- `boundary_has_combined_observation`
+- `boundary_terminal_observation`
+- `boundary_next_initial_observation`
 
 These are produced in `AgentExecutionEngine` token mode.
 
@@ -60,7 +69,7 @@ These are produced in `AgentExecutionEngine` token mode.
 For valid tokens, compute:
 
 - Numerator log-prob: `log πθ(a_t | x, y<t)`
-- Denominator log-prob: `log πθ(a_t | c_N, y<t)` where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts (practical prompt-context approximation)
+- Denominator log-prob: `log πθ(a_t | c_N, x/h_t context, y<t)` implemented as denominator `input_ids = [c_N ; prompts ; first_attempt_prefix]`, where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts
 - Coefficient:
   - `c_t = stopgrad(logp_num - logp_den)`
 - Distill advantage:
@@ -79,16 +88,23 @@ Per sample:
 1. Reconstruct teacher hindsight context from raw `step_records` using transition-confirmed complete attempts:
    - validate cumulative token consistency across steps
    - detect completion only when `episode_index` increases between adjacent steps
-   - each detected completion contributes a candidate context equal to the next step `prompt_ids`
+   - for each detected completion, use previous-step boundary metadata:
+     - `delta = current_prompt_ids[len(accumulated):]`
+     - require `boundary_terminal_env_token_len + boundary_next_initial_env_token_len == len(delta)`
+     - candidate context is `accumulated + delta[:boundary_terminal_env_token_len]`
+   - this keeps terminal boundary tokens from attempt `N` and excludes `(N+1)` initial-observation tokens
    - if `teacher_context_attempts = N`, select candidate `N`
    - if `teacher_context_attempts = null`, select the last candidate (all complete attempts)
    - trailing partial attempt is excluded because it has no later episode transition
+   - malformed/missing boundary metadata at transition marks hindsight unavailable and skips distillation for that sample
 2. Extract first-attempt prefix response sequence from batch masks:
    - find `last_first_attempt_idx = max{i | first_attempt_response_mask[i]==1 and response_mask[i]==1}`
    - set `first_attempt_prefix = responses[: last_first_attempt_idx + 1]`
    - let `L_prefix = len(first_attempt_prefix)`
 3. Estimate denominator scoring length:
-   - `L_den = len(selected_teacher_context_tokens) + L_prefix`
+   - extract valid prompt tokens from numerator prompt segment using prompt-side attention mask
+   - build denominator prompt tokens as `concat(selected_teacher_context_tokens, valid_prompt_tokens)`
+   - `L_den = len(selected_teacher_context_tokens) + len(valid_prompt_tokens) + L_prefix`
 4. Determine limit:
    - `limit = rllm.distill.context_limit or (data.max_prompt_length + data.max_response_length)`
 5. Guard:
@@ -136,11 +152,14 @@ Added tests:
 - `tests/test_sdpo_self_distill.py`
   - first-attempt prefix extraction correctness (last-`1` index, not mask sum)
   - first-N complete-attempt hindsight reconstruction from raw step tokens
-  - malformed hindsight reconstruction skip path
+  - malformed hindsight/boundary reconstruction skip path
   - denominator overflow guard (`L_den > limit` vs `==`)
   - SDPO detach + masking behavior
   - mixed batch partial skip + metric counts
   - distill update execution gating
+- `tests/test_multi_episode_env.py`
+  - boundary metadata emission for non-reflection combined observation
+  - boundary metadata emission for reflection reset transition
 - `tests/test_agent_execution_engine_distill.py`
   - `assemble_steps` first-attempt mask alignment
   - mismatch mask zeroing behavior
