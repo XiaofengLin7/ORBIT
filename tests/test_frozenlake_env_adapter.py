@@ -89,6 +89,29 @@ def test_step_accepts_action_wrapper(frozenlake_env) -> None:
     assert info["parsed_action"] == 3
 
 
+def test_step_handles_punctuation_only_action_without_crash() -> None:
+    """Punctuation-only model output should safely map to no-op action."""
+    pytest.importorskip("gymnasium")
+    from envs.frozenlake_env_adapter import FrozenLakeEnvAdapter
+
+    env = FrozenLakeEnvAdapter(
+        env_id="frozenlake",
+        env_kwargs={
+            "desc": ["SF", "FG"],
+            "is_slippery": False,
+            "max_turns": 1,
+            "seed": 23,
+        },
+    )
+    try:
+        env.reset()
+        _, _, done, info = env.step("!!!")
+        assert done is True
+        assert info["parsed_action"] == 0
+    finally:
+        env.close()
+
+
 def test_factory_from_dict() -> None:
     """Factory should construct a usable adapter from nested config."""
     pytest.importorskip("gymnasium")

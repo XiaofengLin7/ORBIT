@@ -240,8 +240,9 @@ class FrozenLakeEnvAdapter(BaseEnv):
             raw_text = boxed_matches[-1].group(1).strip()
 
         token = raw_text.lower().replace("`", " ").strip()
-        token = re.sub(r"[^\w\s]", " ", token)
-        token = token.split()[0] if token else ""
+        token = re.sub(r"[^\w\s]", " ", token).strip()
+        token_parts = token.split()
+        token = token_parts[0] if token_parts else ""
 
         if token.isdigit():
             candidate = int(token)

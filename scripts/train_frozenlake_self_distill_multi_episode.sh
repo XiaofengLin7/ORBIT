@@ -1,46 +1,40 @@
 #!/bin/bash
 set -x
 
-# GPU assignment: use 4 GPUs (adjust if vLLM is using one; e.g., skip GPU0 if needed).
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
 
-# Available GEM Tower of Hanoi env_ids:
-# - game:TowerofHanoi-v0-easy   (3 disks, 10 turns)
-# - game:TowerofHanoi-v0-hard   (5 disks, 35 turns)
-# - game:TowerofHanoi-v0-random (randomized)
-ENV_ID=${ENV_ID:-game:TowerofHanoi-v0-easy}
-TOTAL_STEP_CAP=${TOTAL_STEP_CAP:-30}
-MAX_TURNS_PER_EPISODE=${MAX_TURNS_PER_EPISODE:-10}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
+# Multi-task FrozenLake config.
+# This config defines distinct train/val task distributions and leaves `desc`
+# unset so each trajectory varies by seed-generated random map.
+TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_frozenlake_self_distill_multi_episode.yaml}
+if [ ! -f "$TASKS_CONFIG" ]; then
+    echo "Error: Tasks config file not found: $TASKS_CONFIG"
+    echo "Set TASKS_CONFIG to a valid YAML path."
+    exit 1
+fi
+
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
 
-# Extract model name (last part after /)
 MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
-# Extract env name (part after :, convert to lowercase with hyphens)
-ENV_NAME=$(echo "$ENV_ID" | cut -d: -f2 | tr '[:upper:]' '[:lower:]' | tr '_' '-')
-# Construct experiment name
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"gem-${ENV_NAME}-self-distill-multi-episode-${MODEL_NAME}"}
+CONFIG_NAME=$(basename "$TASKS_CONFIG" .yaml | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"frozenlake-multi-episode-${CONFIG_NAME}-${MODEL_NAME}"}
 
-# Multi-episode + SDPO self-distillation.
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
     data.val_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=16384 \
-    +rllm.env.env_args.inner_env_class=envs.gem_env_adapter.GEMEnvAdapter \
-    +rllm.env.env_args.inner_env_kwargs.env_id=$ENV_ID \
-    +rllm.env.env_args.inner_env_kwargs.env_kwargs.max_turns=$MAX_TURNS_PER_EPISODE \
-    +rllm.env.env_args.total_step_cap=$TOTAL_STEP_CAP \
+    +data.tasks_config_path="$TASKS_CONFIG" \
     +rllm.env.env_args.success_reward=1.0 \
-    rllm.agent.max_steps=$TOTAL_STEP_CAP \
     +rllm.env.env_args.episode_header="New episode begins." \
     +rllm.env.env_args.enable_reflection=False \
-    rllm.distill.enable=True \
+    rllm.distill.enable=False \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=sdpo_self \
     +rllm.distill.context_limit=32768 \
