@@ -6,7 +6,7 @@ This document describes the implemented shared-weight SDPO self-distillation pat
 
 At each training step:
 1. Run the normal teacher PPO update on full rollout data.
-2. Run one auxiliary distillation actor update on the first-attempt prefix sequence, with loss applied on first-attempt model tokens only.
+2. Compute a distillation bonus on the first-attempt prefix sequence and merge it into the same actor update.
 
 Distillation can be skipped when context-overflow is triggered, hindsight context is unavailable, or the batch has insufficient valid distill tokens.
 
@@ -32,6 +32,9 @@ rllm:
     mode: sdpo_self
     denominator_mode: teacher_adapted_feedback
     teacher_context_attempts: null
+    teacher_regularization: none
+    teacher_update_rate: 0.05
+    teacher_update_interval: 10
     context_limit: null
     context_overflow_policy: skip_loss
     min_distill_tokens: 1
@@ -43,9 +46,18 @@ Semantics:
 - `mode`: currently supports `sdpo_self`.
 - `denominator_mode`: currently `teacher_adapted_feedback`.
 - `teacher_context_attempts`: if set to `N`, require at least `N` transition-confirmed complete attempts and use only the first `N`; if `null`, use all transition-confirmed complete attempts.
+- `teacher_regularization`: teacher policy source for denominator scoring.
+  - `none`: denominator log-prob is computed from current actor.
+  - `ema`: denominator log-prob is computed from a teacher snapshot updated by EMA after each actor step.
+  - `every_n_steps`: denominator log-prob is computed from a teacher snapshot hard-copied from actor every `teacher_update_interval` steps.
+- `teacher_update_rate`: EMA coefficient for `ema` mode (`[0, 1]`).
+- `teacher_update_interval`: hard-sync interval `N` for `every_n_steps` mode (`>=1`).
 - `context_limit`: if `null`, defaults to `data.max_prompt_length + data.max_response_length`.
 - `context_overflow_policy`: currently supports only `skip_loss`.
 - `min_distill_tokens`: skip auxiliary update when valid token count is below threshold.
+
+Compatibility guard:
+- Teacher regularization modes (`ema` and `every_n_steps`) are incompatible with KL reference-policy path (`algorithm.use_kl_in_reward` or `actor_rollout_ref.actor.use_kl_loss`) in v1.
 
 ## Rollout Metadata Requirements
 
@@ -69,7 +81,10 @@ These are produced in `AgentExecutionEngine` token mode.
 For valid tokens, compute:
 
 - Numerator log-prob: `log πθ(a_t | x, y<t)`
-- Denominator log-prob: `log πθ(a_t | c_N, x/h_t context, y<t)` implemented as denominator `input_ids = [c_N ; prompts ; first_attempt_prefix]`, where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts
+- Denominator log-prob:
+  - `teacher_regularization=none`: `log πθ(a_t | c_N, x/h_t context, y<t)` from current actor.
+  - `teacher_regularization in {ema, every_n_steps}`: same conditioning, but scored by the teacher snapshot.
+  - implementation input is `input_ids = [c_N ; prompts ; first_attempt_prefix]`, where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts
 - Coefficient:
   - `c_t = stopgrad(logp_num - logp_den)`
 - Distill advantage:
@@ -125,9 +140,15 @@ Note:
 
 Within `JointSDPOSelfDistillTrainer.fit_agent()`:
 1. Generate trajectories and compute standard PPO quantities.
-2. Run normal teacher actor update.
-3. Prepare distillation payload (numerator/denominator batches + mask).
-4. If payload has enough valid tokens, run one extra actor update using distill advantages.
+2. Prepare distillation payload (denominator batch + mask + kept-row mapping) after trajectory filtering.
+3. Compute a detached distillation bonus and add it to PPO actor advantages.
+4. Run one actor update on the merged advantages (single shared update call).
+5. If teacher regularization is enabled:
+   - `ema`: update teacher snapshot by EMA after each actor step.
+   - `every_n_steps`: hard-sync teacher snapshot after steps where `global_steps % teacher_update_interval == 0`.
+
+Teacher initialization:
+- After checkpoint load, teacher snapshot is hard-synced from actor once when teacher regularization is enabled.
 
 Checkpoints remain the normal actor checkpoints (single shared model stream).
 
@@ -144,7 +165,7 @@ Additional diagnostics:
 - `distill/log_ratio_mean`
 - `distill/log_ratio_std`
 - `distill/skipped_batches`
-- `distill_actor/*` (auxiliary actor update metrics)
+- `distill/teacher_sync_applied`
 
 ## Tests
 
@@ -156,7 +177,8 @@ Added tests:
   - denominator overflow guard (`L_den > limit` vs `==`)
   - SDPO detach + masking behavior
   - mixed batch partial skip + metric counts
-  - distill update execution gating
+  - teacher-regularization settings validation and KL-incompatibility guard
+  - denominator teacher log-prob routing and teacher sync schedule hooks
 - `tests/test_multi_episode_env.py`
   - boundary metadata emission for non-reflection combined observation
   - boundary metadata emission for reflection reset transition

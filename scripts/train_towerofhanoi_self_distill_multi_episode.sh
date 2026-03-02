@@ -17,14 +17,26 @@ MAX_TURNS_PER_EPISODE=${MAX_TURNS_PER_EPISODE:-10}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
+TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
+TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
+TEACHER_UPDATE_INTERVAL=${TEACHER_UPDATE_INTERVAL:-10}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
 
 # Extract model name (last part after /)
 MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 # Extract env name (part after :, convert to lowercase with hyphens)
 ENV_NAME=$(echo "$ENV_ID" | cut -d: -f2 | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+
+if [ "$TEACHER_REGULARIZATION" = "ema" ]; then
+    TEACHER_REG_SUFFIX="teacher-ema-a-${TEACHER_UPDATE_RATE}"
+elif [ "$TEACHER_REGULARIZATION" = "every_n_steps" ]; then
+    TEACHER_REG_SUFFIX="teacher-every-${TEACHER_UPDATE_INTERVAL}"
+else
+    TEACHER_REG_SUFFIX="teacher-none"
+fi
+
 # Construct experiment name
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"gem-${ENV_NAME}-self-distill-multi-episode-${MODEL_NAME}"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"gem-${ENV_NAME}-self-distill-multi-episode-${MODEL_NAME}-${TEACHER_REG_SUFFIX}"}
 
 # Multi-episode + SDPO self-distillation.
 python scripts/train_multi_episode.py \
@@ -48,6 +60,9 @@ python scripts/train_multi_episode.py \
     +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
+    ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
+    ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
+    ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \
     rllm.disable_thinking=True \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \

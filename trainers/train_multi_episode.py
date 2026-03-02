@@ -125,10 +125,22 @@ class MultiEpisodeTaskRunner:
 
         ray_worker_group_cls = RayWorkerGroup
 
+        distill_cfg = config.rllm.get("distill", None) if hasattr(config, "rllm") else None
+        distill_enable = bool(distill_cfg is not None and distill_cfg.get("enable", False))
+        distill_teacher_regularization = (
+            str(distill_cfg.get("teacher_regularization", "none")).lower()
+            if distill_enable
+            else "none"
+        )
+
         # Set up workers based on strategy (matching vendor code pattern)
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             assert config.critic.strategy in {"fsdp", "fsdp2"}
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
+            from trainers.teacher_regularized_workers import (
+                TeacherRegularizedActorRolloutRefWorker,
+                TeacherRegularizedAsyncActorRolloutRefWorker,
+            )
 
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
@@ -139,14 +151,25 @@ class MultiEpisodeTaskRunner:
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
+            if distill_teacher_regularization != "none":
+                actor_rollout_cls = (
+                    TeacherRegularizedAsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else TeacherRegularizedActorRolloutRefWorker
+                )
+            else:
+                actor_rollout_cls = (
+                    AsyncActorRolloutRefWorker
+                    if config.actor_rollout_ref.rollout.mode == "async"
+                    else ActorRolloutRefWorker
+                )
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+            if distill_teacher_regularization != "none":
+                raise ValueError(
+                    "rllm.distill.teacher_regularization currently supports only fsdp/fsdp2 strategy."
+                )
             from verl.workers.megatron_workers import (
                 ActorRolloutRefWorker,
                 AsyncActorRolloutRefWorker,

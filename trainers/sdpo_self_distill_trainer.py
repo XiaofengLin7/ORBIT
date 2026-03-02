@@ -3,7 +3,7 @@
 This module implements shared-weight self-distillation where each training step
 performs:
 1. Standard teacher RL update on full multi-episode rollouts.
-2. SDPO-style auxiliary actor update over first-attempt tokens only.
+2. SDPO-style distillation bonus merged into the same actor update.
 
 Distillation uses a strict context-overflow guard on denominator scoring length:
 ``L_den = len(denominator_prompt_tokens) + len(first_attempt_sequence_tokens)``,
@@ -43,15 +43,18 @@ class DistillSettings:
     context_overflow_policy: str = "skip_loss"
     min_distill_tokens: int = 1
     teacher_context_attempts: int | None = None
+    teacher_regularization: str = "none"
+    teacher_update_rate: float = 0.05
+    teacher_update_interval: int = 10
 
 
 @dataclass
 class DistillPayload:
     """Prepared distillation payload for one optimization step."""
 
-    numerator_batch: DataProto
     denominator_batch: DataProto
     distill_mask: torch.Tensor
+    kept_indices: torch.Tensor
     skipped_context_overflow: int
     total_samples: int
     kept_samples: int
@@ -72,6 +75,14 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
         Tensor prompt tokens for denominator context, or ``None`` when records
         are malformed, non-cumulative, missing/invalid boundary metadata at
         transitions, or insufficient complete attempts exist.
+
+    Notes:
+        A complete attempt is usually confirmed by a transition to a later
+        ``episode_index`` with valid boundary metadata on the previous step.
+        For trajectories that end immediately after an episode completes
+        (e.g., total step cap reached, no next reset), we also treat the final
+        completed attempt as available context using the accumulated
+        prompt+completion prefix from the last step.
     """
     if not step_records:
         return None
@@ -128,6 +139,14 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
         accumulated = current_prompt_ids + list(current_completion_ids)
         prev_episode_index = current_episode_index
         prev_step = step
+
+    # If the trajectory ends right after an episode completion, there is no
+    # subsequent step to expose a transition. Count this terminal completed
+    # attempt so strict teacher_context_attempts does not require a "next"
+    # episode that never exists at step-cap end.
+    last_step = step_records[-1]
+    if bool(last_step.get("episode_done", False)):
+        complete_attempt_contexts.append(list(accumulated))
 
     if not complete_attempt_contexts:
         return None
@@ -246,6 +265,33 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         cfg = self.config.rllm.get("distill", {})
         if cfg is None:
             cfg = {}
+        teacher_regularization = str(cfg.get("teacher_regularization", "none")).lower()
+        valid_teacher_regularization = {"none", "ema", "every_n_steps"}
+        if teacher_regularization not in valid_teacher_regularization:
+            raise ValueError(
+                "rllm.distill.teacher_regularization must be one of "
+                f"{sorted(valid_teacher_regularization)}, got {teacher_regularization}"
+            )
+        teacher_update_rate = float(cfg.get("teacher_update_rate", 0.05))
+        teacher_update_interval = int(cfg.get("teacher_update_interval", 10))
+        if teacher_regularization == "ema" and not (0.0 <= teacher_update_rate <= 1.0):
+            raise ValueError(
+                f"rllm.distill.teacher_update_rate must be in [0, 1] for ema mode, got {teacher_update_rate}"
+            )
+        if teacher_regularization == "every_n_steps" and teacher_update_interval < 1:
+            raise ValueError(
+                "rllm.distill.teacher_update_interval must be >= 1 for every_n_steps mode, "
+                f"got {teacher_update_interval}"
+            )
+        use_kl_in_reward = bool(getattr(self.config.algorithm, "use_kl_in_reward", False))
+        actor_cfg = getattr(self.config.actor_rollout_ref, "actor", None)
+        use_kl_loss = bool(getattr(actor_cfg, "use_kl_loss", False)) if actor_cfg is not None else False
+        if teacher_regularization != "none" and (use_kl_in_reward or use_kl_loss):
+            raise ValueError(
+                "Teacher-regularized distillation (rllm.distill.teacher_regularization != 'none') "
+                "is incompatible with KL reference-policy path. Disable algorithm.use_kl_in_reward "
+                "and actor_rollout_ref.actor.use_kl_loss."
+            )
         teacher_context_attempts_raw = cfg.get("teacher_context_attempts", None)
         teacher_context_attempts = (
             int(teacher_context_attempts_raw) if teacher_context_attempts_raw is not None else None
@@ -263,6 +309,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             context_overflow_policy=str(cfg.get("context_overflow_policy", "skip_loss")),
             min_distill_tokens=int(cfg.get("min_distill_tokens", 1)),
             teacher_context_attempts=teacher_context_attempts,
+            teacher_regularization=teacher_regularization,
+            teacher_update_rate=teacher_update_rate,
+            teacher_update_interval=teacher_update_interval,
         )
 
     def _transform_agent_trajectories(
@@ -291,10 +340,14 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             if usable > 0:
                 first_attempt_masks[i, :usable] = mask[:usable].float()
         final_gen_batch_output.batch["first_attempt_response_mask"] = first_attempt_masks
+        final_gen_batch_output.batch["distill_traj_idx"] = torch.arange(
+            len(trajectories),
+            dtype=torch.long,
+        )
         return final_gen_batch_output, metrics
 
     def _prepare_distill_payload(self, batch: DataProto) -> tuple[DistillPayload | None, dict[str, float]]:
-        """Prepare numerator/denominator batches and token masks for distillation."""
+        """Prepare denominator batch and token masks for merged distillation."""
         if not self.distill_settings.enable:
             return None, {}
         if not self._latest_token_trajectories:
@@ -315,7 +368,18 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         first_attempt_mask = first_attempt_mask.float()
         distill_mask = response_mask * first_attempt_mask
 
-        total_samples = min(len(self._latest_token_trajectories), batch.batch["responses"].shape[0])
+        traj_indices = batch.batch.get("distill_traj_idx")
+        if traj_indices is None:
+            traj_indices = torch.arange(
+                batch.batch["responses"].shape[0],
+                dtype=torch.long,
+            )
+        elif not isinstance(traj_indices, torch.Tensor):
+            traj_indices = torch.as_tensor(traj_indices, dtype=torch.long)
+        else:
+            traj_indices = traj_indices.long()
+
+        total_samples = int(batch.batch["responses"].shape[0])
         original_response_len = int(batch.batch["responses"].shape[1])
         kept_indices: list[int] = []
         denominator_prompt_tokens_per_sample: list[torch.Tensor] = []
@@ -340,7 +404,16 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             if float(distill_mask[i].sum().item()) <= 0:
                 continue
 
-            step_records = self._latest_token_trajectories[i].get("step_records", [])
+            traj_idx = int(traj_indices[i].item())
+            if traj_idx < 0 or traj_idx >= len(self._latest_token_trajectories):
+                skipped_hindsight_unavailable += 1
+                continue
+            trajectory = self._latest_token_trajectories[traj_idx]
+            if not isinstance(trajectory, dict):
+                skipped_hindsight_unavailable += 1
+                continue
+
+            step_records = trajectory.get("step_records", [])
             if not isinstance(step_records, list):
                 skipped_hindsight_unavailable += 1
                 continue
@@ -397,7 +470,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 "distill/kept_ratio": 0.0,
             }
 
-        selected = batch.select_idxs(np.array(kept_indices))
         selected_den = batch.select_idxs(np.array(kept_indices))
 
         pad_token_id = int(self.tokenizer.pad_token_id)
@@ -434,19 +506,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             prefix_response_mask[i, :row_len] = first_attempt_prefix_response_masks_per_sample[i]
             selected_distill_mask[i, :row_len] = first_attempt_prefix_distill_masks_per_sample[i]
 
-        # Numerator batch uses original prompt context with first-attempt prefix responses.
-        numerator_prompts = selected.batch["prompts"]
-        numerator_prompt_attention = selected.batch["attention_mask"][:, :-original_response_len]
-        numerator_attention_mask = torch.cat([numerator_prompt_attention.long(), prefix_response_mask], dim=1)
-        numerator_position_ids = (torch.cumsum(numerator_attention_mask, dim=1) - 1) * numerator_attention_mask
-        numerator_input_ids = torch.cat([numerator_prompts, responses], dim=1)
-
-        selected.batch["responses"] = responses
-        selected.batch["response_mask"] = prefix_response_mask
-        selected.batch["input_ids"] = numerator_input_ids
-        selected.batch["attention_mask"] = numerator_attention_mask
-        selected.batch["position_ids"] = numerator_position_ids
-
         # Denominator batch uses teacher hindsight prompt with same first-attempt prefix responses.
         prompt_lens = torch.as_tensor([int(x.numel()) for x in prompt_rows], dtype=torch.long)
         prompt_pos = torch.arange(max_prompt_len).unsqueeze(0)
@@ -462,11 +521,11 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         selected_den.batch["attention_mask"] = denominator_attention_mask
         selected_den.batch["position_ids"] = denominator_position_ids
 
-        kept_samples = int(selected.batch["responses"].shape[0])
+        kept_samples = int(selected_den.batch["responses"].shape[0])
         payload = DistillPayload(
-            numerator_batch=selected,
             denominator_batch=selected_den,
             distill_mask=selected_distill_mask,
+            kept_indices=torch.as_tensor(kept_indices, dtype=torch.long),
             skipped_context_overflow=skipped_context_overflow,
             total_samples=total_samples,
             kept_samples=kept_samples,
@@ -494,34 +553,22 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
     def _pad_distill_inputs_to_world_size(
         self,
-        numerator_batch: DataProto,
         denominator_batch: DataProto,
         distill_mask: torch.Tensor,
         world_size: int,
-    ) -> tuple[DataProto, DataProto, torch.Tensor]:
-        """Pad distillation inputs to world-size divisor and zero out padded mask rows."""
-        if len(numerator_batch) != len(denominator_batch):
-            raise ValueError(
-                "Numerator and denominator batch sizes must match for distillation. "
-                f"Got {len(numerator_batch)} and {len(denominator_batch)}."
-            )
-        if int(distill_mask.shape[0]) != len(numerator_batch):
+    ) -> tuple[DataProto, torch.Tensor]:
+        """Pad denominator distillation inputs to world-size divisor."""
+        if int(distill_mask.shape[0]) != len(denominator_batch):
             raise ValueError(
                 "distill_mask first dimension must match distill batch size. "
-                f"Got {int(distill_mask.shape[0])} and {len(numerator_batch)}."
+                f"Got {int(distill_mask.shape[0])} and {len(denominator_batch)}."
             )
 
-        numerator_batch, num_pad_size = pad_dataproto_to_divisor(numerator_batch, world_size)
         denominator_batch, den_pad_size = pad_dataproto_to_divisor(denominator_batch, world_size)
-        if num_pad_size != den_pad_size:
-            raise RuntimeError(
-                "Numerator/denominator padding mismatch. "
-                f"Got num_pad_size={num_pad_size}, den_pad_size={den_pad_size}."
-            )
-        if num_pad_size <= 0:
-            return numerator_batch, denominator_batch, distill_mask
+        if den_pad_size <= 0:
+            return denominator_batch, distill_mask
 
-        mask_pad_shape = (num_pad_size, *distill_mask.shape[1:])
+        mask_pad_shape = (den_pad_size, *distill_mask.shape[1:])
         distill_mask = torch.cat(
             [
                 distill_mask,
@@ -529,16 +576,50 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             ],
             dim=0,
         )
-        return numerator_batch, denominator_batch, distill_mask
+        return denominator_batch, distill_mask
 
-    def _run_distill_update(
+    def _initialize_teacher_snapshot_if_needed(self, timing_raw: dict[str, float]) -> float:
+        """Initialize teacher snapshot from actor after checkpoint load."""
+        if not self.distill_settings.enable:
+            return 0.0
+        if self.distill_settings.teacher_regularization == "none":
+            return 0.0
+        with marked_timer("distill_teacher_init_sync", timing_raw):
+            self.actor_rollout_wg.sync_teacher_from_actor(mode="hard", update_rate=0.0)
+        return 1.0
+
+    def _maybe_sync_teacher_after_actor_update(self, timing_raw: dict[str, float]) -> float:
+        """Apply configured teacher sync schedule after actor update."""
+        if not self.distill_settings.enable:
+            return 0.0
+        mode = self.distill_settings.teacher_regularization
+        if mode == "none":
+            return 0.0
+        if mode == "ema":
+            with marked_timer("distill_teacher_sync", timing_raw):
+                self.actor_rollout_wg.sync_teacher_from_actor(
+                    mode="ema",
+                    update_rate=self.distill_settings.teacher_update_rate,
+                )
+            return 1.0
+        if mode == "every_n_steps":
+            if self.global_steps % self.distill_settings.teacher_update_interval != 0:
+                return 0.0
+            with marked_timer("distill_teacher_sync", timing_raw):
+                self.actor_rollout_wg.sync_teacher_from_actor(mode="hard", update_rate=0.0)
+            return 1.0
+        raise ValueError(f"Unsupported teacher_regularization mode: {mode}")
+
+    def _compute_distill_bonus(
         self,
+        batch: DataProto,
         payload: DistillPayload | None,
         timing_raw: dict[str, float],
-    ) -> dict[str, float]:
-        """Run one SDPO-style auxiliary actor update."""
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute SDPO-style distillation bonus to merge into actor advantages."""
+        bonus = torch.zeros_like(batch.batch["advantages"])
         if not self.distill_settings.enable or payload is None:
-            return {
+            return bonus, {
                 "distill/sdpo_loss": 0.0,
                 "distill/log_ratio_mean": 0.0,
                 "distill/log_ratio_std": 0.0,
@@ -548,7 +629,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         token_count = int(payload.distill_mask.sum().item())
         if token_count < self.distill_settings.min_distill_tokens:
-            return {
+            return bonus, {
                 "distill/sdpo_loss": 0.0,
                 "distill/log_ratio_mean": 0.0,
                 "distill/log_ratio_std": 0.0,
@@ -556,20 +637,31 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 "distill/skipped_batches": 1.0,
             }
 
-        numerator_batch, denominator_batch, distill_mask = self._pad_distill_inputs_to_world_size(
-            numerator_batch=payload.numerator_batch,
+        denominator_batch, distill_mask = self._pad_distill_inputs_to_world_size(
             denominator_batch=payload.denominator_batch,
             distill_mask=payload.distill_mask,
             world_size=self.actor_rollout_wg.world_size,
         )
 
-        with marked_timer("distill_num_log_prob", timing_raw):
-            numerator_log_prob = self.actor_rollout_wg.compute_log_prob(numerator_batch)
         with marked_timer("distill_den_log_prob", timing_raw):
-            denominator_log_prob = self.actor_rollout_wg.compute_log_prob(denominator_batch)
+            if self.distill_settings.teacher_regularization == "none":
+                denominator_log_prob = self.actor_rollout_wg.compute_log_prob(denominator_batch)
+            else:
+                denominator_log_prob = self.actor_rollout_wg.compute_teacher_log_prob(denominator_batch)
 
-        num_lp = numerator_log_prob.batch["old_log_probs"]
-        den_lp = denominator_log_prob.batch["old_log_probs"]
+        kept_count = int(payload.kept_indices.numel())
+        den_lp = denominator_log_prob.batch["old_log_probs"][:kept_count]
+        distill_mask = distill_mask[:kept_count]
+        max_response_len = int(distill_mask.shape[1])
+
+        kept_indices = payload.kept_indices.to(
+            dtype=torch.long,
+            device=batch.batch["old_log_probs"].device,
+        )
+        num_lp = batch.batch["old_log_probs"].index_select(0, kept_indices)[:, :max_response_len]
+        den_lp = den_lp.to(device=num_lp.device, dtype=num_lp.dtype)
+        distill_mask = distill_mask.to(device=num_lp.device, dtype=num_lp.dtype)
+
         distill_adv, stats = compute_sdpo_advantages(
             numerator_log_probs=num_lp,
             denominator_log_probs=den_lp,
@@ -577,23 +669,10 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             lambda_coef=self.distill_settings.lambda_coef,
         )
 
-        distill_batch = numerator_batch.union(numerator_log_prob)
-        distill_batch.batch["advantages"] = distill_adv
-        distill_batch.batch["returns"] = distill_adv
-
-        if self.use_reference_policy and self.config.actor_rollout_ref.actor.use_kl_loss:
-            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(distill_batch)
-            distill_batch = distill_batch.union(ref_log_prob)
-
-        distill_batch = self._pad_to_world_size(distill_batch, world_size=self.actor_rollout_wg.world_size)
-        with marked_timer("update_actor_distill", timing_raw):
-            actor_output = self.actor_rollout_wg.update_actor(distill_batch)
-        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-        prefixed_actor_metrics = {f"distill_actor/{k}": float(v) for k, v in actor_output_metrics.items()}
-
-        stats.update(prefixed_actor_metrics)
+        scatter_indices = payload.kept_indices.to(dtype=torch.long, device=bonus.device)
+        bonus[scatter_indices, :max_response_len] = distill_adv.to(device=bonus.device, dtype=bonus.dtype)
         stats["distill/skipped_batches"] = 0.0
-        return stats
+        return bonus, stats
 
     def fit_agent(self):
         """Run PPO training with additional SDPO self-distillation actor updates."""
@@ -609,6 +688,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
+        self._initialize_teacher_snapshot_if_needed(timing_raw={})
 
         import time
 
@@ -637,6 +717,8 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
                 metrics: dict[str, float] = {}
                 timing_raw: dict[str, float] = {}
+                if self.distill_settings.enable:
+                    metrics["distill/teacher_sync_applied"] = 0.0
 
                 batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
 
@@ -661,8 +743,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                         )
                         batch = batch.union(final_gen_batch_output)
                         metrics.update(generate_metrics)
-                        distill_payload, distill_prep_metrics = self._prepare_distill_payload(batch)
-                        metrics.update(distill_prep_metrics)
 
                     if self.use_critic:
                         with marked_timer("values", timing_raw):
@@ -747,6 +827,17 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                         mask = batch.batch["attention_mask"][:, -1] == 1
                         batch = batch[~mask]
 
+                    if not self.config.rllm.stepwise_advantage.enable:
+                        distill_payload, distill_prep_metrics = self._prepare_distill_payload(batch)
+                        metrics.update(distill_prep_metrics)
+                        distill_bonus, distill_metrics = self._compute_distill_bonus(
+                            batch=batch,
+                            payload=distill_payload,
+                            timing_raw=timing_raw,
+                        )
+                        batch.batch["advantages"] = batch.batch["advantages"] + distill_bonus
+                        metrics.update(distill_metrics)
+
                     batch = self._pad_dataproto_to_world_size(batch=batch)
                     self._balance_batch(batch, metrics=metrics)
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -762,12 +853,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update({k: float(v) for k, v in actor_output_metrics.items()})
-
-                        distill_metrics = self._run_distill_update(
-                            payload=distill_payload,
-                            timing_raw=timing_raw,
-                        )
-                        metrics.update(distill_metrics)
+                        teacher_sync_applied = self._maybe_sync_teacher_after_actor_update(timing_raw=timing_raw)
+                        if self.distill_settings.enable:
+                            metrics["distill/teacher_sync_applied"] = float(teacher_sync_applied)
 
                     if (
                         self.val_reward_fn is not None

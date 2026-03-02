@@ -9,6 +9,7 @@ import sys
 import types
 
 import torch
+from omegaconf import OmegaConf
 
 _ROOT = Path(__file__).resolve().parents[1]
 for _extra_path in (_ROOT, _ROOT / "third_party" / "rllm", _ROOT / "third_party" / "verl"):
@@ -46,6 +47,12 @@ class _FakeDataProto:
         self.batch = batch
         self.meta_info: dict[str, Any] = {}
 
+    def __len__(self) -> int:
+        if not self.batch:
+            return 0
+        first_tensor = next(iter(self.batch.values()))
+        return int(first_tensor.shape[0])
+
     def select_idxs(self, indices: Any) -> "_FakeDataProto":
         idx = torch.as_tensor(indices, dtype=torch.long)
         return _FakeDataProto({k: v[idx] for k, v in self.batch.items()})
@@ -69,10 +76,23 @@ class _FakeActorRolloutWG:
         self.world_size = 1
         self.update_calls = 0
         self.last_update_batch: _FakeDataProto | None = None
+        self.compute_log_prob_calls = 0
+        self.compute_teacher_log_prob_calls = 0
+        self.sync_calls: list[dict[str, float | str]] = []
 
     def compute_log_prob(self, batch: _FakeDataProto) -> _FakeDataProto:
+        self.compute_log_prob_calls += 1
         responses = batch.batch["responses"].float()
         return _FakeDataProto({"old_log_probs": responses / 10.0})
+
+    def compute_teacher_log_prob(self, batch: _FakeDataProto) -> _FakeDataProto:
+        self.compute_teacher_log_prob_calls += 1
+        responses = batch.batch["responses"].float()
+        return _FakeDataProto({"old_log_probs": responses / 20.0})
+
+    def sync_teacher_from_actor(self, mode: str, update_rate: float = 0.0) -> dict[str, float]:
+        self.sync_calls.append({"mode": mode, "update_rate": float(update_rate)})
+        return {"applied": 1.0}
 
     def update_actor(self, batch: _FakeDataProto) -> _FakeActorOutput:
         self.update_calls += 1
@@ -97,6 +117,28 @@ def _build_trainer_for_unit_tests() -> JointSDPOSelfDistillTrainer:
     return trainer
 
 
+def _make_settings_config(distill_cfg: dict[str, Any]) -> Any:
+    return OmegaConf.create(
+        {
+            "data": {
+                "max_prompt_length": 10,
+                "max_response_length": 5,
+            },
+            "rllm": {
+                "distill": distill_cfg,
+            },
+            "algorithm": {
+                "use_kl_in_reward": False,
+            },
+            "actor_rollout_ref": {
+                "actor": {
+                    "use_kl_loss": False,
+                }
+            },
+        }
+    )
+
+
 def test_denominator_overflow_guard_gt_and_eq() -> None:
     assert (
         should_skip_denominator_overflow(
@@ -114,6 +156,91 @@ def test_denominator_overflow_guard_gt_and_eq() -> None:
         )
         is False
     )
+
+
+def test_load_distill_settings_teacher_regularization_valid_modes() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config({"teacher_regularization": "none"})
+    settings = trainer._load_distill_settings()
+    assert settings.teacher_regularization == "none"
+    assert settings.teacher_update_rate == 0.05
+    assert settings.teacher_update_interval == 10
+
+    trainer.config = _make_settings_config(
+        {
+            "teacher_regularization": "ema",
+            "teacher_update_rate": 0.2,
+        }
+    )
+    settings = trainer._load_distill_settings()
+    assert settings.teacher_regularization == "ema"
+    assert settings.teacher_update_rate == 0.2
+
+    trainer.config = _make_settings_config(
+        {
+            "teacher_regularization": "every_n_steps",
+            "teacher_update_interval": 3,
+        }
+    )
+    settings = trainer._load_distill_settings()
+    assert settings.teacher_regularization == "every_n_steps"
+    assert settings.teacher_update_interval == 3
+
+
+def test_load_distill_settings_teacher_regularization_invalid_mode() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config({"teacher_regularization": "bad_mode"})
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "teacher_regularization" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid teacher_regularization")
+
+
+def test_load_distill_settings_teacher_regularization_invalid_ema_rate() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {
+            "teacher_regularization": "ema",
+            "teacher_update_rate": 1.2,
+        }
+    )
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "teacher_update_rate" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid teacher_update_rate")
+
+
+def test_load_distill_settings_teacher_regularization_invalid_interval() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {
+            "teacher_regularization": "every_n_steps",
+            "teacher_update_interval": 0,
+        }
+    )
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "teacher_update_interval" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for invalid teacher_update_interval")
+
+
+def test_load_distill_settings_teacher_regularization_kl_guard() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    cfg = _make_settings_config({"teacher_regularization": "ema"})
+    cfg.algorithm.use_kl_in_reward = True
+    trainer.config = cfg
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "incompatible" in str(exc).lower()
+    else:
+        raise AssertionError("Expected ValueError for KL incompatibility")
 
 
 def test_denominator_overflow_guard_counts_prompt_in_denominator_context() -> None:
@@ -309,6 +436,36 @@ def test_build_hindsight_prompt_tokens_first_n_complete_attempts_insufficient_re
         teacher_context_attempts=2,
     )
     assert hindsight is None
+
+
+def test_build_hindsight_prompt_tokens_final_completed_attempt_without_next_transition() -> None:
+    step_records = [
+        {
+            "prompt_ids": [1],
+            "completion_ids": [2],
+            "episode_index": 0,
+            "boundary_transition": True,
+            "boundary_terminal_env_token_len": 1,
+            "boundary_next_initial_env_token_len": 1,
+            "episode_done": True,
+        },
+        {
+            "prompt_ids": [1, 2, 30, 31],
+            "completion_ids": [4],
+            "episode_index": 1,
+            "boundary_transition": False,
+            "boundary_terminal_env_token_len": 0,
+            "boundary_next_initial_env_token_len": 0,
+            # Final attempt completes at trajectory end (no third attempt reset).
+            "episode_done": True,
+        },
+    ]
+    hindsight = build_hindsight_prompt_tokens_first_n_complete_attempts(
+        step_records=step_records,
+        teacher_context_attempts=2,
+    )
+    assert hindsight is not None
+    assert hindsight.tolist() == [1, 2, 30, 31, 4]
 
 
 def test_build_hindsight_prompt_tokens_first_n_complete_attempts_null_uses_all_complete_only() -> None:
@@ -507,70 +664,89 @@ def test_prepare_distill_payload_mixed_batch_partial_skip() -> None:
     assert metrics["distill/skipped_hindsight_unavailable"] == 1.0
     assert abs(metrics["distill/kept_ratio"] - (1.0 / 3.0)) < 1e-6
     assert payload.denominator_batch.batch["prompts"][0].tolist() == [1, 2, 3, 4, 5, 1, 2, 3]
-    assert payload.numerator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
     assert payload.denominator_batch.batch["responses"][0].tolist() == [11, 90, 12, 91]
     assert payload.distill_mask[0].tolist() == [1.0, 0.0, 0.0, 1.0]
+    assert payload.kept_indices.tolist() == [0]
 
 
-def test_run_distill_update_only_runs_on_nonempty_payload() -> None:
+def test_compute_distill_bonus_requires_nonempty_payload() -> None:
     trainer = _build_trainer_for_unit_tests()
     trainer.actor_rollout_wg = _FakeActorRolloutWG()
-    trainer.use_reference_policy = False
-    trainer.config = SimpleNamespace(
-        actor_rollout_ref=SimpleNamespace(actor=SimpleNamespace(use_kl_loss=False)),
-    )
-    trainer._pad_to_world_size = lambda batch, world_size: batch
     trainer._pad_distill_inputs_to_world_size = (
-        lambda numerator_batch, denominator_batch, distill_mask, world_size: (
-            numerator_batch,
+        lambda denominator_batch, distill_mask, world_size: (
             denominator_batch,
             distill_mask,
         )
     )
+    batch = _FakeDataProto(
+        {
+            "advantages": torch.zeros((1, 2)),
+            "old_log_probs": torch.tensor([[1.0, 2.0]]),
+        }
+    )
 
-    skipped = trainer._run_distill_update(payload=None, timing_raw={})
+    skipped_bonus, skipped = trainer._compute_distill_bonus(batch=batch, payload=None, timing_raw={})
+    assert torch.allclose(skipped_bonus, torch.zeros((1, 2)))
     assert skipped["distill/skipped_batches"] == 1.0
-    assert trainer.actor_rollout_wg.update_calls == 0
 
     payload = DistillPayload(
-        numerator_batch=_FakeDataProto({"responses": torch.tensor([[10.0, 20.0]])}),
         denominator_batch=_FakeDataProto({"responses": torch.tensor([[8.0, 15.0]])}),
         distill_mask=torch.tensor([[1.0, 1.0]]),
+        kept_indices=torch.tensor([0], dtype=torch.long),
         skipped_context_overflow=0,
         total_samples=1,
         kept_samples=1,
     )
-    kept = trainer._run_distill_update(payload=payload, timing_raw={})
+    kept_bonus, kept = trainer._compute_distill_bonus(batch=batch, payload=payload, timing_raw={})
+    assert torch.allclose(kept_bonus, torch.tensor([[0.02, 0.05]]), atol=1e-6)
     assert kept["distill/skipped_batches"] == 0.0
-    assert trainer.actor_rollout_wg.update_calls == 1
+    assert kept["distill/token_count"] == 2.0
+    assert trainer.actor_rollout_wg.compute_log_prob_calls == 1
+    assert trainer.actor_rollout_wg.compute_teacher_log_prob_calls == 0
 
 
-def test_run_distill_update_zero_masks_padded_rows() -> None:
+def test_compute_distill_bonus_uses_teacher_logprob_when_regularized() -> None:
     trainer = _build_trainer_for_unit_tests()
     trainer.actor_rollout_wg = _FakeActorRolloutWG()
-    trainer.use_reference_policy = False
-    trainer.config = SimpleNamespace(
-        actor_rollout_ref=SimpleNamespace(actor=SimpleNamespace(use_kl_loss=False)),
-    )
-    trainer._pad_to_world_size = lambda batch, world_size: batch
+    trainer.distill_settings.teacher_regularization = "ema"
     trainer._pad_distill_inputs_to_world_size = (
-        lambda numerator_batch, denominator_batch, distill_mask, world_size: (
+        lambda denominator_batch, distill_mask, world_size: (
+            denominator_batch,
+            distill_mask,
+        )
+    )
+    batch = _FakeDataProto(
+        {
+            "advantages": torch.zeros((1, 2)),
+            "old_log_probs": torch.tensor([[1.0, 2.0]]),
+        }
+    )
+    payload = DistillPayload(
+        denominator_batch=_FakeDataProto({"responses": torch.tensor([[8.0, 15.0]])}),
+        distill_mask=torch.tensor([[1.0, 1.0]]),
+        kept_indices=torch.tensor([0], dtype=torch.long),
+        skipped_context_overflow=0,
+        total_samples=1,
+        kept_samples=1,
+    )
+    bonus, metrics = trainer._compute_distill_bonus(batch=batch, payload=payload, timing_raw={})
+    assert torch.allclose(bonus, torch.tensor([[0.06, 0.125]]), atol=1e-6)
+    assert metrics["distill/skipped_batches"] == 0.0
+    assert trainer.actor_rollout_wg.compute_log_prob_calls == 0
+    assert trainer.actor_rollout_wg.compute_teacher_log_prob_calls == 1
+
+
+def test_compute_distill_bonus_zero_masks_padded_rows() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer._pad_distill_inputs_to_world_size = (
+        lambda denominator_batch, distill_mask, world_size: (
             _FakeDataProto(
                 {
                     "responses": torch.tensor(
                         [
                             [10.0, 20.0],
                             [100.0, 200.0],
-                        ]
-                    )
-                }
-            ),
-            _FakeDataProto(
-                {
-                    "responses": torch.tensor(
-                        [
-                            [8.0, 15.0],
-                            [80.0, 190.0],
                         ]
                     )
                 }
@@ -583,21 +759,97 @@ def test_run_distill_update_zero_masks_padded_rows() -> None:
             ),
         )
     )
+    batch = _FakeDataProto(
+        {
+            "advantages": torch.zeros((2, 2)),
+            "old_log_probs": torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [10.0, 20.0],
+                ]
+            ),
+        }
+    )
 
     payload = DistillPayload(
-        numerator_batch=_FakeDataProto({"responses": torch.tensor([[10.0, 20.0]])}),
         denominator_batch=_FakeDataProto({"responses": torch.tensor([[8.0, 15.0]])}),
         distill_mask=torch.tensor([[1.0, 1.0]]),
+        kept_indices=torch.tensor([0], dtype=torch.long),
         skipped_context_overflow=0,
         total_samples=1,
         kept_samples=1,
     )
-    metrics = trainer._run_distill_update(payload=payload, timing_raw={})
+    bonus, metrics = trainer._compute_distill_bonus(batch=batch, payload=payload, timing_raw={})
 
     assert metrics["distill/skipped_batches"] == 0.0
     assert metrics["distill/token_count"] == 2.0
-    assert trainer.actor_rollout_wg.last_update_batch is not None
-    assert torch.allclose(
-        trainer.actor_rollout_wg.last_update_batch.batch["advantages"][1],
-        torch.zeros(2),
+    assert torch.allclose(bonus[1], torch.zeros(2))
+
+
+def test_compute_distill_bonus_respects_min_token_gate() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer.distill_settings.min_distill_tokens = 3
+    trainer._pad_distill_inputs_to_world_size = (
+        lambda denominator_batch, distill_mask, world_size: (
+            denominator_batch,
+            distill_mask,
+        )
     )
+    batch = _FakeDataProto(
+        {
+            "advantages": torch.zeros((1, 2)),
+            "old_log_probs": torch.tensor([[1.0, 2.0]]),
+        }
+    )
+    payload = DistillPayload(
+        denominator_batch=_FakeDataProto({"responses": torch.tensor([[8.0, 15.0]])}),
+        distill_mask=torch.tensor([[1.0, 1.0]]),
+        kept_indices=torch.tensor([0], dtype=torch.long),
+        skipped_context_overflow=0,
+        total_samples=1,
+        kept_samples=1,
+    )
+
+    bonus, metrics = trainer._compute_distill_bonus(batch=batch, payload=payload, timing_raw={})
+    assert torch.allclose(bonus, torch.zeros((1, 2)))
+    assert metrics["distill/skipped_batches"] == 1.0
+    assert metrics["distill/token_count"] == 2.0
+
+
+def test_teacher_sync_hooks_init_and_post_update() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer.global_steps = 6
+    trainer.distill_settings.teacher_regularization = "ema"
+    trainer.distill_settings.teacher_update_rate = 0.25
+    trainer.distill_settings.teacher_update_interval = 3
+
+    init_applied = trainer._initialize_teacher_snapshot_if_needed(timing_raw={})
+    assert init_applied == 1.0
+    assert len(trainer.actor_rollout_wg.sync_calls) == 1
+    assert trainer.actor_rollout_wg.sync_calls[0]["mode"] == "hard"
+
+    post_applied = trainer._maybe_sync_teacher_after_actor_update(timing_raw={})
+    assert post_applied == 1.0
+    assert len(trainer.actor_rollout_wg.sync_calls) == 2
+    assert trainer.actor_rollout_wg.sync_calls[1]["mode"] == "ema"
+    assert trainer.actor_rollout_wg.sync_calls[1]["update_rate"] == 0.25
+
+
+def test_teacher_sync_hooks_every_n_steps_interval() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer.distill_settings.teacher_regularization = "every_n_steps"
+    trainer.distill_settings.teacher_update_interval = 4
+
+    trainer.global_steps = 5
+    not_applied = trainer._maybe_sync_teacher_after_actor_update(timing_raw={})
+    assert not_applied == 0.0
+    assert len(trainer.actor_rollout_wg.sync_calls) == 0
+
+    trainer.global_steps = 8
+    applied = trainer._maybe_sync_teacher_after_actor_update(timing_raw={})
+    assert applied == 1.0
+    assert len(trainer.actor_rollout_wg.sync_calls) == 1
+    assert trainer.actor_rollout_wg.sync_calls[0]["mode"] == "hard"

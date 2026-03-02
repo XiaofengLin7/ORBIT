@@ -19,11 +19,27 @@ fi
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
+TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
+TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
+TEACHER_UPDATE_INTERVAL=${TEACHER_UPDATE_INTERVAL:-25}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
 
 MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 CONFIG_NAME=$(basename "$TASKS_CONFIG" .yaml | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+ENABLE_SELF_DISTILL=${ENABLE_SELF_DISTILL:-True}
+
+if [ "$TEACHER_REGULARIZATION" = "ema" ]; then
+    TEACHER_REG_SUFFIX="teacher-ema-a-${TEACHER_UPDATE_RATE}"
+elif [ "$TEACHER_REGULARIZATION" = "every_n_steps" ]; then
+    TEACHER_REG_SUFFIX="teacher-every-${TEACHER_UPDATE_INTERVAL}"
+else
+    TEACHER_REG_SUFFIX="teacher-none"
+fi
+
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-"frozenlake-multi-episode-${CONFIG_NAME}-${MODEL_NAME}"}
+if [ "$ENABLE_SELF_DISTILL" = True ]; then
+    EXPERIMENT_NAME="${EXPERIMENT_NAME}-self-distill-lambda-${DISTILL_LAMBDA}-${TEACHER_REG_SUFFIX}"
+fi
 
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
@@ -34,7 +50,7 @@ python scripts/train_multi_episode.py \
     +rllm.env.env_args.success_reward=1.0 \
     +rllm.env.env_args.episode_header="New episode begins." \
     +rllm.env.env_args.enable_reflection=False \
-    rllm.distill.enable=False \
+    rllm.distill.enable=$ENABLE_SELF_DISTILL \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=sdpo_self \
     +rllm.distill.context_limit=32768 \
@@ -42,6 +58,9 @@ python scripts/train_multi_episode.py \
     +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
+    ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
+    ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
+    ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \
     rllm.disable_thinking=True \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \
