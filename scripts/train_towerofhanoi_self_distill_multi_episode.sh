@@ -15,7 +15,8 @@ ENV_ID=${ENV_ID:-game:TowerofHanoi-v0-easy}
 TOTAL_STEP_CAP=${TOTAL_STEP_CAP:-30}
 MAX_TURNS_PER_EPISODE=${MAX_TURNS_PER_EPISODE:-10}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
-DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
+DISTILL_LAMBDA=${DISTILL_LAMBDA:-1.0}
+DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
 TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
 TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
 TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
@@ -33,6 +34,11 @@ elif [ "$TEACHER_REGULARIZATION" = "every_n_steps" ]; then
     TEACHER_REG_SUFFIX="teacher-every-${TEACHER_UPDATE_INTERVAL}"
 else
     TEACHER_REG_SUFFIX="teacher-none"
+fi
+
+if [ "$DISTILL_MODE" != "sdpo_self" ] && [ "$DISTILL_MODE" != "sdpo_pure" ]; then
+    echo "Error: DISTILL_MODE must be one of: sdpo_self, sdpo_pure"
+    exit 1
 fi
 
 # Construct experiment name
@@ -54,7 +60,7 @@ python scripts/train_multi_episode.py \
     +rllm.env.env_args.enable_reflection=False \
     rllm.distill.enable=True \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
-    +rllm.distill.mode=sdpo_self \
+    +rllm.distill.mode=$DISTILL_MODE \
     +rllm.distill.context_limit=32768 \
     +rllm.distill.denominator_mode=teacher_adapted_feedback \
     +rllm.distill.context_overflow_policy=skip_loss \

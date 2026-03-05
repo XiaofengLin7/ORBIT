@@ -15,6 +15,28 @@ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_data
 from verl.utils.fsdp_utils import load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
 
+from trainers.sdpo_actor import SDPODataParallelPPOActor
+
+
+class _SDPOActorMixin:
+    """Mixin that swaps worker actor to the local SDPO-capable actor wrapper."""
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):  # type: ignore[override]
+        """Initialize models, then replace actor with local SDPO-capable wrapper."""
+        super().init_model()
+        if not self._is_actor:
+            return
+
+        existing_actor = self.actor
+        self.actor = SDPODataParallelPPOActor(
+            config=existing_actor.config,
+            actor_module=self.actor_module_fsdp,
+            actor_optimizer=self.actor_optimizer,
+        )
+        teacher_module = self.ref_module_fsdp if self._is_ref and hasattr(self, "ref_module_fsdp") else None
+        self.actor.set_teacher_module(teacher_module)
+
 
 class _TeacherRegularizationMixin:
     """Mixin that adds teacher log-prob scoring and teacher parameter sync."""
@@ -92,10 +114,25 @@ class _TeacherRegularizationMixin:
         return {"applied": 1.0}
 
 
-class TeacherRegularizedActorRolloutRefWorker(_TeacherRegularizationMixin, ActorRolloutRefWorker):
-    """Sync worker with teacher-regularization support."""
+class SDPOActorRolloutRefWorker(_SDPOActorMixin, ActorRolloutRefWorker):
+    """Sync worker that uses local SDPO-capable actor wrapper."""
 
 
-class TeacherRegularizedAsyncActorRolloutRefWorker(_TeacherRegularizationMixin, AsyncActorRolloutRefWorker):
-    """Async worker with teacher-regularization support."""
+class SDPOAsyncActorRolloutRefWorker(_SDPOActorMixin, AsyncActorRolloutRefWorker):
+    """Async worker that uses local SDPO-capable actor wrapper."""
 
+
+class TeacherRegularizedActorRolloutRefWorker(
+    _TeacherRegularizationMixin,
+    _SDPOActorMixin,
+    ActorRolloutRefWorker,
+):
+    """Sync worker with teacher regularization and local SDPO actor wrapper."""
+
+
+class TeacherRegularizedAsyncActorRolloutRefWorker(
+    _TeacherRegularizationMixin,
+    _SDPOActorMixin,
+    AsyncActorRolloutRefWorker,
+):
+    """Async worker with teacher regularization and local SDPO actor wrapper."""

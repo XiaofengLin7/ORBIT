@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Type
 from rllm.agents.agent import Action  # type: ignore
 from rllm.environments.base.base_env import BaseEnv  # type: ignore
 
-from prompts.prompt import reflection_prompt
+from prompts.prompt import reflection_prompt as default_reflection_prompt
 
 class MultiEpisodeEnv(BaseEnv):
     """Wrapper environment that runs multiple episodes of an inner environment.
@@ -39,6 +39,7 @@ class MultiEpisodeEnv(BaseEnv):
         success_reward: float = 1.0,
         episode_header: str = "New episode begins.",
         enable_reflection: bool = False,
+        reflection_prompt: str | None = default_reflection_prompt,
         **kwargs: Any,
     ):
         """Initialize the multi-episode environment wrapper.
@@ -67,7 +68,9 @@ class MultiEpisodeEnv(BaseEnv):
         self.success_reward = float(success_reward)
         self.episode_header = episode_header
         self.enable_reflection = enable_reflection
-        self.reflection_prompt = reflection_prompt
+        self.reflection_prompt = (
+            default_reflection_prompt if reflection_prompt is None else str(reflection_prompt)
+        )
 
         # Create the inner environment
         self.inner_env: BaseEnv = self.inner_env_class(**self.inner_env_kwargs)
@@ -88,6 +91,8 @@ class MultiEpisodeEnv(BaseEnv):
 
         # Reflection state
         self._waiting_for_reflection: bool = False
+        # When True, consume one final reflection action before closing trajectory.
+        self._pending_outer_done_after_reflection: bool = False
 
     @staticmethod
     def _resolve_class(class_path: str) -> Type[BaseEnv]:
@@ -133,6 +138,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._seed = seed if seed is not None else self._seed
 
         self._waiting_for_reflection = False
+        self._pending_outer_done_after_reflection = False
 
         # Reset inner environment
         observation, info = self._reset_inner_env()
@@ -166,7 +172,8 @@ class MultiEpisodeEnv(BaseEnv):
         Returns:
             observation: Next observation (with episode header on new episode).
             reward: Shaped reward (success_reward on episode success, else 0.0).
-            done: True only when total_steps >= total_step_cap.
+            done: True when trajectory is complete, including after consuming a
+                final reflection turn when reflection is enabled at step-cap end.
             info: Augmented info dictionary with multi-episode metadata.
         """
         # Boundary metadata is injected every step to avoid stale values.
@@ -178,6 +185,22 @@ class MultiEpisodeEnv(BaseEnv):
         # Handle reflection step if waiting for reflection
         if self._waiting_for_reflection:
             self._waiting_for_reflection = False
+            if self._pending_outer_done_after_reflection:
+                self._pending_outer_done_after_reflection = False
+                augmented_info = self._augment_info(
+                    base_info={},
+                    episode_index=self._episode_index,
+                    episode_step=self._episode_step,
+                    total_step=self._total_steps,
+                    episode_start=False,
+                    episode_done=True,
+                    trajectory_done=True,
+                    boundary_transition=boundary_transition,
+                    boundary_has_combined_observation=boundary_has_combined_observation,
+                    boundary_terminal_observation=boundary_terminal_observation,
+                    boundary_next_initial_observation=boundary_next_initial_observation,
+                )
+                return "", 0.0, True, augmented_info
 
             # Start the next episode
             observation, info = self._reset_inner_env()
@@ -231,50 +254,48 @@ class MultiEpisodeEnv(BaseEnv):
             self._episode_successes.append(success)
             self._episode_lengths.append(self._episode_step)
 
-            if not outer_done:
-                # If reflection is enabled, we prompt for reflection instead of immediate reset
-                if self.enable_reflection:
-                    self._waiting_for_reflection = True
-                    
-                    # Append reflection prompt to terminal observation
-                    if isinstance(observation, str):
-                        observation = f"{observation}\n\n{self.reflection_prompt}"
-                    
-                    # We return the terminal observation + prompt, with episode_done=True
-                    # The inner env is NOT reset yet.
+            # If reflection is enabled, always require one reflection action.
+            # At step cap, trajectory completion is deferred until that action.
+            if self.enable_reflection:
+                self._waiting_for_reflection = True
+                self._pending_outer_done_after_reflection = bool(outer_done)
+                if isinstance(observation, str):
+                    observation = f"{observation}\n\n{self.reflection_prompt}"
+                if outer_done:
+                    outer_done = False
+            elif not outer_done:
+                # We want the agent to see the terminal observation of the
+                # finished episode *and* get primed for the next episode.
+                #
+                # To avoid losing the terminal observation, we first cache it,
+                # then reset the inner env and append the next-episode header +
+                # initial observation after the terminal one.
+                terminal_observation = observation
+
+                # Reset for next episode (same task/seed) and bump index.
+                next_obs, reset_info = self._reset_inner_env()
+                self._maybe_track_maze_state()
+                self._episode_index += 1
+                self._episode_step = 0
+                next_obs = self._format_observation(next_obs, self._episode_index)
+
+                boundary_transition = True
+                if isinstance(terminal_observation, str):
+                    boundary_terminal_observation = terminal_observation
+                if isinstance(next_obs, str):
+                    boundary_next_initial_observation = next_obs
+
+                # Combine terminal obs and the next-episode header/obs when using
+                # string observations (the GEM adapter always returns strings).
+                if isinstance(terminal_observation, str) and isinstance(next_obs, str):
+                    boundary_has_combined_observation = True
+                    observation = f"{terminal_observation}\n\n{next_obs}"
                 else:
-                    # We want the agent to see the terminal observation of the
-                    # finished episode *and* get primed for the next episode.
-                    #
-                    # To avoid losing the terminal observation, we first cache it,
-                    # then reset the inner env and append the next-episode header +
-                    # initial observation after the terminal one.
-                    terminal_observation = observation
+                    # Fallback: just expose the terminal observation.
+                    observation = terminal_observation
 
-                    # Reset for next episode (same task/seed) and bump index.
-                    next_obs, reset_info = self._reset_inner_env()
-                    self._maybe_track_maze_state()
-                    self._episode_index += 1
-                    self._episode_step = 0
-                    next_obs = self._format_observation(next_obs, self._episode_index)
-
-                    boundary_transition = True
-                    if isinstance(terminal_observation, str):
-                        boundary_terminal_observation = terminal_observation
-                    if isinstance(next_obs, str):
-                        boundary_next_initial_observation = next_obs
-
-                    # Combine terminal obs and the next-episode header/obs when using
-                    # string observations (the GEM adapter always returns strings).
-                    if isinstance(terminal_observation, str) and isinstance(next_obs, str):
-                        boundary_has_combined_observation = True
-                        observation = f"{terminal_observation}\n\n{next_obs}"
-                    else:
-                        # Fallback: just expose the terminal observation.
-                        observation = terminal_observation
-
-                    # Merge reset info into info so downstream can see both.
-                    info = {**info, **reset_info}
+                # Merge reset info into info so downstream can see both.
+                info = {**info, **reset_info}
         
         # If trajectory ends and current episode is incomplete, count it as an attempted episode
         # (but not successful since it didn't complete)
@@ -680,7 +701,10 @@ class MultiEpisodeEnv(BaseEnv):
         success_reward = info.get("success_reward", 1.0)
         episode_header = info.get("episode_header", "New episode begins.")
         enable_reflection = info.get("enable_reflection", False)
-        reflection_prompt = info.get("reflection_prompt", "")
+        reflection_prompt_raw = info.get("reflection_prompt", default_reflection_prompt)
+        reflection_prompt = (
+            default_reflection_prompt if reflection_prompt_raw is None else str(reflection_prompt_raw)
+        )
 
         if inner_env_class is None:
             raise ValueError("inner_env_class must be provided in env_args")

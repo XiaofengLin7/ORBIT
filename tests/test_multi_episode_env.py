@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from envs.multi_episode_env import MultiEpisodeEnv
 
 
@@ -77,14 +79,58 @@ def test_boundary_metadata_reflection_reset_step() -> None:
     finally:
         env.close()
 
-"""Focused tests for MultiEpisodeEnv integrations."""
 
-from __future__ import annotations
+def test_reflection_is_required_even_when_step_cap_is_hit() -> None:
+    env = MultiEpisodeEnv(
+        inner_env_class=_InnerAlwaysDoneEnv,
+        total_step_cap=1,
+        episode_header="New episode begins.",
+        enable_reflection=True,
+    )
+    try:
+        env.reset(seed=1, task={"seed": 1})
 
-import pytest
+        # This step reaches step cap and ends the inner episode, but should still
+        # ask for one final reflection turn.
+        obs1, reward1, done1, info1 = env.step("act")
+        assert reward1 == 1.0
+        assert done1 is False
+        assert info1["episode_done"] is True
+        assert env.reflection_prompt in obs1
 
-from envs.multi_episode_env import MultiEpisodeEnv
+        # Reflection action finalizes the trajectory without consuming extra env steps.
+        obs2, reward2, done2, info2 = env.step("reflection")
+        assert obs2 == ""
+        assert reward2 == 0.0
+        assert done2 is True
+        assert info2["episode_done"] is True
+        assert info2["total_step"] == 1
+        assert "metrics" in info2
+        assert info2["metrics"]["episode/total_steps"] == 1
+    finally:
+        env.close()
 
+
+def test_from_dict_applies_custom_reflection_prompt() -> None:
+    custom_reflection_prompt = "[Reflection2] custom prompt"
+    env = MultiEpisodeEnv.from_dict(
+        {
+            "inner_env_class": _InnerAlwaysDoneEnv,
+            "total_step_cap": 3,
+            "episode_header": "New episode begins.",
+            "enable_reflection": True,
+            "reflection_prompt": custom_reflection_prompt,
+        }
+    )
+    try:
+        env.reset(seed=1, task={"seed": 1})
+        obs, reward, done, info = env.step("act")
+        assert reward == 1.0
+        assert done is False
+        assert info["episode_done"] is True
+        assert custom_reflection_prompt in obs
+    finally:
+        env.close()
 
 def test_frozenlake_adapter_episode_success_metadata() -> None:
     """MultiEpisodeEnv should detect success from FrozenLake adapter metadata."""

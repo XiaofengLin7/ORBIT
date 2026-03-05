@@ -1,28 +1,32 @@
-# SDPO Self-Distillation (v1)
+# SDPO Self-Distillation (Direct Loss, Current)
 
 ## Overview
 
-This document describes the implemented shared-weight SDPO self-distillation path used in multi-episode training.
+This document describes the current shared-weight SDPO self-distillation path used in multi-episode training.
 
 At each training step:
-1. Run the normal teacher PPO update on full rollout data.
-2. Compute a distillation bonus on the first-attempt prefix sequence and merge it into the same actor update.
+1. Run normal PPO preparation on rollout data (reward, old log-prob, advantages, etc.).
+2. Build a distillation payload from hindsight context + first-attempt tokens.
+3. Run a single actor update with combined loss:
+   - `total_actor_loss = ppo_pg_loss + lambda * sdpo_loss`
+   - existing entropy / KL terms are still applied when enabled.
 
-Distillation can be skipped when context-overflow is triggered, hindsight context is unavailable, or the batch has insufficient valid distill tokens.
+This replaced the old `distill bonus added into advantages` path.
 
 ## Scope
 
-Current scope is trajectory-mode training (`stepwise_advantage.enable=false`).
+- Current scope is trajectory-mode training (`stepwise_advantage.enable = false`).
+- Distillation token scope is fixed to first-attempt tokens only (no token-scope config).
 
-Implemented files:
+Key implementation files:
+- `trainers/sdpo_actor.py`
 - `trainers/sdpo_self_distill_trainer.py`
+- `trainers/teacher_regularized_workers.py`
 - `trainers/train_multi_episode.py`
-- `trainers/__init__.py`
-- `third_party/rllm/rllm/engine/agent_execution_engine.py` (minimal metadata additions)
 
 ## Configuration
 
-Distillation is enabled from `rllm.distill`:
+Distillation is configured under `rllm.distill`.
 
 ```yaml
 rllm:
@@ -38,158 +42,161 @@ rllm:
     context_limit: null
     context_overflow_policy: skip_loss
     min_distill_tokens: 1
+
+    # SDPO loss controls
+    loss_variant: non_full        # non_full | full_logit
+    alpha: 1.0                    # [0,1], must be 1.0 for non_full
+    is_clip: null                 # nullable positive float
+    full_logit_topk: 64           # positive int
+    full_logit_add_tail: true     # bool
 ```
 
 Semantics:
-- `enable`: turn on SDPO auxiliary update.
-- `lambda`: scales distill advantages.
-- `mode`: currently supports `sdpo_self`.
+- `enable`: enable SDPO distillation path.
+- `lambda`: scalar weight for SDPO term in actor objective.
+- `mode`: currently `sdpo_self`.
 - `denominator_mode`: currently `teacher_adapted_feedback`.
-- `teacher_context_attempts`: if set to `N`, require at least `N` transition-confirmed complete attempts and use only the first `N`; if `null`, use all transition-confirmed complete attempts.
-- `teacher_regularization`: teacher policy source for denominator scoring.
-  - `none`: denominator log-prob is computed from current actor.
-  - `ema`: denominator log-prob is computed from a teacher snapshot updated by EMA after each actor step.
-  - `every_n_steps`: denominator log-prob is computed from a teacher snapshot hard-copied from actor every `teacher_update_interval` steps.
-- `teacher_update_rate`: EMA coefficient for `ema` mode (`[0, 1]`).
-- `teacher_update_interval`: hard-sync interval `N` for `every_n_steps` mode (`>=1`).
+- `teacher_context_attempts`:
+  - integer `N`: require at least `N` complete attempts and use the first `N`.
+  - `null`: use last available complete-attempt context.
+- `teacher_regularization`: `none`, `ema`, or `every_n_steps`.
+- `teacher_update_rate`: EMA rate for `ema`.
+- `teacher_update_interval`: hard-sync interval for `every_n_steps`.
 - `context_limit`: if `null`, defaults to `data.max_prompt_length + data.max_response_length`.
-- `context_overflow_policy`: currently supports only `skip_loss`.
-- `min_distill_tokens`: skip auxiliary update when valid token count is below threshold.
+- `context_overflow_policy`: currently only `skip_loss`.
+- `min_distill_tokens`: if valid distill tokens < this value, distillation is disabled for that batch.
+- `loss_variant`: SDPO branch (`non_full` or `full_logit`).
+- `alpha`: KL/JSD interpolation for `full_logit`; for `non_full`, required to be `1.0`.
+- `is_clip`: optional IS-ratio clip multiplier for distillation.
+- `full_logit_topk`: top-k support for full-logit branch.
+- `full_logit_add_tail`: whether to add tail bucket in top-k mode.
+
+Not added by design:
+- no `rllm.distill.token_scope`
+- no distill variant logging key
+- no empty-target-batch logging key
 
 Compatibility guard:
-- Teacher regularization modes (`ema` and `every_n_steps`) are incompatible with KL reference-policy path (`algorithm.use_kl_in_reward` or `actor_rollout_ref.actor.use_kl_loss`) in v1.
+- `teacher_regularization != none` is incompatible with KL reference-policy path:
+  - `algorithm.use_kl_in_reward`
+  - `actor_rollout_ref.actor.use_kl_loss`
 
-## Rollout Metadata Requirements
+## Distillation Targets And Mask
 
-To support distillation, token rollouts now include:
-- `first_attempt_response_mask`: token-level mask selecting attempt-0 completion tokens.
-- `step_records`: per-step list containing prompt/completion ids, logprobs, text fields, `episode_index`, and boundary metadata:
-  - `boundary_transition`
-  - `boundary_terminal_env_token_len`
-  - `boundary_next_initial_env_token_len`
+Distillation is only applied to first-attempt model tokens:
+- `distill_mask = response_mask * first_attempt_response_mask`
+- first-attempt prefix is extracted up to the last valid first-attempt token index.
+- interleaved env/model tokens before that endpoint remain in the scored prefix.
 
-Additionally, multi-episode env info provides boundary observation split fields:
-- `boundary_transition`
-- `boundary_has_combined_observation`
-- `boundary_terminal_observation`
-- `boundary_next_initial_observation`
+If no valid first-attempt token exists, that sample is skipped for distillation.
 
-These are produced in `AgentExecutionEngine` token mode.
+## Hindsight / Denominator Construction
 
-## Distillation Objective Used in Code
+Denominator context construction is unchanged from earlier logic:
+- reconstruct complete attempts from `step_records` using episode transitions + boundary metadata.
+- build denominator prompt as `concat(hindsight_context_tokens, student_prompt_tokens)`.
+- denominator response is the first-attempt prefix response sequence.
 
-For valid tokens, compute:
+Context overflow guard:
+- `L_den = len(denominator_prompt_tokens) + len(first_attempt_prefix_tokens)`
+- if `L_den > context_limit`: skip sample (`distill/skipped_context_overflow`).
+- if hindsight unavailable/malformed/insufficient: skip sample (`distill/skipped_hindsight_unavailable`).
+- `L_den == context_limit` is kept.
 
-- Numerator log-prob: `log πθ(a_t | x, y<t)`
-- Denominator log-prob:
-  - `teacher_regularization=none`: `log πθ(a_t | c_N, x/h_t context, y<t)` from current actor.
-  - `teacher_regularization in {ema, every_n_steps}`: same conditioning, but scored by the teacher snapshot.
-  - implementation input is `input_ids = [c_N ; prompts ; first_attempt_prefix]`, where `c_N` is the selected teacher hindsight prompt from transition-confirmed complete attempts
-- Coefficient:
-  - `c_t = stopgrad(logp_num - logp_den)`
-- Distill advantage:
-  - `A_t^distill = lambda * c_t`
+## Loss Formulation
 
-Scoring and masking:
-- Distill `responses` are the first-attempt prefix sequence: response-token prefix ending at the last index where `first_attempt_response_mask==1`.
-- This prefix keeps interleaved env/model tokens that appear before that endpoint.
-- Distill loss applies only where `response_mask=1` and `first_attempt_response_mask=1`.
-- Invalid token-mismatch trajectories are fully masked by engine mismatch filtering.
+Actor wrapper computes PPO and SDPO in the same optimizer step.
 
-## Context-Overflow Guard
+### Combined objective
 
-Per sample:
+- `policy_loss = ppo_pg_loss + lambda * sdpo_loss`
+- if enabled:
+  - entropy term: `policy_loss -= entropy_coeff * entropy`
+  - KL term: `policy_loss += kl_loss_coef * kl_loss`
 
-1. Reconstruct teacher hindsight context from raw `step_records` using transition-confirmed complete attempts:
-   - validate cumulative token consistency across steps
-   - detect completion only when `episode_index` increases between adjacent steps
-   - for each detected completion, use previous-step boundary metadata:
-     - `delta = current_prompt_ids[len(accumulated):]`
-     - require `boundary_terminal_env_token_len + boundary_next_initial_env_token_len == len(delta)`
-     - candidate context is `accumulated + delta[:boundary_terminal_env_token_len]`
-   - this keeps terminal boundary tokens from attempt `N` and excludes `(N+1)` initial-observation tokens
-   - if `teacher_context_attempts = N`, select candidate `N`
-   - if `teacher_context_attempts = null`, select the last candidate (all complete attempts)
-   - trailing partial attempt is excluded because it has no later episode transition
-   - malformed/missing boundary metadata at transition marks hindsight unavailable and skips distillation for that sample
-2. Extract first-attempt prefix response sequence from batch masks:
-   - find `last_first_attempt_idx = max{i | first_attempt_response_mask[i]==1 and response_mask[i]==1}`
-   - set `first_attempt_prefix = responses[: last_first_attempt_idx + 1]`
-   - let `L_prefix = len(first_attempt_prefix)`
-3. Estimate denominator scoring length:
-   - extract valid prompt tokens from numerator prompt segment using prompt-side attention mask
-   - build denominator prompt tokens as `concat(selected_teacher_context_tokens, valid_prompt_tokens)`
-   - `L_den = len(selected_teacher_context_tokens) + len(valid_prompt_tokens) + L_prefix`
-4. Determine limit:
-   - `limit = rllm.distill.context_limit or (data.max_prompt_length + data.max_response_length)`
-5. Guard:
-   - if `L_den > limit`, skip distillation for this sample.
-   - if hindsight reconstruction is invalid/malformed or complete attempts are insufficient, skip distillation for this sample.
+### SDPO branch: `non_full`
 
-Boundary behavior:
-- `L_den > limit`: skip.
-- `L_den == limit`: keep.
+Per-token:
+- `per_token = (student_logp - teacher_logp).detach() * student_logp`
 
-Overflow policy is strict skip-only (no truncation fallback), while preserving raw trajectory tokens for teacher context.
+This matches the non-full branch in `../SDPO`.
 
-Note:
-- The method target is exact reverse-KL.
-- The implementation uses the existing practical SDPO-style detached log-ratio surrogate (`compute_sdpo_advantages`) and does not add exact per-token reverse-KL recomputation.
+### SDPO branch: `full_logit`
 
-## Training Flow
+Uses full-logit KL/JSD-style distillation:
+- `alpha = 0`: forward KL branch
+- `alpha = 1`: reverse KL branch
+- `0 < alpha < 1`: generalized JSD-style mixture branch
 
-Within `JointSDPOSelfDistillTrainer.fit_agent()`:
-1. Generate trajectories and compute standard PPO quantities.
-2. Prepare distillation payload (denominator batch + mask + kept-row mapping) after trajectory filtering.
-3. Compute a detached distillation bonus and add it to PPO actor advantages.
-4. Run one actor update on the merged advantages (single shared update call).
-5. If teacher regularization is enabled:
-   - `ema`: update teacher snapshot by EMA after each actor step.
-   - `every_n_steps`: hard-sync teacher snapshot after steps where `global_steps % teacher_update_interval == 0`.
+Top-k mode:
+- gather student top-k logits
+- gather teacher logits at the same student-selected indices
+- optional tail bucket (`full_logit_add_tail=true`) or renormalization
 
-Teacher initialization:
-- After checkpoint load, teacher snapshot is hard-synced from actor once when teacher regularization is enabled.
+### Optional IS clip
 
-Checkpoints remain the normal actor checkpoints (single shared model stream).
+If `is_clip` is set:
+- `ratio = exp(clamp((student_logp - old_logp).detach(), -20, 20)).clamp(max=is_clip)`
+- multiply distill per-token loss by `ratio`.
+
+If rollout IS weights exist in batch, they are also multiplied into distill per-token loss.
+
+## Data Flow
+
+1. Trainer generates trajectories and computes PPO prep tensors.
+2. Trainer builds distill payload from current hindsight logic.
+3. Trainer attaches distill tensors to batch:
+   - `distill_teacher_input_ids`
+   - `distill_teacher_attention_mask`
+   - `distill_teacher_position_ids`
+   - `distill_teacher_responses`
+   - `distill_mask`
+   - distill meta settings (`distill_*` in `batch.meta_info`)
+4. Actor wrapper computes standard PPO pg loss.
+5. Actor wrapper computes teacher-side scores (no grad) on denominator context.
+6. Actor wrapper computes SDPO loss branch (`non_full` or `full_logit`) on first-attempt mask.
+7. Actor wrapper backprops one combined loss (`ppo + lambda*sdpo`) per micro-batch.
+8. Teacher sync schedule (`none` / `ema` / `every_n_steps`) remains unchanged.
+
+## Worker Wiring
+
+- Distill-enabled runs use local SDPO actor worker wrappers.
+- For `teacher_regularization = none`: SDPO actor uses current actor module as teacher scorer.
+- For `ema` / `every_n_steps`: teacher-regularized worker hosts ref snapshot and SDPO actor scores with that teacher module.
+- No `third_party` files are modified.
 
 ## Metrics
 
-Primary distill metrics:
+Kept distill metrics:
 - `distill/sdpo_loss`
 - `distill/token_count`
 - `distill/skipped_context_overflow`
 - `distill/skipped_hindsight_unavailable`
 - `distill/kept_ratio`
-
-Additional diagnostics:
-- `distill/log_ratio_mean`
-- `distill/log_ratio_std`
-- `distill/skipped_batches`
 - `distill/teacher_sync_applied`
+
+Not logged:
+- `distill/variant`
+- `distill/empty_target_batch`
+- old bonus-path diagnostics (`distill/log_ratio_*`, `distill/skipped_batches`)
 
 ## Tests
 
-Added tests:
+Current tests covering this path:
 - `tests/test_sdpo_self_distill.py`
-  - first-attempt prefix extraction correctness (last-`1` index, not mask sum)
-  - first-N complete-attempt hindsight reconstruction from raw step tokens
-  - malformed hindsight/boundary reconstruction skip path
-  - denominator overflow guard (`L_den > limit` vs `==`)
-  - SDPO detach + masking behavior
-  - mixed batch partial skip + metric counts
-  - teacher-regularization settings validation and KL-incompatibility guard
-  - denominator teacher log-prob routing and teacher sync schedule hooks
-- `tests/test_multi_episode_env.py`
-  - boundary metadata emission for non-reflection combined observation
-  - boundary metadata emission for reflection reset transition
+  - hindsight reconstruction and boundary handling
+  - first-attempt prefix extraction and overflow skipping
+  - distill payload attachment and config validation
+  - teacher sync schedule hooks
+- `tests/test_sdpo_actor_loss.py`
+  - SDPO formula checks for `non_full`
+  - full-logit forward/reverse KL and JSD/top-k+tail behavior
 - `tests/test_agent_execution_engine_distill.py`
-  - `assemble_steps` first-attempt mask alignment
-  - mismatch mask zeroing behavior
-  - token-mode `step_records` with episode-index alignment
+  - rollout/assembly metadata for distillation masking and step records
 
-Run in project environment:
+Run:
 
 ```bash
 conda activate icx
-pytest -q tests/test_sdpo_self_distill.py tests/test_agent_execution_engine_distill.py
+pytest -q tests/test_sdpo_self_distill.py tests/test_agent_execution_engine_distill.py tests/test_sdpo_actor_loss.py
 ```

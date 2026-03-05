@@ -60,6 +60,29 @@ val_tasks:
     inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
     shapes:  [[6,6],[7,6],[7,7],[6,7]]  
 
+  # FrozenLake example with shortest-path difficulty filtering
+  # - env_id: "frozenlake"
+  #   max_turns_per_episode: 10
+  #   total_step_cap: 20
+  #   test_size: 256
+  #   inner_env_class: 'envs.frozenlake_env_adapter.FrozenLakeEnvAdapter'
+  #   size: 6
+  #   p: 0.78
+  #   is_slippery: false
+  #   shortest_path_min_length: 6
+  #   shortest_path_max_length: 10
+
+  # Sokoban example with shortest-path difficulty filtering
+  # - env_id: "sokoban"
+  #   max_turns_per_episode: 20
+  #   total_step_cap: 40
+  #   test_size: 128
+  #   inner_env_class: 'envs.sokoban_env_adapter.SokobanEnvAdapter'
+  #   dim_room: [6, 6]
+  #   num_boxes: 1
+  #   shortest_path_min_length: 4
+  #   shortest_path_max_length: 8
+
   - env_id: "game:Mastermind-v0-random"
     max_turns_per_episode: 3
     total_step_cap: 9
@@ -82,4 +105,3 @@ val_tasks:
   #   max_turns_per_episode: 10
   #   total_step_cap: 30
   #   test_size: 64
-

@@ -6,10 +6,8 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-"expandable_segments:False"}
 export VLLM_USE_V1=1
 
-# Multi-task FrozenLake config.
-# This config defines distinct train/val task distributions and leaves `desc`
-# unset so each trajectory varies by seed-generated random map.
-TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_frozenlake_self_distill_multi_episode.yaml}
+# Multi-task Sokoban config.
+TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_sokoban_self_distill_multi_episode.yaml}
 if [ ! -f "$TASKS_CONFIG" ]; then
     echo "Error: Tasks config file not found: $TASKS_CONFIG"
     echo "Set TASKS_CONFIG to a valid YAML path."
@@ -85,7 +83,7 @@ else
     REFLECTION_SUFFIX="reflection-off"
 fi
 
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"frozenlake-multi-episode-${CONFIG_NAME}-${MODEL_NAME}"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"sokoban-multi-episode-${CONFIG_NAME}-${MODEL_NAME}"}
 EXPERIMENT_NAME="${EXPERIMENT_NAME}-${REFLECTION_SUFFIX}"
 if [ "$ENABLE_SELF_DISTILL" = True ]; then
     DISTILL_SUFFIX="self-distill-lambda-${DISTILL_LAMBDA}-${TEACHER_REG_SUFFIX}-var-${DISTILL_LOSS_VARIANT}-alpha-${DISTILL_ALPHA}"

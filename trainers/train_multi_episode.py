@@ -16,6 +16,7 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 
+from prompts.prompt import reflection_prompt_2
 from rllm.trainer.env_agent_mappings import AGENT_CLASS_MAPPING, ENV_CLASS_MAPPING
 from rllm.trainer.verl.agent_workflow_trainer import AgentWorkflowPPOTrainer
 from rllm.trainer.verl.ray_runtime_env import get_ppo_ray_runtime_env
@@ -138,6 +139,8 @@ class MultiEpisodeTaskRunner:
             assert config.critic.strategy in {"fsdp", "fsdp2"}
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
             from trainers.teacher_regularized_workers import (
+                SDPOActorRolloutRefWorker,
+                SDPOAsyncActorRolloutRefWorker,
                 TeacherRegularizedActorRolloutRefWorker,
                 TeacherRegularizedAsyncActorRolloutRefWorker,
             )
@@ -151,12 +154,19 @@ class MultiEpisodeTaskRunner:
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
-            if distill_teacher_regularization != "none":
-                actor_rollout_cls = (
-                    TeacherRegularizedAsyncActorRolloutRefWorker
-                    if config.actor_rollout_ref.rollout.mode == "async"
-                    else TeacherRegularizedActorRolloutRefWorker
-                )
+            if distill_enable:
+                if distill_teacher_regularization != "none":
+                    actor_rollout_cls = (
+                        TeacherRegularizedAsyncActorRolloutRefWorker
+                        if config.actor_rollout_ref.rollout.mode == "async"
+                        else TeacherRegularizedActorRolloutRefWorker
+                    )
+                else:
+                    actor_rollout_cls = (
+                        SDPOAsyncActorRolloutRefWorker
+                        if config.actor_rollout_ref.rollout.mode == "async"
+                        else SDPOActorRolloutRefWorker
+                    )
             else:
                 actor_rollout_cls = (
                     AsyncActorRolloutRefWorker
@@ -166,9 +176,9 @@ class MultiEpisodeTaskRunner:
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            if distill_teacher_regularization != "none":
+            if distill_enable:
                 raise ValueError(
-                    "rllm.distill.teacher_regularization currently supports only fsdp/fsdp2 strategy."
+                    "rllm.distill currently supports only fsdp/fsdp2 strategy."
                 )
             from verl.workers.megatron_workers import (
                 ActorRolloutRefWorker,
@@ -266,6 +276,12 @@ class MultiEpisodeTaskRunner:
                 and config.rllm.get("distill") is not None
                 and config.rllm.distill.get("enable", False)
             )
+            if use_distill and getattr(env_class, "__name__", "") == "MultiEpisodeEnv":
+                # Distillation denominator context is built from completed attempts;
+                # enable explicit reflection turns by default so reflection prompt/response
+                # tokens are available in hindsight context.
+                env_args.setdefault("enable_reflection", True)
+                env_args.setdefault("reflection_prompt", reflection_prompt_2)
             trainer_cls = JointSDPOSelfDistillTrainer if use_distill else MultiEpisodeAgentPPOTrainer
 
             # Use custom trainer instead of AgentPPOTrainer

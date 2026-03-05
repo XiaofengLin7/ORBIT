@@ -59,6 +59,12 @@ def main(cfg) -> None:  # type: ignore
     """
     # Extract environment configuration
     env_args = OmegaConf.to_container(cfg.rllm.env.env_args, resolve=True)  # type: ignore
+    distill_enable = bool(
+        hasattr(cfg, "rllm")
+        and cfg.rllm.get("distill") is not None
+        and cfg.rllm.distill.get("enable", False)
+    )
+    max_total_step_cap = 30
 
     # Check for multi-task configuration
     tasks_config_path: Optional[str] = cfg.data.get("tasks_config_path", None)
@@ -80,14 +86,18 @@ def main(cfg) -> None:  # type: ignore
             (task.get("total_step_cap", 30) for task in all_tasks),
             default=30
         )
-        # Update max_steps if not explicitly set or if it's too small
-        if not hasattr(cfg.rllm.agent, "max_steps") or cfg.rllm.agent.max_steps < max_total_step_cap:
-            cfg.rllm.agent.max_steps = max_total_step_cap
     else:
         # Single-task mode: backward compatibility
         inner_env_kwargs = env_args.get("inner_env_kwargs", {})
         env_id = inner_env_kwargs.get("env_id", "game:GuessTheNumber-v0-hard")
+        max_total_step_cap = int(env_args.get("total_step_cap", 30))
         train_dataset, val_dataset = prepare_gem_data(env_id=env_id)
+
+    # Reflection-enabled distillation introduces one extra model turn per
+    # completed episode, so reserve additional rollout budget.
+    required_max_steps = (2 * max_total_step_cap) if distill_enable else max_total_step_cap
+    if not hasattr(cfg.rllm.agent, "max_steps") or cfg.rllm.agent.max_steps < required_max_steps:
+        cfg.rllm.agent.max_steps = required_max_steps
 
     # Set dataset paths in config
     if train_dataset is not None and hasattr(cfg, "data"):
@@ -113,4 +123,3 @@ def main(cfg) -> None:  # type: ignore
 
 if __name__ == "__main__":
     main()
-
