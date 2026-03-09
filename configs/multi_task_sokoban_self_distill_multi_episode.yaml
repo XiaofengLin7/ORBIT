@@ -8,37 +8,37 @@
 train_tasks:
   - env_id: "sokoban"
     inner_env_class: "envs.sokoban_env_adapter.SokobanEnvAdapter"
-    max_turns_per_episode: 20
-    total_step_cap: 40
+    max_turns_per_episode: 8
+    total_step_cap: 16
     dim_room: [6, 6]
     num_boxes: 1
     search_depth: 300
     observation_format: "grid"
     shortest_path_min_length: 4
-    shortest_path_max_length: 9
+    shortest_path_max_length: 6
     train_size: 1024
 
   - env_id: "sokoban"
     inner_env_class: "envs.sokoban_env_adapter.SokobanEnvAdapter"
-    max_turns_per_episode: 24
-    total_step_cap: 48
+    max_turns_per_episode: 9
+    total_step_cap: 18
     dim_room: [7, 7]
     num_boxes: 1
     search_depth: 300
     observation_format: "grid"
     shortest_path_min_length: 6
-    shortest_path_max_length: 12
+    shortest_path_max_length: 8
     train_size: 1024
 
 val_tasks:
   - env_id: "sokoban"
     inner_env_class: "envs.sokoban_env_adapter.SokobanEnvAdapter"
-    max_turns_per_episode: 20
-    total_step_cap: 40
+    max_turns_per_episode: 8
+    total_step_cap: 16
     dim_room: [6, 6]
     num_boxes: 1
     search_depth: 300
     observation_format: "grid"
-    shortest_path_min_length: 10
-    shortest_path_max_length: 16
+    shortest_path_min_length: 6
+    shortest_path_max_length: 7
     test_size: 256

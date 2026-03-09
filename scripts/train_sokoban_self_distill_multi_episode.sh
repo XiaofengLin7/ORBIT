@@ -19,7 +19,8 @@ ACTOR_LR=${ACTOR_LR:-1e-5}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-1.0}
 # Distillation mode options: sdpo_self, sdpo_pure.
 DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
-TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
+DISTILL_TRAJECTORY_SELECTION=${DISTILL_TRAJECTORY_SELECTION:-selective_retry_success_n2}
+TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-1}
 # Teacher sync options: none, ema, every_n_steps.
 TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
 TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
@@ -30,7 +31,8 @@ DISTILL_LOSS_VARIANT=${DISTILL_LOSS_VARIANT:-full_logit}
 DISTILL_IS_CLIP=${DISTILL_IS_CLIP:-2.0}
 FULL_LOGIT_TOPK=${FULL_LOGIT_TOPK:-64}
 FULL_LOGIT_ADD_TAIL=${FULL_LOGIT_ADD_TAIL:-True}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-20480}
+NEGATE_SDPO_LOSS=${NEGATE_SDPO_LOSS:-False}
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
 ROLLOUT_N=${ROLLOUT_N:-8}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}
@@ -53,6 +55,16 @@ if [ "$DISTILL_MODE" != "sdpo_self" ] && [ "$DISTILL_MODE" != "sdpo_pure" ]; the
     exit 1
 fi
 
+if [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_hindsight" ] && [ "$DISTILL_TRAJECTORY_SELECTION" != "selective_retry_success_n2" ]; then
+    echo "Error: DISTILL_TRAJECTORY_SELECTION must be one of: first_attempt_hindsight, selective_retry_success_n2"
+    exit 1
+fi
+
+if [ "$DISTILL_TRAJECTORY_SELECTION" = "selective_retry_success_n2" ] && [ "$TEACHER_CONTEXT_ATTEMPTS" != "1" ]; then
+    echo "Error: TEACHER_CONTEXT_ATTEMPTS must be 1 when DISTILL_TRAJECTORY_SELECTION=selective_retry_success_n2"
+    exit 1
+fi
+
 if [ "$DISTILL_LOSS_VARIANT" = "non_full" ]; then
     case "$DISTILL_ALPHA" in
         1|1.0|1.00|1.000|1.0000) ;;
@@ -63,38 +75,62 @@ if [ "$DISTILL_LOSS_VARIANT" = "non_full" ]; then
     esac
 fi
 
-MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 CONFIG_NAME=$(basename "$TASKS_CONFIG" .yaml | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 ENABLE_SELF_DISTILL=${ENABLE_SELF_DISTILL:-True}
 ENABLE_REFLECTION=${ENABLE_REFLECTION:-True}
 REFLECTION_PROMPT=${REFLECTION_PROMPT:-}
+ENV_NAME="sokoban"
+
+append_experiment_tag() {
+    local tag="$1"
+    if [ -z "$tag" ]; then
+        return
+    fi
+    if [ -n "$TRAINING_CONFIG_NAME" ]; then
+        TRAINING_CONFIG_NAME="${TRAINING_CONFIG_NAME}-${tag}"
+    else
+        TRAINING_CONFIG_NAME="$tag"
+    fi
+}
 
 if [ "$TEACHER_REGULARIZATION" = "ema" ]; then
-    TEACHER_REG_SUFFIX="teacher-ema-a-${TEACHER_UPDATE_RATE}"
+    TEACHER_REG_TAG="teacher-ema"
 elif [ "$TEACHER_REGULARIZATION" = "every_n_steps" ]; then
-    TEACHER_REG_SUFFIX="teacher-every-${TEACHER_UPDATE_INTERVAL}"
+    TEACHER_REG_TAG="teacher-every-n-steps"
 else
-    TEACHER_REG_SUFFIX="teacher-none"
+    TEACHER_REG_TAG="teacher-none"
 fi
 
 if [ "$ENABLE_REFLECTION" = True ] || [ "$ENABLE_REFLECTION" = "true" ]; then
-    REFLECTION_SUFFIX="reflection-on"
+    REFLECTION_TAG="reflection-on"
 else
-    REFLECTION_SUFFIX="reflection-off"
+    REFLECTION_TAG="reflection-off"
 fi
 
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"sokoban-multi-episode-${CONFIG_NAME}-${MODEL_NAME}"}
-EXPERIMENT_NAME="${EXPERIMENT_NAME}-${REFLECTION_SUFFIX}"
+TASK_CONFIG_NAME=${CONFIG_NAME#multi-task-}
+TASK_CONFIG_NAME=${TASK_CONFIG_NAME#${ENV_NAME}-}
+TASK_CONFIG_NAME=${TASK_CONFIG_NAME%-self-distill-multi-episode}
+TASK_CONFIG_NAME=${TASK_CONFIG_NAME%-multi-episode}
+TASK_CONFIG_NAME=${TASK_CONFIG_NAME%-self-distill}
+
+TRAINING_CONFIG_NAME=""
+append_experiment_tag "$TASK_CONFIG_NAME"
+append_experiment_tag "$REFLECTION_TAG"
 if [ "$ENABLE_SELF_DISTILL" = True ]; then
-    DISTILL_SUFFIX="self-distill-lambda-${DISTILL_LAMBDA}-${TEACHER_REG_SUFFIX}-var-${DISTILL_LOSS_VARIANT}-alpha-${DISTILL_ALPHA}"
-    if [ "$DISTILL_LOSS_VARIANT" = "full_logit" ]; then
-        DISTILL_SUFFIX="${DISTILL_SUFFIX}-topk-${FULL_LOGIT_TOPK}-tail-${FULL_LOGIT_ADD_TAIL}"
+    append_experiment_tag "$DISTILL_MODE"
+    append_experiment_tag "$DISTILL_TRAJECTORY_SELECTION"
+    append_experiment_tag "$DISTILL_LOSS_VARIANT"
+    append_experiment_tag "a${DISTILL_ALPHA}"
+    append_experiment_tag "l${DISTILL_LAMBDA}"
+    append_experiment_tag "$TEACHER_REG_TAG"
+    if [ "$NEGATE_SDPO_LOSS" = True ] || [ "$NEGATE_SDPO_LOSS" = "true" ]; then
+        append_experiment_tag "negate"
     fi
-    if [ "$DISTILL_IS_CLIP" != "null" ]; then
-        DISTILL_SUFFIX="${DISTILL_SUFFIX}-isclip-${DISTILL_IS_CLIP}"
-    fi
-    EXPERIMENT_NAME="${EXPERIMENT_NAME}-${DISTILL_SUFFIX}"
+else
+    append_experiment_tag "no-distill"
 fi
+
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"${ENV_NAME}-${TRAINING_CONFIG_NAME}"}
 
 EXTRA_ENV_ARGS=()
 if [ -n "$REFLECTION_PROMPT" ]; then
@@ -109,7 +145,7 @@ python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
     data.val_batch_size=128 \
     data.max_prompt_length=1024 \
-    data.max_response_length=16384 \
+    data.max_response_length=15360 \
     +data.tasks_config_path="$TASKS_CONFIG" \
     +rllm.env.env_args.success_reward=1.0 \
     +rllm.env.env_args.episode_header="New episode begins." \
@@ -118,6 +154,7 @@ python scripts/train_multi_episode.py \
     rllm.distill.enable=$ENABLE_SELF_DISTILL \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=$DISTILL_MODE \
+    +rllm.distill.trajectory_selection=$DISTILL_TRAJECTORY_SELECTION \
     +rllm.distill.context_limit=32768 \
     +rllm.distill.denominator_mode=teacher_adapted_feedback \
     +rllm.distill.context_overflow_policy=skip_loss \
@@ -128,10 +165,11 @@ python scripts/train_multi_episode.py \
     +rllm.distill.is_clip=$DISTILL_IS_CLIP \
     +rllm.distill.full_logit_topk=$FULL_LOGIT_TOPK \
     +rllm.distill.full_logit_add_tail=$FULL_LOGIT_ADD_TAIL \
+    +rllm.distill.negate_sdpo_loss=$NEGATE_SDPO_LOSS \
     ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
     ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
     ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \
-    rllm.disable_thinking=True \
+    rllm.disable_thinking=False \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=$ACTOR_LR \
     actor_rollout_ref.model.use_remove_padding=$ACTOR_USE_REMOVE_PADDING \

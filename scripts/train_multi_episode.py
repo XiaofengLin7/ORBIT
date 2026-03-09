@@ -38,7 +38,7 @@ def _default_multi_episode_prompt() -> str:
         "You are solving the same task across multiple episodes with a fixed total step budget. "
         "Each episode resets the environment but keeps the task identical. "
         "Leverage information gathered from earlier episodes to succeed faster. "
-        "Think briefly and respond with actions inside \\boxed{} each turn. Overlong responses will be penalized."
+        "Think step by step and respond with actions inside \\boxed{} each turn."
     )
 
 

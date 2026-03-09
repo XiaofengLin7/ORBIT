@@ -17,23 +17,35 @@ MAX_TURNS_PER_EPISODE=${MAX_TURNS_PER_EPISODE:-10}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-1.0}
 DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
+DISTILL_TRAJECTORY_SELECTION=${DISTILL_TRAJECTORY_SELECTION:-first_attempt_hindsight}
 TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
 TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
 TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
 TEACHER_UPDATE_INTERVAL=${TEACHER_UPDATE_INTERVAL:-10}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
+NEGATE_SDPO_LOSS=${NEGATE_SDPO_LOSS:-False}
 
-# Extract model name (last part after /)
-MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 # Extract env name (part after :, convert to lowercase with hyphens)
 ENV_NAME=$(echo "$ENV_ID" | cut -d: -f2 | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
+append_experiment_tag() {
+    local tag="$1"
+    if [ -z "$tag" ]; then
+        return
+    fi
+    if [ -n "$TRAINING_CONFIG_NAME" ]; then
+        TRAINING_CONFIG_NAME="${TRAINING_CONFIG_NAME}-${tag}"
+    else
+        TRAINING_CONFIG_NAME="$tag"
+    fi
+}
+
 if [ "$TEACHER_REGULARIZATION" = "ema" ]; then
-    TEACHER_REG_SUFFIX="teacher-ema-a-${TEACHER_UPDATE_RATE}"
+    TEACHER_REG_TAG="teacher-ema"
 elif [ "$TEACHER_REGULARIZATION" = "every_n_steps" ]; then
-    TEACHER_REG_SUFFIX="teacher-every-${TEACHER_UPDATE_INTERVAL}"
+    TEACHER_REG_TAG="teacher-every-n-steps"
 else
-    TEACHER_REG_SUFFIX="teacher-none"
+    TEACHER_REG_TAG="teacher-none"
 fi
 
 if [ "$DISTILL_MODE" != "sdpo_self" ] && [ "$DISTILL_MODE" != "sdpo_pure" ]; then
@@ -41,8 +53,25 @@ if [ "$DISTILL_MODE" != "sdpo_self" ] && [ "$DISTILL_MODE" != "sdpo_pure" ]; the
     exit 1
 fi
 
-# Construct experiment name
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"gem-${ENV_NAME}-self-distill-multi-episode-${MODEL_NAME}-${TEACHER_REG_SUFFIX}"}
+if [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_hindsight" ] && [ "$DISTILL_TRAJECTORY_SELECTION" != "selective_retry_success_n2" ]; then
+    echo "Error: DISTILL_TRAJECTORY_SELECTION must be one of: first_attempt_hindsight, selective_retry_success_n2"
+    exit 1
+fi
+
+if [ "$DISTILL_TRAJECTORY_SELECTION" = "selective_retry_success_n2" ] && [ "$TEACHER_CONTEXT_ATTEMPTS" != "1" ]; then
+    echo "Error: TEACHER_CONTEXT_ATTEMPTS must be 1 when DISTILL_TRAJECTORY_SELECTION=selective_retry_success_n2"
+    exit 1
+fi
+
+TRAINING_CONFIG_NAME=""
+append_experiment_tag "$DISTILL_MODE"
+append_experiment_tag "$DISTILL_TRAJECTORY_SELECTION"
+append_experiment_tag "$TEACHER_REG_TAG"
+if [ "$NEGATE_SDPO_LOSS" = True ] || [ "$NEGATE_SDPO_LOSS" = "true" ]; then
+    append_experiment_tag "negate"
+fi
+
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"${ENV_NAME}-${TRAINING_CONFIG_NAME}"}
 
 # Multi-episode + SDPO self-distillation.
 python scripts/train_multi_episode.py \
@@ -61,11 +90,13 @@ python scripts/train_multi_episode.py \
     rllm.distill.enable=True \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=$DISTILL_MODE \
+    +rllm.distill.trajectory_selection=$DISTILL_TRAJECTORY_SELECTION \
     +rllm.distill.context_limit=32768 \
     +rllm.distill.denominator_mode=teacher_adapted_feedback \
     +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
+    +rllm.distill.negate_sdpo_loss=$NEGATE_SDPO_LOSS \
     ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
     ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
     ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \

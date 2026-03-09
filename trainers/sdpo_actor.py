@@ -36,6 +36,7 @@ class SDPODistillParams:
     is_clip: float | None
     full_logit_topk: int
     full_logit_add_tail: bool
+    negate_sdpo_loss: bool
     teacher_regularization: str
 
 
@@ -54,7 +55,7 @@ def _renorm_topk_log_probs(log_probs: torch.Tensor) -> torch.Tensor:
 
 def _compute_sdpo_per_token_loss(
     student_log_probs: torch.Tensor,
-    teacher_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor | None,
     *,
     loss_variant: str,
     alpha: float,
@@ -67,6 +68,8 @@ def _compute_sdpo_per_token_loss(
 ) -> torch.Tensor:
     """Compute SDPO per-token loss matching ../SDPO branches."""
     if loss_variant == "non_full":
+        if teacher_log_probs is None:
+            raise ValueError("teacher_log_probs is required for non_full SDPO loss variant.")
         return (student_log_probs - teacher_log_probs).detach() * student_log_probs
 
     use_topk = student_topk_log_probs is not None and teacher_topk_log_probs is not None
@@ -164,8 +167,8 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             raise ValueError(f"distill_is_clip must be positive when provided, got {is_clip}")
 
         full_logit_topk = int(meta_info.get("distill_full_logit_topk", 64))
-        if full_logit_topk <= 0:
-            raise ValueError(f"distill_full_logit_topk must be positive, got {full_logit_topk}")
+        if full_logit_topk < 0:
+            raise ValueError(f"distill_full_logit_topk must be non-negative, got {full_logit_topk}")
 
         teacher_regularization = str(meta_info.get("distill_teacher_regularization", "none")).lower()
         if teacher_regularization not in {"none", "ema", "every_n_steps"}:
@@ -183,6 +186,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             is_clip=is_clip,
             full_logit_topk=full_logit_topk,
             full_logit_add_tail=bool(meta_info.get("distill_full_logit_add_tail", True)),
+            negate_sdpo_loss=bool(meta_info.get("distill_negate_sdpo_loss", False)),
             teacher_regularization=teacher_regularization,
         )
 
@@ -236,7 +240,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             logits = output.logits
             response_length = model_inputs["responses"].shape[-1]
             logits = logits[:, -response_length - 1 : -1, :]
-            logits = logits / temperature
+            logits = self._scale_logits_by_temperature(logits, temperature=temperature)
             all_log_probs = torch.log_softmax(logits.float(), dim=-1)
             labels = model_inputs["responses"]
             token_log_probs = torch.gather(all_log_probs, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
@@ -265,8 +269,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             logits = output.logits
             response_length = model_inputs["responses"].shape[-1]
             logits = logits[:, -response_length - 1 : -1, :]
-            logits = logits / temperature
-            token_log_probs = logprobs_from_logits(logits, model_inputs["responses"])
+            del output  # free the full [B, total_seq, V] backing tensor early
+            logits = self._scale_logits_by_temperature(logits, temperature=temperature)
+            token_log_probs = self._chunked_logprobs_from_logits(
+                logits, model_inputs["responses"]
+            )
         return token_log_probs
 
     def _truncate_inputs_for_distill(
@@ -283,6 +290,109 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             "attention_mask": model_inputs["attention_mask"][:, :seq_length],
             "position_ids": model_inputs["position_ids"][:, :seq_length],
         }
+
+    def _build_distill_model_inputs(
+        self,
+        model_inputs: dict[str, torch.Tensor],
+        *,
+        prefix: str,
+    ) -> dict[str, torch.Tensor]:
+        """Extract one distillation model-input bundle from the batch."""
+        return {
+            "responses": model_inputs[f"{prefix}_responses"],
+            "input_ids": model_inputs[f"{prefix}_input_ids"],
+            "attention_mask": model_inputs[f"{prefix}_attention_mask"],
+            "position_ids": model_inputs[f"{prefix}_position_ids"],
+        }
+
+    def _scale_logits_by_temperature(
+        self,
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Scale logits by temperature with a no-grad in-place fast path."""
+        if temperature == 1.0:
+            return logits
+        if torch.is_grad_enabled():
+            return logits / temperature
+        return logits.div_(temperature)
+
+    def _chunked_logprobs_from_logits(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        seq_chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """Memory-efficient token log-probs via chunked log_softmax + gather.
+
+        Instead of materializing a contiguous ``[B*S, V]`` float32 tensor
+        (which can OOM for large vocab × long sequences), this processes
+        the sequence in chunks of ``seq_chunk_size`` tokens at a time.
+
+        Args:
+            logits: ``[B, S, V]`` tensor (may be a non-contiguous view).
+            labels: ``[B, S]`` token-id tensor.
+            seq_chunk_size: Number of sequence positions per chunk.
+
+        Returns:
+            ``[B, S]`` tensor of per-token log-probabilities.
+        """
+        S = logits.shape[1]
+        if S <= seq_chunk_size:
+            # Small enough — use the standard (fast) path.
+            return logprobs_from_logits(logits.contiguous(), labels)
+
+        out_chunks: list[torch.Tensor] = []
+        for start in range(0, S, seq_chunk_size):
+            end = min(start + seq_chunk_size, S)
+            # .contiguous() on the small chunk, then float32 log_softmax
+            chunk_logits = logits[:, start:end, :].contiguous().float()
+            chunk_labels = labels[:, start:end]
+            chunk_log_probs = F.log_softmax(chunk_logits, dim=-1)
+            gathered = torch.gather(
+                chunk_log_probs, dim=-1, index=chunk_labels.unsqueeze(-1)
+            ).squeeze(-1)
+            out_chunks.append(gathered)
+            del chunk_logits, chunk_log_probs
+        return torch.cat(out_chunks, dim=1)
+
+    def _row_chunked_logsumexp(
+        self,
+        logits: torch.Tensor,
+        *,
+        target_chunk_bytes: int = 1 << 30,
+    ) -> torch.Tensor:
+        """Compute per-row logsumexp with bounded temporary memory.
+
+        Args:
+            logits: Tensor whose last dimension is the vocabulary dimension.
+            target_chunk_bytes: Approximate temporary-memory budget for each
+                chunked reduction call.
+
+        Returns:
+            Tensor of shape ``logits.shape[:-1] + (1,)`` containing the
+            log-sum-exp reduction over the last dimension.
+        """
+        if logits.numel() == 0:
+            return logits.new_empty((*logits.shape[:-1], 1))
+
+        vocab_size = int(logits.shape[-1])
+        if vocab_size <= 0:
+            return torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        flat_logits = logits.reshape(-1, vocab_size)
+        bytes_per_row = max(1, vocab_size * flat_logits.element_size())
+        chunk_rows = max(1, int(target_chunk_bytes) // bytes_per_row)
+        if chunk_rows >= int(flat_logits.shape[0]):
+            return torch.logsumexp(logits, dim=-1, keepdim=True)
+
+        reduced_chunks = []
+        for start in range(0, int(flat_logits.shape[0]), chunk_rows):
+            stop = min(start + chunk_rows, int(flat_logits.shape[0]))
+            reduced_chunks.append(torch.logsumexp(flat_logits[start:stop], dim=-1, keepdim=True))
+        return torch.cat(reduced_chunks, dim=0).reshape(*logits.shape[:-1], 1)
 
     def _forward_topk_log_probs(
         self,
@@ -373,7 +483,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     use_cache=False,
                 )
                 logits_rmpad = output.logits.squeeze(0)
-                logits_rmpad = logits_rmpad / temperature
+                logits_rmpad = self._scale_logits_by_temperature(
+                    logits_rmpad,
+                    temperature=temperature,
+                )
 
                 if topk_indices is None:
                     topk = min(int(distill_topk), int(logits_rmpad.shape[-1]))
@@ -396,14 +509,15 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     topk_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=topk_indices_rmpad)
                     return_topk_indices = False
 
-                logsumexp_rmpad = torch.logsumexp(logits_rmpad, dim=-1, keepdim=True)
+                logsumexp_rmpad = self._row_chunked_logsumexp(logits_rmpad)
                 topk_logps_rmpad = topk_logits_rmpad - logsumexp_rmpad
                 full_labels = torch.zeros((batch_size, seqlen), device=input_ids.device, dtype=torch.long)
                 full_labels[:, -response_length - 1 : -1] = responses
+                # flash_attn.index_first_axis expects input rank >= 2.
                 labels_rmpad = index_first_axis(
-                    rearrange(full_labels, "b s -> (b s)"),
+                    rearrange(full_labels.unsqueeze(-1), "b s ... -> (b s) ..."),
                     indices,
-                )
+                ).squeeze(-1)
                 token_logits_rmpad = torch.gather(logits_rmpad, dim=-1, index=labels_rmpad.unsqueeze(-1)).squeeze(-1)
                 token_logps_rmpad = token_logits_rmpad - logsumexp_rmpad.squeeze(-1)
                 if is_mask_all_zero:
@@ -462,7 +576,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             )
             logits = output.logits
             logits = logits[:, -response_length - 1 : -1, :]
-            logits = logits / temperature
+            logits = self._scale_logits_by_temperature(logits, temperature=temperature)
 
             if topk_indices is None:
                 topk = min(int(distill_topk), int(logits.shape[-1]))
@@ -471,7 +585,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 topk_logits = torch.gather(logits, dim=-1, index=topk_indices)
                 topk_indices_out = None
 
-            logsumexp = torch.logsumexp(logits, dim=-1, keepdim=True)
+            logsumexp = self._row_chunked_logsumexp(logits)
             token_logits = torch.gather(logits, dim=-1, index=responses.unsqueeze(-1))
             token_log_probs = (token_logits - logsumexp).squeeze(-1)
             topk_logps = topk_logits - logsumexp
@@ -485,20 +599,19 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         self,
         *,
         model_inputs: dict[str, Any],
-        log_prob: torch.Tensor,
-        old_log_prob: torch.Tensor,
         temperature: float,
         loss_agg_mode: str,
         distill_params: SDPODistillParams,
-        student_all_log_probs: torch.Tensor | None = None,
-        student_topk_log_probs: torch.Tensor | None = None,
-        student_topk_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute SDPO loss term and related metrics for a micro-batch."""
         distill_mask = model_inputs["distill_mask"].float()
         if distill_mask.ndim != 2:
             raise ValueError(f"distill_mask must have shape [B, T], got shape {tuple(distill_mask.shape)}")
         token_count = float(distill_mask.sum().item())
+        student_inputs = self._build_distill_model_inputs(
+            model_inputs,
+            prefix="distill_student",
+        )
 
         teacher_module = self.actor_module
         if distill_params.teacher_regularization != "none":
@@ -508,85 +621,118 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 )
             teacher_module = self.teacher_module
 
-        teacher_inputs = {
-            "responses": model_inputs["distill_teacher_responses"],
-            "input_ids": model_inputs["distill_teacher_input_ids"],
-            "attention_mask": model_inputs["distill_teacher_attention_mask"],
-            "position_ids": model_inputs["distill_teacher_position_ids"],
-        }
-
-        with torch.no_grad():
-            teacher_log_prob = self._forward_with_module_log_probs(
-                teacher_inputs,
-                temperature=temperature,
-                module=teacher_module,
-            )
+        teacher_inputs = self._build_distill_model_inputs(
+            model_inputs,
+            prefix="distill_teacher",
+        )
 
         distill_len = min(
             int(distill_mask.shape[1]),
-            int(log_prob.shape[1]),
-            int(old_log_prob.shape[1]),
-            int(teacher_log_prob.shape[1]),
+            int(student_inputs["responses"].shape[1]),
+            int(teacher_inputs["responses"].shape[1]),
         )
-        if distill_params.loss_variant == "full_logit":
-            if student_all_log_probs is not None:
-                distill_len = min(distill_len, int(student_all_log_probs.shape[1]))
-            if student_topk_log_probs is not None:
-                distill_len = min(distill_len, int(student_topk_log_probs.shape[1]))
-        if distill_len <= 0:
-            zero = log_prob.new_zeros(())
-            return zero, {"distill/sdpo_loss": 0.0, "distill/token_count": 0.0}
-
-        distill_mask = distill_mask[:, :distill_len].to(device=log_prob.device, dtype=log_prob.dtype)
-        student_log_probs = log_prob[:, :distill_len]
-        teacher_log_probs = teacher_log_prob[:, :distill_len].to(device=log_prob.device, dtype=log_prob.dtype)
+        student_log_probs: torch.Tensor | None = None
+        teacher_log_probs: torch.Tensor | None = None
 
         student_all_log_probs_used = None
         teacher_all_log_probs_used = None
         student_topk_log_probs_used = None
         teacher_topk_log_probs_used = None
-        if distill_params.loss_variant == "full_logit":
+        if distill_params.loss_variant == "non_full":
+            student_log_probs = self._forward_with_module_log_probs(
+                student_inputs,
+                temperature=temperature,
+                module=self.actor_module,
+            )
+            with torch.no_grad():
+                teacher_log_prob = self._forward_with_module_log_probs(
+                    teacher_inputs,
+                    temperature=temperature,
+                    module=teacher_module,
+                )
+            distill_len = min(
+                distill_len,
+                int(student_log_probs.shape[1]),
+                int(teacher_log_prob.shape[1]),
+            )
+            teacher_log_probs = teacher_log_prob
+        else:
             if self.use_fused_kernels:
                 raise ValueError("full_logit distillation requires disabling fused kernels.")
             if self.use_ulysses_sp:
                 raise ValueError("full_logit distillation is not yet supported with ulysses sequence parallelism.")
             if distill_params.full_logit_topk > 0:
-                if student_topk_log_probs is not None and student_topk_indices is not None:
-                    student_topk_log_probs_used = student_topk_log_probs[:, :distill_len]
-                    student_topk_indices_used = student_topk_indices[:, :distill_len]
-                else:
-                    student_distill_inputs = self._truncate_inputs_for_distill(model_inputs, distill_len)
-                    student_topk_log_probs_used, student_topk_indices_used = self._forward_topk_log_probs(
-                        student_distill_inputs,
-                        temperature=temperature,
-                        module=self.actor_module,
-                        distill_topk=distill_params.full_logit_topk,
-                        topk_indices=None,
-                    )
+                (
+                    student_log_probs,
+                    _,
+                    student_topk_log_probs_used,
+                    student_topk_indices_used,
+                ) = self._forward_topk_with_token_log_probs(
+                    student_inputs,
+                    temperature=temperature,
+                    module=self.actor_module,
+                    distill_topk=distill_params.full_logit_topk,
+                    topk_indices=None,
+                    calculate_entropy=False,
+                )
+                distill_len = min(
+                    distill_len,
+                    int(student_log_probs.shape[1]),
+                    int(student_topk_log_probs_used.shape[1]),
+                )
                 teacher_distill_inputs = self._truncate_inputs_for_distill(teacher_inputs, distill_len)
                 with torch.no_grad():
-                    teacher_topk_log_probs_used, _ = self._forward_topk_log_probs(
+                    _, _, teacher_topk_log_probs_used, _ = self._forward_topk_with_token_log_probs(
                         teacher_distill_inputs,
                         temperature=temperature,
                         module=teacher_module,
                         distill_topk=distill_params.full_logit_topk,
                         topk_indices=student_topk_indices_used,
                     )
+                distill_len = min(distill_len, int(teacher_topk_log_probs_used.shape[1]))
             else:
-                if student_all_log_probs is not None:
-                    student_all_log_probs_used = student_all_log_probs[:, :distill_len]
-                else:
-                    student_all_log_probs_used = self._forward_with_all_log_probs(
-                        model_inputs=self._truncate_inputs_for_distill(model_inputs, distill_len),
-                        temperature=temperature,
-                        module=self.actor_module,
-                    )[1]
+                student_log_probs, student_all_log_probs_used = self._forward_with_all_log_probs(
+                    model_inputs=student_inputs,
+                    temperature=temperature,
+                    module=self.actor_module,
+                )
                 with torch.no_grad():
                     teacher_all_log_probs_used = self._forward_with_all_log_probs(
-                        model_inputs=self._truncate_inputs_for_distill(teacher_inputs, distill_len),
+                        model_inputs=teacher_inputs,
                         temperature=temperature,
                         module=teacher_module,
                     )[1]
+                distill_len = min(
+                    distill_len,
+                    int(student_log_probs.shape[1]),
+                    int(student_all_log_probs_used.shape[1]),
+                    int(teacher_all_log_probs_used.shape[1]),
+                )
+
+        if student_log_probs is None:
+            raise ValueError("student_log_probs must be computed for SDPO loss.")
+        if distill_len <= 0:
+            zero = student_log_probs.sum() * 0.0
+            return zero, {"distill/sdpo_loss": 0.0, "distill/token_count": 0.0}
+
+        student_log_probs = student_log_probs[:, :distill_len]
+        distill_mask = distill_mask[:, :distill_len].to(
+            device=student_log_probs.device,
+            dtype=student_log_probs.dtype,
+        )
+        if teacher_log_probs is not None:
+            teacher_log_probs = teacher_log_probs[:, :distill_len].to(
+                device=student_log_probs.device,
+                dtype=student_log_probs.dtype,
+            )
+        if student_all_log_probs_used is not None:
+            student_all_log_probs_used = student_all_log_probs_used[:, :distill_len]
+        if teacher_all_log_probs_used is not None:
+            teacher_all_log_probs_used = teacher_all_log_probs_used[:, :distill_len]
+        if student_topk_log_probs_used is not None:
+            student_topk_log_probs_used = student_topk_log_probs_used[:, :distill_len]
+        if teacher_topk_log_probs_used is not None:
+            teacher_topk_log_probs_used = teacher_topk_log_probs_used[:, :distill_len]
 
         per_token_loss = _compute_sdpo_per_token_loss(
             student_log_probs=student_log_probs,
@@ -600,16 +746,23 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             full_logit_topk=distill_params.full_logit_topk,
             full_logit_add_tail=distill_params.full_logit_add_tail,
         )
+        if distill_params.negate_sdpo_loss:
+            per_token_loss = -per_token_loss
 
         if distill_params.is_clip is not None:
-            negative_approx_kl = (student_log_probs - old_log_prob[:, :distill_len]).detach()
+            student_old_log_prob = model_inputs.get("distill_student_old_log_probs")
+            if student_old_log_prob is None:
+                raise ValueError(
+                    "distill_student_old_log_probs is required when distill_is_clip is enabled."
+                )
+            student_old_log_prob = student_old_log_prob[:, :distill_len].to(
+                device=student_log_probs.device,
+                dtype=student_log_probs.dtype,
+            )
+            negative_approx_kl = (student_log_probs - student_old_log_prob).detach()
             negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
             ratio = torch.exp(negative_approx_kl).clamp(max=distill_params.is_clip)
             per_token_loss = per_token_loss * ratio
-
-        rollout_is_weights = model_inputs.get("rollout_is_weights")
-        if rollout_is_weights is not None:
-            per_token_loss = per_token_loss * rollout_is_weights[:, :distill_len]
 
         if token_count <= 0:
             # Keep graph/collective structure aligned across ranks even when this
@@ -632,6 +785,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         distill_params = self._parse_distill_params(data.meta_info)
 
         distill_required_keys = {
+            "distill_student_input_ids",
+            "distill_student_attention_mask",
+            "distill_student_position_ids",
+            "distill_student_responses",
             "distill_teacher_input_ids",
             "distill_teacher_attention_mask",
             "distill_teacher_position_ids",
@@ -639,6 +796,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             "distill_mask",
         }
         use_distill = distill_params.enabled and distill_required_keys.issubset(set(data.batch.keys()))
+        if use_distill and distill_params.is_clip is not None and "distill_student_old_log_probs" not in data.batch:
+            raise ValueError(
+                "distill_student_old_log_probs is required when distill_is_clip is enabled."
+            )
 
         select_keys = [
             "responses",
@@ -653,6 +814,12 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             select_keys.append("ref_log_prob")
         if use_distill:
             select_keys.extend(sorted(distill_required_keys))
+            if "distill_student_response_mask" in data.batch:
+                select_keys.append("distill_student_response_mask")
+            if "distill_teacher_response_mask" in data.batch:
+                select_keys.append("distill_teacher_response_mask")
+            if distill_params.is_clip is not None:
+                select_keys.append("distill_student_old_log_probs")
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
         if "rollout_log_probs" in data.batch.keys():
@@ -694,41 +861,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
 
-                    student_all_log_probs = None
-                    student_topk_log_probs = None
-                    student_topk_indices = None
-                    use_one_pass_full_logit = use_distill and distill_params.loss_variant == "full_logit"
-                    if use_one_pass_full_logit:
-                        if distill_params.full_logit_topk > 0:
-                            (
-                                log_prob,
-                                entropy,
-                                student_topk_log_probs,
-                                student_topk_indices,
-                            ) = self._forward_topk_with_token_log_probs(
-                                model_inputs=model_inputs,
-                                temperature=temperature,
-                                module=self.actor_module,
-                                distill_topk=distill_params.full_logit_topk,
-                                topk_indices=None,
-                                calculate_entropy=calculate_entropy,
-                            )
-                        else:
-                            log_prob, student_all_log_probs = self._forward_with_all_log_probs(
-                                model_inputs=model_inputs,
-                                temperature=temperature,
-                                module=self.actor_module,
-                            )
-                            entropy = None
-                            if calculate_entropy:
-                                student_probs = torch.exp(student_all_log_probs)
-                                entropy = -(student_probs * student_all_log_probs).sum(dim=-1)
-                    else:
-                        entropy, log_prob = self._forward_micro_batch(
-                            model_inputs,
-                            temperature=temperature,
-                            calculate_entropy=calculate_entropy,
-                        )
+                    entropy, log_prob = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                    )
 
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -753,14 +890,9 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     if use_distill:
                         sdpo_loss, sdpo_metrics = self._compute_sdpo_loss(
                             model_inputs=model_inputs,
-                            log_prob=log_prob,
-                            old_log_prob=old_log_prob,
                             temperature=temperature,
                             loss_agg_mode=loss_agg_mode,
                             distill_params=distill_params,
-                            student_all_log_probs=student_all_log_probs,
-                            student_topk_log_probs=student_topk_log_probs,
-                            student_topk_indices=student_topk_indices,
                         )
                         policy_loss = policy_loss + distill_params.lambda_coef * sdpo_loss
                         micro_batch_metrics["distill/sdpo_loss"] = sdpo_metrics["distill/sdpo_loss"] * loss_scale_factor

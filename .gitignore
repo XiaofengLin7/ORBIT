@@ -10,5 +10,7 @@ results/
 plots/
 *.png
 AGENTS.md
+CLAUDE.md
+.claude/
 .codex/
 idea.pdf

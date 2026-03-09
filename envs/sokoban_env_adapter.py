@@ -12,8 +12,10 @@ Install dependency (once per environment)::
 from __future__ import annotations
 
 from collections import deque
+import inspect
 import random
 import re
+import threading
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
@@ -30,6 +32,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 BOXED_PATTERN = re.compile(r"\\boxed\{([^}]+)\}", re.IGNORECASE)
+_SOKOBAN_GEN_LOCK = threading.Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Text rendering
@@ -396,11 +399,16 @@ class SokobanEnvAdapter(BaseEnv):
         num_boxes: int,
         max_steps: int,
     ) -> GymSokobanEnv:
-        return GymSokobanEnv(
-            dim_room=tuple(dim_room),
-            num_boxes=int(num_boxes),
-            max_steps=int(max_steps),
-        )
+        init_kwargs: Dict[str, Any] = {
+            "dim_room": tuple(dim_room),
+            "num_boxes": int(num_boxes),
+            "max_steps": int(max_steps),
+        }
+        # gym_sokoban.__init__ calls reset() by default, but its generator uses
+        # global mutable state and can race under threaded env construction.
+        if "reset" in inspect.signature(GymSokobanEnv).parameters:
+            init_kwargs["reset"] = False
+        return GymSokobanEnv(**init_kwargs)
 
     @classmethod
     def _build_env_for_reset(
@@ -424,8 +432,7 @@ class SokobanEnvAdapter(BaseEnv):
                 num_boxes=num_boxes,
                 max_steps=max_steps,
             )
-            cls._set_seed(env, base_seed)
-            env.reset()
+            cls._seed_and_reset_env(env, base_seed)
             shortest_path_length = cls._compute_shortest_path_length(
                 env.room_state, env.room_fixed
             )
@@ -439,8 +446,7 @@ class SokobanEnvAdapter(BaseEnv):
                 num_boxes=num_boxes,
                 max_steps=max_steps,
             )
-            cls._set_seed(env, candidate_seed)
-            env.reset()
+            cls._seed_and_reset_env(env, candidate_seed)
             shortest_path_length = cls._compute_shortest_path_length(
                 env.room_state, env.room_fixed
             )
@@ -467,6 +473,17 @@ class SokobanEnvAdapter(BaseEnv):
         env.seed(int(seed))
         random.seed(int(seed))
         np.random.seed(int(seed))
+
+    @classmethod
+    def _seed_and_reset_env(
+        cls,
+        env: GymSokobanEnv,
+        seed: Optional[int],
+    ) -> None:
+        """Serialize seed+reset because gym_sokoban generation is not thread-safe."""
+        with _SOKOBAN_GEN_LOCK:
+            cls._set_seed(env, seed)
+            env.reset()
 
     @staticmethod
     def _coerce_optional_positive_int(
