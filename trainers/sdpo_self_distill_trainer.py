@@ -50,11 +50,14 @@ class DistillSettings:
     full_logit_topk: int = 64
     full_logit_add_tail: bool = True
     negate_sdpo_loss: bool = False
+    use_stale_coefficient: bool = False
+    strip_system_from_teacher_prompt: bool = True
     teacher_context_attempts: int | None = None
     trajectory_selection: str = "first_attempt_hindsight"
     teacher_regularization: str = "none"
     teacher_update_rate: float = 0.05
     teacher_update_interval: int = 10
+    merge_to_advantages: bool = False
 
 
 @dataclass
@@ -72,6 +75,7 @@ class DistillPayload:
     total_samples: int
     kept_samples: int
     student_old_log_probs: torch.Tensor | None = None
+    teacher_old_log_probs: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -626,6 +630,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             raise ValueError(
                 f"rllm.distill.full_logit_topk must be a non-negative integer, got {full_logit_topk}"
             )
+        merge_to_advantages = bool(cfg.get("merge_to_advantages", False))
         return DistillSettings(
             enable=bool(cfg.get("enable", False)),
             lambda_coef=float(cfg.get("lambda", 1.0)),
@@ -641,11 +646,14 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             full_logit_topk=full_logit_topk,
             full_logit_add_tail=bool(cfg.get("full_logit_add_tail", True)),
             negate_sdpo_loss=bool(cfg.get("negate_sdpo_loss", False)),
+            use_stale_coefficient=bool(cfg.get("use_stale_coefficient", False)),
+            strip_system_from_teacher_prompt=bool(cfg.get("strip_system_from_teacher_prompt", True)),
             teacher_context_attempts=teacher_context_attempts,
             trajectory_selection=trajectory_selection,
             teacher_regularization=teacher_regularization,
             teacher_update_rate=teacher_update_rate,
             teacher_update_interval=teacher_update_interval,
+            merge_to_advantages=merge_to_advantages,
         )
 
     def _transform_agent_trajectories(
@@ -912,16 +920,19 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
             prompt_attention_row = batch.batch["attention_mask"][i, :-original_response_len]
             student_prompt_tokens = batch.batch["prompts"][i][prompt_attention_row > 0].long()
-            student_prompt_without_system = self._build_student_prompt_without_system(
-                trajectory=trajectory,
-                student_prompt_tokens=student_prompt_tokens,
-            )
-            if student_prompt_without_system is None:
-                skipped_hindsight_unavailable += 1
-                skipped_hindsight_system_strip_unavailable += 1
-                continue
+            if self.distill_settings.strip_system_from_teacher_prompt:
+                teacher_suffix = self._build_student_prompt_without_system(
+                    trajectory=trajectory,
+                    student_prompt_tokens=student_prompt_tokens,
+                )
+                if teacher_suffix is None:
+                    skipped_hindsight_unavailable += 1
+                    skipped_hindsight_system_strip_unavailable += 1
+                    continue
+            else:
+                teacher_suffix = student_prompt_tokens
             teacher_prompt_tokens = torch.cat(
-                [teacher_context_tokens.long(), student_prompt_without_system.long()],
+                [teacher_context_tokens.long(), teacher_suffix.long()],
                 dim=0,
             )
 
@@ -998,16 +1009,30 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             selected_distill_mask[row_idx, :row_len] = row.float()
 
         kept_samples = int(selected_student.batch["responses"].shape[0])
+        need_student_old = (
+            self.distill_settings.is_clip is not None
+            or self.distill_settings.use_stale_coefficient
+        )
+        need_teacher_old = self.distill_settings.use_stale_coefficient
         student_old_log_probs: torch.Tensor | None = None
-        if self.distill_settings.is_clip is not None:
+        teacher_old_log_probs: torch.Tensor | None = None
+        if need_student_old or need_teacher_old:
             if not hasattr(self, "actor_rollout_wg"):
                 raise ValueError(
-                    "Distillation with rllm.distill.is_clip requires actor_rollout_wg "
-                    "to compute distill_student_old_log_probs."
+                    "Distillation with is_clip or use_stale_coefficient requires "
+                    "actor_rollout_wg to compute old log-probs."
                 )
-            student_old_log_probs = self._compute_distill_student_old_log_probs(
+        if need_student_old:
+            student_old_log_probs = self._compute_distill_old_log_probs(
                 selected_student,
                 kept_samples=kept_samples,
+                use_teacher=False,
+            )
+        if need_teacher_old:
+            teacher_old_log_probs = self._compute_distill_old_log_probs(
+                selected_teacher,
+                kept_samples=kept_samples,
+                use_teacher=(self.distill_settings.teacher_regularization != "none"),
             )
 
         payload = DistillPayload(
@@ -1022,6 +1047,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             total_samples=total_samples,
             kept_samples=kept_samples,
             student_old_log_probs=student_old_log_probs,
+            teacher_old_log_probs=teacher_old_log_probs,
         )
         metrics = {
             "distill/skipped_context_overflow": float(skipped_context_overflow),
@@ -1033,19 +1059,111 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         }
         return payload, metrics
 
-    def _compute_distill_student_old_log_probs(
+    def _compute_distill_old_log_probs(
         self,
-        student_batch: DataProto,
+        batch: DataProto,
         *,
         kept_samples: int,
+        use_teacher: bool = False,
     ) -> torch.Tensor:
-        """Compute clipped-SDPO student old log-probs on a world-size-safe batch."""
+        """Compute old log-probs on a world-size-safe batch.
+
+        Args:
+            batch: Student or teacher distillation batch.
+            kept_samples: Number of real (non-pad) samples.
+            use_teacher: If True, score with the teacher (ref) module
+                instead of the actor.
+        """
         world_size = int(getattr(self.actor_rollout_wg, "world_size", 1))
-        compute_batch = student_batch
+        compute_batch = batch
         if world_size > 1 and (kept_samples % world_size) != 0:
-            compute_batch = self._pad_dataproto_to_world_size(batch=student_batch)
-        compact_old_log_probs = self.actor_rollout_wg.compute_log_prob(compute_batch)
-        return compact_old_log_probs.batch["old_log_probs"][:kept_samples].float()
+            compute_batch = self._pad_dataproto_to_world_size(batch=batch)
+        if use_teacher:
+            out = self.actor_rollout_wg.compute_teacher_log_prob(compute_batch)
+        else:
+            out = self.actor_rollout_wg.compute_log_prob(compute_batch)
+        key = "ref_log_prob" if "ref_log_prob" in out.batch else "old_log_probs"
+        return out.batch[key][:kept_samples].float()
+
+    def _compute_distill_bonus(
+        self,
+        batch: DataProto,
+        payload: DistillPayload | None,
+        timing_raw: dict[str, float],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute SDPO-style distillation bonus to merge into actor advantages.
+
+        This reproduces the March 2nd architecture: the bonus is added to
+        PPO advantages so that ``agg_loss(combined_advantage, response_mask)``
+        naturally applies per-sequence F/T dilution.
+        """
+        bonus = torch.zeros_like(batch.batch["advantages"])
+        zero_stats: dict[str, float] = {
+            "distill/sdpo_loss": 0.0,
+            "distill/log_ratio_mean": 0.0,
+            "distill/log_ratio_std": 0.0,
+            "distill/token_count": 0.0,
+            "distill/skipped_batches": 1.0,
+        }
+        if not self.distill_settings.enable or payload is None:
+            return bonus, zero_stats
+
+        token_count = int(payload.distill_mask.sum().item())
+        if token_count < self.distill_settings.min_distill_tokens:
+            zero_stats["distill/token_count"] = float(token_count)
+            return bonus, zero_stats
+
+        # Denominator (teacher) log-probs — one forward pass.
+        use_teacher = self.distill_settings.teacher_regularization != "none"
+        with marked_timer("distill_den_log_prob", timing_raw):
+            den_lp = self._compute_distill_old_log_probs(
+                payload.teacher_batch,
+                kept_samples=payload.kept_samples,
+                use_teacher=use_teacher,
+            )
+
+        kept_count = payload.kept_samples
+        distill_mask = payload.distill_mask[:kept_count]
+        max_response_len = int(distill_mask.shape[1])
+
+        # Numerator: rollout log-probs from batch (no extra forward pass).
+        kept_indices = payload.kept_indices.to(
+            dtype=torch.long,
+            device=batch.batch["old_log_probs"].device,
+        )
+        num_lp = batch.batch["old_log_probs"].index_select(0, kept_indices)[
+            :, :max_response_len
+        ]
+        den_lp = den_lp[:kept_count, :max_response_len].to(
+            device=num_lp.device, dtype=num_lp.dtype,
+        )
+        distill_mask = distill_mask.to(device=num_lp.device, dtype=num_lp.dtype)
+
+        # Compute bonus: lambda * stopgrad(s_old - t_old) * mask
+        log_ratio = (num_lp - den_lp).detach()
+        masked_ratio = log_ratio * distill_mask
+        distill_adv = self.distill_settings.lambda_coef * masked_ratio
+
+        # Scatter into full-batch bonus tensor.
+        scatter_indices = kept_indices.to(device=bonus.device)
+        bonus[scatter_indices, :max_response_len] = distill_adv.to(
+            device=bonus.device, dtype=bonus.dtype,
+        )
+
+        # Stats for logging.
+        valid = masked_ratio[distill_mask > 0]
+        stats: dict[str, float] = {
+            "distill/sdpo_loss": float(-(distill_adv[distill_mask > 0].mean().item()))
+            if valid.numel() > 0
+            else 0.0,
+            "distill/log_ratio_mean": float(valid.mean().item()) if valid.numel() > 0 else 0.0,
+            "distill/log_ratio_std": float(valid.std(unbiased=False).item())
+            if valid.numel() > 1
+            else 0.0,
+            "distill/token_count": float(token_count),
+            "distill/skipped_batches": 0.0,
+        }
+        return bonus, stats
 
     def _set_distill_meta(self, batch: DataProto, *, enabled_for_step: bool) -> None:
         """Attach per-step distillation settings in batch meta info for actor update."""
@@ -1060,6 +1178,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         batch.meta_info["distill_full_logit_topk"] = int(self.distill_settings.full_logit_topk)
         batch.meta_info["distill_full_logit_add_tail"] = bool(self.distill_settings.full_logit_add_tail)
         batch.meta_info["distill_negate_sdpo_loss"] = bool(self.distill_settings.negate_sdpo_loss)
+        batch.meta_info["distill_use_stale_coefficient"] = bool(self.distill_settings.use_stale_coefficient)
         batch.meta_info["distill_teacher_regularization"] = str(self.distill_settings.teacher_regularization)
 
     def _attach_distill_payload_to_batch(
@@ -1129,6 +1248,9 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         student_old_log_probs = None
         if payload.student_old_log_probs is not None:
             student_old_log_probs = torch.zeros((batch_size, max_distill_len), dtype=payload.student_old_log_probs.dtype)
+        teacher_old_log_probs = None
+        if payload.teacher_old_log_probs is not None:
+            teacher_old_log_probs = torch.zeros((batch_size, max_distill_len), dtype=payload.teacher_old_log_probs.dtype)
 
         student_prompt_attention_compact = student_batch["attention_mask"][:, :max_student_prompt_len].long()
         teacher_prompt_attention_compact = teacher_batch["attention_mask"][:, :max_teacher_prompt_len].long()
@@ -1146,6 +1268,8 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             distill_mask[kept_idx] = payload.distill_mask[row_idx].float()
             if student_old_log_probs is not None and payload.student_old_log_probs is not None:
                 student_old_log_probs[kept_idx] = payload.student_old_log_probs[row_idx]
+            if teacher_old_log_probs is not None and payload.teacher_old_log_probs is not None:
+                teacher_old_log_probs[kept_idx] = payload.teacher_old_log_probs[row_idx]
 
         student_attention_mask = torch.cat([student_prompt_attention, student_response_mask], dim=1)
         student_position_ids = (torch.cumsum(student_attention_mask, dim=1) - 1) * student_attention_mask
@@ -1162,6 +1286,8 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         batch.batch["distill_student_response_mask"] = student_response_mask
         if student_old_log_probs is not None:
             batch.batch["distill_student_old_log_probs"] = student_old_log_probs
+        if teacher_old_log_probs is not None:
+            batch.batch["distill_teacher_old_log_probs"] = teacher_old_log_probs
         batch.batch["distill_teacher_input_ids"] = teacher_input_ids
         batch.batch["distill_teacher_attention_mask"] = teacher_attention_mask
         batch.batch["distill_teacher_position_ids"] = teacher_position_ids
@@ -1366,11 +1492,21 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                     if self.distill_settings.enable and not self.config.rllm.stepwise_advantage.enable:
                         distill_payload, distill_prep_metrics = self._prepare_distill_payload(batch)
                         metrics.update(distill_prep_metrics)
-                        distill_metrics = self._attach_distill_payload_to_batch(
-                            batch=batch,
-                            payload=distill_payload,
-                        )
-                        metrics.update(distill_metrics)
+                        if self.distill_settings.merge_to_advantages:
+                            distill_bonus, distill_metrics = self._compute_distill_bonus(
+                                batch=batch,
+                                payload=distill_payload,
+                                timing_raw=timing_raw,
+                            )
+                            batch.batch["advantages"] = batch.batch["advantages"] + distill_bonus
+                            metrics.update(distill_metrics)
+                            self._set_distill_meta(batch=batch, enabled_for_step=False)
+                        else:
+                            distill_metrics = self._attach_distill_payload_to_batch(
+                                batch=batch,
+                                payload=distill_payload,
+                            )
+                            metrics.update(distill_metrics)
 
                     batch = self._pad_dataproto_to_world_size(batch=batch)
                     self._balance_batch(batch, metrics=metrics)

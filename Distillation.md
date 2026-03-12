@@ -1,8 +1,12 @@
-# SDPO Self-Distillation (Direct Loss, Current)
+# SDPO Self-Distillation
 
 ## Overview
 
-This document describes the current shared-weight SDPO self-distillation path used in multi-episode training.
+This document describes the shared-weight SDPO self-distillation path used in multi-episode training.
+
+Two distillation modes are supported:
+
+### Direct-loss mode (default, `merge_to_advantages=false`)
 
 At each training step:
 1. Run normal PPO preparation on rollout data (reward, old log-prob, advantages, etc.).
@@ -11,7 +15,17 @@ At each training step:
    - `total_actor_loss = ppo_pg_loss + lambda * sdpo_loss`
    - existing entropy / KL terms are still applied when enabled.
 
-This replaced the old `distill bonus added into advantages` path.
+The SDPO loss is aggregated over first-attempt tokens only via `distill_mask`.
+
+### Advantage-bonus mode (`merge_to_advantages=true`)
+
+Reproduces the March 2nd architecture where the SDPO signal is added directly to PPO advantages before the standard actor update:
+1. Run normal PPO preparation on rollout data.
+2. Build a distillation payload from hindsight context + first-attempt tokens.
+3. Compute bonus: `λ * stopgrad(s_old - t_old) * distill_mask`, scatter into full-batch advantages.
+4. Run a standard PPO actor update (no SDPO forward passes in the actor).
+
+The bonus is aggregated over ALL response tokens via `response_mask` in `agg_loss`, which naturally applies per-sequence F/T dilution (first-attempt tokens / total response tokens). This gives variable per-sequence weighting that a fixed lambda in direct-loss mode cannot replicate.
 
 ## Scope
 
@@ -35,6 +49,7 @@ rllm:
     lambda: 0.1
     mode: sdpo_self
     denominator_mode: teacher_adapted_feedback
+    trajectory_selection: first_attempt_hindsight
     teacher_context_attempts: null
     teacher_regularization: none
     teacher_update_rate: 0.05
@@ -49,27 +64,38 @@ rllm:
     is_clip: null                 # nullable positive float
     full_logit_topk: 64           # positive int
     full_logit_add_tail: true     # bool
+    negate_sdpo_loss: false       # bool
+    use_stale_coefficient: false  # bool
+    strip_system_from_teacher_prompt: true  # bool
+
+    # Distillation mode
+    merge_to_advantages: false    # bool — false: direct loss, true: advantage bonus
 ```
 
 Semantics:
 - `enable`: enable SDPO distillation path.
-- `lambda`: scalar weight for SDPO term in actor objective.
-- `mode`: currently `sdpo_self`.
+- `lambda`: scalar weight for SDPO term. In direct-loss mode, scales the SDPO loss added to the actor objective. In advantage-bonus mode, scales the bonus added to PPO advantages.
+- `mode`: `sdpo_self` (self-distillation, shared-weight model acts as both student and teacher) or `sdpo_pure` (separate teacher model).
 - `denominator_mode`: currently `teacher_adapted_feedback`.
+- `trajectory_selection`: how to select which trajectory tokens to distill. Currently `first_attempt_hindsight` (distill first-attempt tokens with hindsight context from complete attempts).
 - `teacher_context_attempts`:
   - integer `N`: require at least `N` complete attempts and use the first `N`.
   - `null`: use last available complete-attempt context.
-- `teacher_regularization`: `none`, `ema`, or `every_n_steps`.
-- `teacher_update_rate`: EMA rate for `ema`.
-- `teacher_update_interval`: hard-sync interval for `every_n_steps`.
-- `context_limit`: if `null`, defaults to `data.max_prompt_length + data.max_response_length`.
-- `context_overflow_policy`: currently only `skip_loss`.
+- `teacher_regularization`: `none` (actor is its own teacher), `ema` (exponential moving average of actor weights), or `every_n_steps` (hard-sync teacher from actor every N steps).
+- `teacher_update_rate`: EMA decay rate when `teacher_regularization=ema`. Lower values = slower teacher drift.
+- `teacher_update_interval`: hard-sync interval (in training steps) when `teacher_regularization=every_n_steps`.
+- `context_limit`: max total tokens for denominator context. If `null`, defaults to `data.max_prompt_length + data.max_response_length`.
+- `context_overflow_policy`: currently only `skip_loss` — skip samples that exceed context limit.
 - `min_distill_tokens`: if valid distill tokens < this value, distillation is disabled for that batch.
-- `loss_variant`: SDPO branch (`non_full` or `full_logit`).
+- `loss_variant`: SDPO branch (`non_full` or `full_logit`). Only applies to direct-loss mode; advantage-bonus mode always uses `non_full`-style log-ratio.
 - `alpha`: KL/JSD interpolation for `full_logit`; for `non_full`, required to be `1.0`.
-- `is_clip`: optional IS-ratio clip multiplier for distillation.
+- `is_clip`: optional IS-ratio clip multiplier for distillation (direct-loss mode only).
 - `full_logit_topk`: top-k support for full-logit branch.
 - `full_logit_add_tail`: whether to add tail bucket in top-k mode.
+- `negate_sdpo_loss`: if `true`, negate the SDPO loss/bonus sign. In direct-loss mode this flips the gradient direction. In advantage-bonus mode, set to `false` since the bonus is naturally anti-distillation (`bonus = λ*(s-t)`, PG loss `= -A*logπ` reinforces tokens where student > teacher).
+- `use_stale_coefficient`: if `true`, apply importance-sampling correction using the ratio between current and old policy log-probs in the SDPO term.
+- `strip_system_from_teacher_prompt`: if `true`, remove the system prompt from the teacher's denominator context. Set to `false` to keep the system prompt in teacher scoring.
+- `merge_to_advantages`: if `false` (default), run SDPO as a separate loss in the actor. If `true`, compute SDPO bonus in the trainer, add to PPO advantages, and run standard PPO — the actor sees `distill_enabled=false` and does no SDPO forward passes.
 
 Not added by design:
 - no `rllm.distill.token_scope`
@@ -143,6 +169,8 @@ If rollout IS weights exist in batch, they are also multiplied into distill per-
 
 ## Data Flow
 
+### Direct-loss mode (`merge_to_advantages=false`)
+
 1. Trainer generates trajectories and computes PPO prep tensors.
 2. Trainer builds distill payload from current hindsight logic.
 3. Trainer attaches distill tensors to batch:
@@ -156,6 +184,17 @@ If rollout IS weights exist in batch, they are also multiplied into distill per-
 5. Actor wrapper computes teacher-side scores (no grad) on denominator context.
 6. Actor wrapper computes SDPO loss branch (`non_full` or `full_logit`) on first-attempt mask.
 7. Actor wrapper backprops one combined loss (`ppo + lambda*sdpo`) per micro-batch.
+8. Teacher sync schedule (`none` / `ema` / `every_n_steps`) remains unchanged.
+
+### Advantage-bonus mode (`merge_to_advantages=true`)
+
+1. Trainer generates trajectories and computes PPO prep tensors.
+2. Trainer builds distill payload from current hindsight logic.
+3. Trainer computes teacher log-probs via one forward pass (using teacher or actor module).
+4. Trainer computes bonus: `λ * stopgrad(s_old - t_old) * distill_mask`, scatters into full-batch tensor.
+5. Trainer adds bonus to `batch["advantages"]`.
+6. Trainer sets `distill_enabled=false` in batch meta — actor runs standard PPO with no distill tensors.
+7. Actor backprops standard PPO loss (advantages already contain SDPO signal).
 8. Teacher sync schedule (`none` / `ema` / `every_n_steps`) remains unchanged.
 
 ## Worker Wiring
@@ -175,10 +214,14 @@ Kept distill metrics:
 - `distill/kept_ratio`
 - `distill/teacher_sync_applied`
 
+Additional metrics in advantage-bonus mode (`merge_to_advantages=true`):
+- `distill/log_ratio_mean`
+- `distill/log_ratio_std`
+- `distill/skipped_batches`
+
 Not logged:
 - `distill/variant`
 - `distill/empty_target_batch`
-- old bonus-path diagnostics (`distill/log_ratio_*`, `distill/skipped_batches`)
 
 ## Tests
 
