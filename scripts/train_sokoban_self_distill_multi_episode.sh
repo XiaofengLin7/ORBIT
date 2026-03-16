@@ -16,7 +16,7 @@ fi
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
 ACTOR_LR=${ACTOR_LR:-1e-5}
-DISTILL_LAMBDA=${DISTILL_LAMBDA:-1.0}
+DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 # Distillation mode options: sdpo_self, sdpo_pure.
 DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
 DISTILL_TRAJECTORY_SELECTION=${DISTILL_TRAJECTORY_SELECTION:-selective_retry_success_n2}
@@ -27,11 +27,12 @@ TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
 TEACHER_UPDATE_INTERVAL=${TEACHER_UPDATE_INTERVAL:-25}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
 # Distillation loss options: non_full, full_logit.
-DISTILL_LOSS_VARIANT=${DISTILL_LOSS_VARIANT:-full_logit}
+DISTILL_LOSS_VARIANT=${DISTILL_LOSS_VARIANT:-non_full}
 DISTILL_IS_CLIP=${DISTILL_IS_CLIP:-true}
 FULL_LOGIT_TOPK=${FULL_LOGIT_TOPK:-64}
 FULL_LOGIT_ADD_TAIL=${FULL_LOGIT_ADD_TAIL:-True}
 NEGATE_SDPO_LOSS=${NEGATE_SDPO_LOSS:-False}
+USE_STALE_COEFFICIENT=${USE_STALE_COEFFICIENT:-False}
 PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-16}
 ROLLOUT_N=${ROLLOUT_N:-8}
@@ -166,6 +167,7 @@ python scripts/train_multi_episode.py \
     +rllm.distill.full_logit_topk=$FULL_LOGIT_TOPK \
     +rllm.distill.full_logit_add_tail=$FULL_LOGIT_ADD_TAIL \
     +rllm.distill.negate_sdpo_loss=$NEGATE_SDPO_LOSS \
+    +rllm.distill.use_stale_coefficient=$USE_STALE_COEFFICIENT \
     ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
     ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
     ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \

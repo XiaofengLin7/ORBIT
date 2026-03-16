@@ -15,15 +15,27 @@ ENV_ID=${ENV_ID:-game:TowerofHanoi-v0-easy}
 TOTAL_STEP_CAP=${TOTAL_STEP_CAP:-30}
 MAX_TURNS_PER_EPISODE=${MAX_TURNS_PER_EPISODE:-10}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
-DISTILL_LAMBDA=${DISTILL_LAMBDA:-1.0}
+DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
-DISTILL_TRAJECTORY_SELECTION=${DISTILL_TRAJECTORY_SELECTION:-first_attempt_hindsight}
-TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-2}
+DISTILL_TRAJECTORY_SELECTION=${DISTILL_TRAJECTORY_SELECTION:-selective_retry_success_n2}
+TEACHER_CONTEXT_ATTEMPTS=${TEACHER_CONTEXT_ATTEMPTS:-1}
 TEACHER_REGULARIZATION=${TEACHER_REGULARIZATION:-ema}
 TEACHER_UPDATE_RATE=${TEACHER_UPDATE_RATE:-0.05}
 TEACHER_UPDATE_INTERVAL=${TEACHER_UPDATE_INTERVAL:-10}
 MIN_DISTILL_TOKENS=${MIN_DISTILL_TOKENS:-1}
+DISTILL_LOSS_VARIANT=${DISTILL_LOSS_VARIANT:-non_full}
+DISTILL_IS_CLIP=${DISTILL_IS_CLIP:-true}
+FULL_LOGIT_TOPK=${FULL_LOGIT_TOPK:-64}
+FULL_LOGIT_ADD_TAIL=${FULL_LOGIT_ADD_TAIL:-True}
 NEGATE_SDPO_LOSS=${NEGATE_SDPO_LOSS:-False}
+USE_STALE_COEFFICIENT=${USE_STALE_COEFFICIENT:-False}
+ENABLE_REFLECTION=${ENABLE_REFLECTION:-True}
+
+if [ "$DISTILL_LOSS_VARIANT" = "full_logit" ]; then
+    DISTILL_ALPHA=${DISTILL_ALPHA:-0.5}
+else
+    DISTILL_ALPHA=${DISTILL_ALPHA:-1.0}
+fi
 
 # Extract env name (part after :, convert to lowercase with hyphens)
 ENV_NAME=$(echo "$ENV_ID" | cut -d: -f2 | tr '[:upper:]' '[:lower:]' | tr '_' '-')
@@ -63,9 +75,25 @@ if [ "$DISTILL_TRAJECTORY_SELECTION" = "selective_retry_success_n2" ] && [ "$TEA
     exit 1
 fi
 
+if [ "$DISTILL_LOSS_VARIANT" != "non_full" ] && [ "$DISTILL_LOSS_VARIANT" != "full_logit" ]; then
+    echo "Error: DISTILL_LOSS_VARIANT must be one of: non_full, full_logit"
+    exit 1
+fi
+
+if [ "$DISTILL_LOSS_VARIANT" = "non_full" ]; then
+    case "$DISTILL_ALPHA" in
+        1|1.0|1.00|1.000|1.0000) ;;
+        *)
+            echo "Error: DISTILL_ALPHA must be 1.0 when DISTILL_LOSS_VARIANT=non_full (got $DISTILL_ALPHA)"
+            exit 1
+            ;;
+    esac
+fi
+
 TRAINING_CONFIG_NAME=""
 append_experiment_tag "$DISTILL_MODE"
 append_experiment_tag "$DISTILL_TRAJECTORY_SELECTION"
+append_experiment_tag "$DISTILL_LOSS_VARIANT"
 append_experiment_tag "$TEACHER_REG_TAG"
 if [ "$NEGATE_SDPO_LOSS" = True ] || [ "$NEGATE_SDPO_LOSS" = "true" ]; then
     append_experiment_tag "negate"
@@ -86,7 +114,7 @@ python scripts/train_multi_episode.py \
     +rllm.env.env_args.success_reward=1.0 \
     rllm.agent.max_steps=$TOTAL_STEP_CAP \
     +rllm.env.env_args.episode_header="New episode begins." \
-    +rllm.env.env_args.enable_reflection=False \
+    +rllm.env.env_args.enable_reflection=$ENABLE_REFLECTION \
     rllm.distill.enable=True \
     +rllm.distill.lambda=$DISTILL_LAMBDA \
     +rllm.distill.mode=$DISTILL_MODE \
@@ -96,7 +124,13 @@ python scripts/train_multi_episode.py \
     +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
+    +rllm.distill.loss_variant=$DISTILL_LOSS_VARIANT \
+    +rllm.distill.alpha=$DISTILL_ALPHA \
+    +rllm.distill.is_clip=$DISTILL_IS_CLIP \
+    +rllm.distill.full_logit_topk=$FULL_LOGIT_TOPK \
+    +rllm.distill.full_logit_add_tail=$FULL_LOGIT_ADD_TAIL \
     +rllm.distill.negate_sdpo_loss=$NEGATE_SDPO_LOSS \
+    +rllm.distill.use_stale_coefficient=$USE_STALE_COEFFICIENT \
     ++rllm.distill.teacher_regularization=$TEACHER_REGULARIZATION \
     ++rllm.distill.teacher_update_rate=$TEACHER_UPDATE_RATE \
     ++rllm.distill.teacher_update_interval=$TEACHER_UPDATE_INTERVAL \
