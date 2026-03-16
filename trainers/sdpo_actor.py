@@ -33,10 +33,11 @@ class SDPODistillParams:
     use_grpo_loss: bool
     loss_variant: str
     alpha: float
-    is_clip: float | None
+    is_clip: bool
     full_logit_topk: int
     full_logit_add_tail: bool
     negate_sdpo_loss: bool
+    use_stale_coefficient: bool
     teacher_regularization: str
 
 
@@ -133,6 +134,41 @@ def _compute_sdpo_per_token_loss(
     return kl_loss.sum(-1)
 
 
+def _segmented_reverse_cumsum(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Reverse cumulative sum within contiguous segments defined by *mask*.
+
+    For each segment (contiguous run of 1s in *mask*), position ℓ gets
+    ``sum_{ℓ'=ℓ}^{end_of_segment} values[ℓ']``.  Positions where
+    ``mask == 0`` are always zero.  Operates in pure tensor ops (no Python
+    loops) and is differentiable w.r.t. *values*.
+    """
+    masked = values * mask
+    flipped = masked.flip(1)
+    flipped_mask = mask.flip(1)
+    raw_cumsum = flipped.cumsum(dim=1)
+
+    # Detect segment starts in flipped space (mask transitions 0→1).
+    starts = torch.zeros_like(flipped_mask)
+    starts[:, 0] = flipped_mask[:, 0]
+    starts[:, 1:] = flipped_mask[:, 1:] * (1 - flipped_mask[:, :-1])
+
+    # At each segment start, the correction is raw_cumsum at the previous
+    # position (the total leak from prior segments).  Forward-fill each
+    # correction across its segment via scatter_add + gather on segment ids.
+    correction_at_start = torch.zeros_like(raw_cumsum)
+    correction_at_start[:, 1:] = starts[:, 1:] * raw_cumsum[:, :-1]
+
+    segment_ids = starts.cumsum(dim=1).long()
+    B, T = raw_cumsum.shape
+    max_seg = int(segment_ids.max().item()) + 1
+    corrections_per_seg = torch.zeros(B, max_seg, device=raw_cumsum.device, dtype=raw_cumsum.dtype)
+    corrections_per_seg.scatter_add_(1, segment_ids, correction_at_start)
+    running_correction = corrections_per_seg.gather(1, segment_ids)
+
+    segmented = (raw_cumsum - running_correction) * flipped_mask
+    return segmented.flip(1)
+
+
 class SDPODataParallelPPOActor(DataParallelPPOActor):
     """PPO actor wrapper with additional SDPO loss term support."""
 
@@ -161,10 +197,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         if not (0.0 <= alpha <= 1.0):
             raise ValueError(f"distill_alpha must be in [0, 1], got {alpha}")
 
-        is_clip_raw = meta_info.get("distill_is_clip", None)
-        is_clip = None if is_clip_raw is None else float(is_clip_raw)
-        if is_clip is not None and is_clip <= 0:
-            raise ValueError(f"distill_is_clip must be positive when provided, got {is_clip}")
+        is_clip = bool(meta_info.get("distill_is_clip", False))
 
         full_logit_topk = int(meta_info.get("distill_full_logit_topk", 64))
         if full_logit_topk < 0:
@@ -187,6 +220,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             full_logit_topk=full_logit_topk,
             full_logit_add_tail=bool(meta_info.get("distill_full_logit_add_tail", True)),
             negate_sdpo_loss=bool(meta_info.get("distill_negate_sdpo_loss", False)),
+            use_stale_coefficient=bool(meta_info.get("distill_use_stale_coefficient", False)),
             teacher_regularization=teacher_regularization,
         )
 
@@ -638,24 +672,47 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         teacher_all_log_probs_used = None
         student_topk_log_probs_used = None
         teacher_topk_log_probs_used = None
+        # When use_stale_coefficient is enabled (for negate_sdpo_loss mode),
+        # the detached coefficient (s - t) uses pre-computed old log-probs
+        # instead of fresh forward-pass log-probs.  This prevents the
+        # positive-feedback loop where the coefficient grows as the policy
+        # moves away from the teacher within PPO epochs.
+        stale_student_log_probs: torch.Tensor | None = None
+        stale_teacher_log_probs: torch.Tensor | None = None
+
         if distill_params.loss_variant == "non_full":
             student_log_probs = self._forward_with_module_log_probs(
                 student_inputs,
                 temperature=temperature,
                 module=self.actor_module,
             )
-            with torch.no_grad():
-                teacher_log_prob = self._forward_with_module_log_probs(
-                    teacher_inputs,
-                    temperature=temperature,
-                    module=teacher_module,
-                )
+            if distill_params.use_stale_coefficient:
+                stale_s = model_inputs.get("distill_student_old_log_probs")
+                stale_t = model_inputs.get("distill_teacher_old_log_probs")
+                if stale_s is None or stale_t is None:
+                    raise ValueError(
+                        "distill_student_old_log_probs and distill_teacher_old_log_probs "
+                        "are required when use_stale_coefficient is enabled."
+                    )
+                stale_student_log_probs = stale_s
+                stale_teacher_log_probs = stale_t
+                # Teacher forward pass is not needed for the coefficient;
+                # skip it to save compute.
+                teacher_log_probs = None
+            else:
+                with torch.no_grad():
+                    teacher_log_prob = self._forward_with_module_log_probs(
+                        teacher_inputs,
+                        temperature=temperature,
+                        module=teacher_module,
+                    )
+                teacher_log_probs = teacher_log_prob
             distill_len = min(
                 distill_len,
                 int(student_log_probs.shape[1]),
-                int(teacher_log_prob.shape[1]),
             )
-            teacher_log_probs = teacher_log_prob
+            if teacher_log_probs is not None:
+                distill_len = min(distill_len, int(teacher_log_probs.shape[1]))
         else:
             if self.use_fused_kernels:
                 raise ValueError("full_logit distillation requires disabling fused kernels.")
@@ -734,22 +791,42 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         if teacher_topk_log_probs_used is not None:
             teacher_topk_log_probs_used = teacher_topk_log_probs_used[:, :distill_len]
 
-        per_token_loss = _compute_sdpo_per_token_loss(
-            student_log_probs=student_log_probs,
-            teacher_log_probs=teacher_log_probs,
-            loss_variant=distill_params.loss_variant,
-            alpha=distill_params.alpha,
-            student_all_log_probs=student_all_log_probs_used,
-            teacher_all_log_probs=teacher_all_log_probs_used,
-            student_topk_log_probs=student_topk_log_probs_used,
-            teacher_topk_log_probs=teacher_topk_log_probs_used,
-            full_logit_topk=distill_params.full_logit_topk,
-            full_logit_add_tail=distill_params.full_logit_add_tail,
-        )
+        if stale_student_log_probs is not None and stale_teacher_log_probs is not None:
+            # Stale-coefficient path: coefficient from pre-computed old log-probs,
+            # gradient only through fresh student_log_probs.
+            stale_s = stale_student_log_probs[:, :distill_len].to(
+                device=student_log_probs.device, dtype=student_log_probs.dtype,
+            )
+            stale_t = stale_teacher_log_probs[:, :distill_len].to(
+                device=student_log_probs.device, dtype=student_log_probs.dtype,
+            )
+            delta = (stale_s - stale_t).detach()
+            advantage = _segmented_reverse_cumsum(delta, distill_mask)
+            per_token_loss = advantage * student_log_probs
+        elif distill_params.loss_variant == "non_full":
+            # Cumulative future log-ratio advantage (unbiased token-level).
+            delta = (student_log_probs - teacher_log_probs).detach()
+            advantage = _segmented_reverse_cumsum(delta, distill_mask)
+            per_token_loss = advantage * student_log_probs
+        else:
+            # full_logit: KL/JSD over distributions — not REINFORCE-style.
+            per_token_loss = _compute_sdpo_per_token_loss(
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                loss_variant=distill_params.loss_variant,
+                alpha=distill_params.alpha,
+                student_all_log_probs=student_all_log_probs_used,
+                teacher_all_log_probs=teacher_all_log_probs_used,
+                student_topk_log_probs=student_topk_log_probs_used,
+                teacher_topk_log_probs=teacher_topk_log_probs_used,
+                full_logit_topk=distill_params.full_logit_topk,
+                full_logit_add_tail=distill_params.full_logit_add_tail,
+            )
         if distill_params.negate_sdpo_loss:
             per_token_loss = -per_token_loss
 
-        if distill_params.is_clip is not None:
+        sdpo_clipfrac = 0.0
+        if distill_params.is_clip:
             student_old_log_prob = model_inputs.get("distill_student_old_log_probs")
             if student_old_log_prob is None:
                 raise ValueError(
@@ -761,8 +838,15 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             )
             negative_approx_kl = (student_log_probs - student_old_log_prob).detach()
             negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-            ratio = torch.exp(negative_approx_kl).clamp(max=distill_params.is_clip)
-            per_token_loss = per_token_loss * ratio
+            ratio = torch.exp(negative_approx_kl)
+            clip_low = getattr(self.config, "clip_ratio_low", None) or self.config.clip_ratio
+            clip_high = getattr(self.config, "clip_ratio_high", None) or self.config.clip_ratio
+            clipped_ratio = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
+            sdpo_unclipped = per_token_loss * ratio
+            sdpo_clipped = per_token_loss * clipped_ratio
+            per_token_loss = torch.maximum(sdpo_unclipped, sdpo_clipped)
+            if token_count > 0:
+                sdpo_clipfrac = float(((sdpo_clipped > sdpo_unclipped) * distill_mask).sum() / token_count)
 
         if token_count <= 0:
             # Keep graph/collective structure aligned across ranks even when this
@@ -773,9 +857,13 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         sdpo_loss = agg_loss(
             loss_mat=per_token_loss,
             loss_mask=distill_mask,
-            loss_agg_mode=loss_agg_mode,
+            loss_agg_mode="seq-mean-token-mean",
         )
-        return sdpo_loss, {"distill/sdpo_loss": float(sdpo_loss.detach().item()), "distill/token_count": token_count}
+        return sdpo_loss, {
+            "distill/sdpo_loss": float(sdpo_loss.detach().item()),
+            "distill/token_count": token_count,
+            "distill/sdpo_clipfrac": sdpo_clipfrac,
+        }
 
     def update_policy(self, data: DataProto) -> dict[str, list[float]]:
         """Update actor policy with configurable GRPO + SDPO objective."""
@@ -796,10 +884,14 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             "distill_mask",
         }
         use_distill = distill_params.enabled and distill_required_keys.issubset(set(data.batch.keys()))
-        if use_distill and distill_params.is_clip is not None and "distill_student_old_log_probs" not in data.batch:
+        if use_distill and distill_params.is_clip and "distill_student_old_log_probs" not in data.batch:
             raise ValueError(
                 "distill_student_old_log_probs is required when distill_is_clip is enabled."
             )
+        if use_distill and distill_params.use_stale_coefficient:
+            for _key in ("distill_student_old_log_probs", "distill_teacher_old_log_probs"):
+                if _key not in data.batch:
+                    raise ValueError(f"{_key} is required when use_stale_coefficient is enabled.")
 
         select_keys = [
             "responses",
@@ -818,8 +910,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 select_keys.append("distill_student_response_mask")
             if "distill_teacher_response_mask" in data.batch:
                 select_keys.append("distill_teacher_response_mask")
-            if distill_params.is_clip is not None:
+            if distill_params.is_clip is not None or distill_params.use_stale_coefficient:
                 select_keys.append("distill_student_old_log_probs")
+            if distill_params.use_stale_coefficient:
+                select_keys.append("distill_teacher_old_log_probs")
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
         if "rollout_log_probs" in data.batch.keys():
@@ -929,4 +1023,4 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         return metrics
 
 
-__all__ = ["SDPODataParallelPPOActor", "SDPODistillParams", "_compute_sdpo_per_token_loss"]
+__all__ = ["SDPODataParallelPPOActor", "SDPODistillParams", "_compute_sdpo_per_token_loss", "_segmented_reverse_cumsum"]

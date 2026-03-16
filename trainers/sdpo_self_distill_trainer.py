@@ -46,7 +46,7 @@ class DistillSettings:
     min_distill_tokens: int = 1
     loss_variant: str = "non_full"
     alpha: float = 1.0
-    is_clip: float | None = None
+    is_clip: bool = False
     full_logit_topk: int = 64
     full_logit_add_tail: bool = True
     negate_sdpo_loss: bool = False
@@ -621,10 +621,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             raise ValueError(f"rllm.distill.alpha must be in [0, 1], got {alpha}")
         if loss_variant == "non_full" and alpha != 1.0:
             raise ValueError("rllm.distill.alpha must be 1.0 when rllm.distill.loss_variant='non_full'.")
-        is_clip_raw = cfg.get("is_clip", None)
-        is_clip = None if is_clip_raw is None else float(is_clip_raw)
-        if is_clip is not None and is_clip <= 0:
-            raise ValueError(f"rllm.distill.is_clip must be positive when provided, got {is_clip}")
+        is_clip = bool(cfg.get("is_clip", False))
         full_logit_topk = int(cfg.get("full_logit_topk", 64))
         if full_logit_topk < 0:
             raise ValueError(
@@ -1172,9 +1169,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         batch.meta_info["distill_use_grpo_loss"] = bool(self.distill_settings.use_grpo_loss)
         batch.meta_info["distill_loss_variant"] = str(self.distill_settings.loss_variant)
         batch.meta_info["distill_alpha"] = float(self.distill_settings.alpha)
-        batch.meta_info["distill_is_clip"] = (
-            None if self.distill_settings.is_clip is None else float(self.distill_settings.is_clip)
-        )
+        batch.meta_info["distill_is_clip"] = bool(self.distill_settings.is_clip)
         batch.meta_info["distill_full_logit_topk"] = int(self.distill_settings.full_logit_topk)
         batch.meta_info["distill_full_logit_add_tail"] = bool(self.distill_settings.full_logit_add_tail)
         batch.meta_info["distill_negate_sdpo_loss"] = bool(self.distill_settings.negate_sdpo_loss)
