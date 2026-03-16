@@ -46,7 +46,7 @@ class DistillSettings:
     min_distill_tokens: int = 1
     loss_variant: str = "non_full"
     alpha: float = 1.0
-    is_clip: bool = False
+    is_clip: float | bool | None = None
     full_logit_topk: int = 64
     full_logit_add_tail: bool = True
     negate_sdpo_loss: bool = False
@@ -359,6 +359,50 @@ def build_hindsight_prompt_tokens_first_n_complete_attempts(
     return selected_context.long()
 
 
+def build_hindsight_prompt_tokens_latest_successful_complete_attempt(
+    step_records: Sequence[dict[str, Any]],
+) -> torch.Tensor | None:
+    """Construct hindsight context from only the latest successful attempt.
+
+    Args:
+        step_records: Step-level records from rollout engine.
+
+    Returns:
+        Tensor prompt tokens for the most recent successful completed attempt,
+        excluding tokens from earlier attempts. Returns ``None`` when records
+        are malformed or no completed successful attempt exists.
+    """
+    complete_attempts = collect_complete_attempt_summaries(step_records)
+    if not complete_attempts:
+        return None
+
+    selected_idx: int | None = None
+    for idx in range(len(complete_attempts) - 1, -1, -1):
+        if bool(complete_attempts[idx].success):
+            selected_idx = idx
+            break
+    if selected_idx is None:
+        return None
+
+    selected_context = complete_attempts[selected_idx].context_tokens.long()
+    if selected_idx == 0:
+        return selected_context
+
+    previous_context = complete_attempts[selected_idx - 1].context_tokens.long()
+    previous_len = int(previous_context.numel())
+    if previous_len <= 0:
+        return selected_context
+    if int(selected_context.numel()) <= previous_len:
+        return None
+    if not torch.equal(selected_context[:previous_len], previous_context):
+        return None
+
+    isolated_context = selected_context[previous_len:]
+    if int(isolated_context.numel()) <= 0:
+        return None
+    return isolated_context
+
+
 def extract_initial_messages_before_first_assistant(
     chat_completions: Any,
 ) -> list[dict[str, str]] | None:
@@ -480,23 +524,23 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         self._distill_chat_parser = parser
         return parser
 
-    def _build_student_prompt_without_system(
+    def _split_student_prompt_system_prefix(
         self,
         *,
         trajectory: dict[str, Any],
         student_prompt_tokens: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Return student prompt tokens with exact leading system-prefix removed.
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Split student prompt into exact system-prefix and remaining suffix.
 
         Args:
             trajectory: Token trajectory payload for one sample.
             student_prompt_tokens: Original prompt tokens used by student.
 
         Returns:
-            Prompt tokens with the exact leading system-token prefix removed
-            when that prefix can be reproduced reliably from rollout metadata.
-            Returns ``None`` when stripping is unavailable or unreliable;
-            callers should skip distillation for that sample.
+            Tuple ``(system_prefix_tokens, stripped_prompt_tokens)`` when the
+            leading system-token prefix can be reproduced reliably from rollout
+            metadata. Returns ``None`` when reconstruction is unavailable or
+            unreliable; callers should skip distillation for that sample.
         """
         initial_messages = extract_initial_messages_before_first_assistant(
             trajectory.get("chat_completions")
@@ -541,6 +585,33 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         stripped_prompt_tokens = student_prompt_tokens[system_prefix_len:]
         if int(stripped_prompt_tokens.numel()) <= 0:
             return None
+        return system_prefix_tokens, stripped_prompt_tokens
+
+    def _build_student_prompt_without_system(
+        self,
+        *,
+        trajectory: dict[str, Any],
+        student_prompt_tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Return student prompt tokens with exact leading system-prefix removed.
+
+        Args:
+            trajectory: Token trajectory payload for one sample.
+            student_prompt_tokens: Original prompt tokens used by student.
+
+        Returns:
+            Prompt tokens with the exact leading system-token prefix removed
+            when that prefix can be reproduced reliably from rollout metadata.
+            Returns ``None`` when stripping is unavailable or unreliable;
+            callers should skip distillation for that sample.
+        """
+        prompt_parts = self._split_student_prompt_system_prefix(
+            trajectory=trajectory,
+            student_prompt_tokens=student_prompt_tokens,
+        )
+        if prompt_parts is None:
+            return None
+        _, stripped_prompt_tokens = prompt_parts
         return stripped_prompt_tokens
 
     def _load_distill_settings(self) -> DistillSettings:
@@ -596,6 +667,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         ).lower()
         valid_trajectory_selection = {
             "first_attempt_hindsight",
+            "first_attempt_latest_success_hindsight",
             "selective_retry_success_n2",
         }
         if trajectory_selection not in valid_trajectory_selection:
@@ -621,7 +693,19 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             raise ValueError(f"rllm.distill.alpha must be in [0, 1], got {alpha}")
         if loss_variant == "non_full" and alpha != 1.0:
             raise ValueError("rllm.distill.alpha must be 1.0 when rllm.distill.loss_variant='non_full'.")
-        is_clip = bool(cfg.get("is_clip", False))
+        is_clip_raw = cfg.get("is_clip", None)
+        if is_clip_raw is None or is_clip_raw is False:
+            is_clip: float | bool | None = None
+        elif isinstance(is_clip_raw, str):
+            lowered = is_clip_raw.strip().lower()
+            if lowered in {"", "0", "false", "none", "null"}:
+                is_clip = None
+            elif lowered == "true":
+                is_clip = True
+            else:
+                is_clip = float(is_clip_raw)
+        else:
+            is_clip = is_clip_raw
         full_logit_topk = int(cfg.get("full_logit_topk", 64))
         if full_logit_topk < 0:
             raise ValueError(
@@ -776,9 +860,13 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         response_mask = batch.batch["response_mask"].float()
         trajectory_selection = self.distill_settings.trajectory_selection
+        uses_first_attempt_target = trajectory_selection in {
+            "first_attempt_hindsight",
+            "first_attempt_latest_success_hindsight",
+        }
         first_attempt_mask: torch.Tensor | None = None
         first_attempt_distill_mask: torch.Tensor | None = None
-        if trajectory_selection == "first_attempt_hindsight":
+        if uses_first_attempt_target:
             first_attempt_mask = batch.batch.get("first_attempt_response_mask")
             if first_attempt_mask is None:
                 return None, self._empty_distill_prep_metrics()
@@ -830,7 +918,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         for i in range(total_samples):
             if (
-                trajectory_selection == "first_attempt_hindsight"
+                uses_first_attempt_target
                 and first_attempt_distill_mask is not None
                 and float(first_attempt_distill_mask[i].sum().item()) <= 0
             ):
@@ -902,10 +990,17 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                     response_mask=prefix_response_mask,
                     distill_mask=prefix_distill_mask,
                 )
-                teacher_context_tokens = build_hindsight_prompt_tokens_first_n_complete_attempts(
-                    step_records=step_records,
-                    teacher_context_attempts=self.distill_settings.teacher_context_attempts,
-                )
+                if trajectory_selection == "first_attempt_latest_success_hindsight":
+                    teacher_context_tokens = (
+                        build_hindsight_prompt_tokens_latest_successful_complete_attempt(
+                            step_records=step_records,
+                        )
+                    )
+                else:
+                    teacher_context_tokens = build_hindsight_prompt_tokens_first_n_complete_attempts(
+                        step_records=step_records,
+                        teacher_context_attempts=self.distill_settings.teacher_context_attempts,
+                    )
             if selected_attempt is None:
                 skipped_hindsight_unavailable += 1
                 skipped_hindsight_selected_attempt_missing += 1
@@ -917,21 +1012,37 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
             prompt_attention_row = batch.batch["attention_mask"][i, :-original_response_len]
             student_prompt_tokens = batch.batch["prompts"][i][prompt_attention_row > 0].long()
-            if self.distill_settings.strip_system_from_teacher_prompt:
-                teacher_suffix = self._build_student_prompt_without_system(
+            teacher_system_prefix: torch.Tensor | None = None
+            if (
+                trajectory_selection == "first_attempt_latest_success_hindsight"
+                or self.distill_settings.strip_system_from_teacher_prompt
+            ):
+                prompt_parts = self._split_student_prompt_system_prefix(
                     trajectory=trajectory,
                     student_prompt_tokens=student_prompt_tokens,
                 )
-                if teacher_suffix is None:
+                if prompt_parts is None:
                     skipped_hindsight_unavailable += 1
                     skipped_hindsight_system_strip_unavailable += 1
                     continue
+                teacher_system_prefix, teacher_suffix = prompt_parts
             else:
                 teacher_suffix = student_prompt_tokens
-            teacher_prompt_tokens = torch.cat(
-                [teacher_context_tokens.long(), teacher_suffix.long()],
-                dim=0,
-            )
+            if trajectory_selection == "first_attempt_latest_success_hindsight":
+                assert teacher_system_prefix is not None
+                teacher_prompt_tokens = torch.cat(
+                    [
+                        teacher_system_prefix.long(),
+                        teacher_context_tokens.long(),
+                        teacher_suffix.long(),
+                    ],
+                    dim=0,
+                )
+            else:
+                teacher_prompt_tokens = torch.cat(
+                    [teacher_context_tokens.long(), teacher_suffix.long()],
+                    dim=0,
+                )
 
             denominator_prompt_len = int(teacher_prompt_tokens.numel())
             distill_response_len = int(selected_attempt.response_tokens.numel())
@@ -1007,7 +1118,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         kept_samples = int(selected_student.batch["responses"].shape[0])
         need_student_old = (
-            self.distill_settings.is_clip is not None
+            bool(self.distill_settings.is_clip)
             or self.distill_settings.use_stale_coefficient
         )
         need_teacher_old = self.distill_settings.use_stale_coefficient

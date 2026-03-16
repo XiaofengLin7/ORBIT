@@ -910,7 +910,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 select_keys.append("distill_student_response_mask")
             if "distill_teacher_response_mask" in data.batch:
                 select_keys.append("distill_teacher_response_mask")
-            if distill_params.is_clip is not None or distill_params.use_stale_coefficient:
+            if distill_params.is_clip or distill_params.use_stale_coefficient:
                 select_keys.append("distill_student_old_log_probs")
             if distill_params.use_stale_coefficient:
                 select_keys.append("distill_teacher_old_log_probs")
