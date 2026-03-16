@@ -26,6 +26,25 @@ class _InnerAlwaysDoneEnv:
         return
 
 
+class _InnerAlwaysFailedEnv:
+    def __init__(self) -> None:
+        self._reset_count = 0
+
+    def reset(self, seed: int | None = None, task: dict | None = None) -> tuple[str, dict[str, Any]]:
+        del seed, task
+        obs = f"init-{self._reset_count}"
+        self._reset_count += 1
+        return obs, {"inner_reset_count": self._reset_count}
+
+    def step(self, action: Any) -> tuple[str, float, bool, dict[str, Any]]:
+        del action
+        terminal_obs = f"terminal-{self._reset_count - 1}"
+        return terminal_obs, 0.0, True, {"terminated": True, "truncated": False}
+
+    def close(self) -> None:
+        return
+
+
 def test_boundary_metadata_non_reflection_combined_observation() -> None:
     env = MultiEpisodeEnv(
         inner_env_class=_InnerAlwaysDoneEnv,
@@ -41,7 +60,7 @@ def test_boundary_metadata_non_reflection_combined_observation() -> None:
         assert info0["boundary_next_initial_observation"] == ""
 
         obs1, reward1, done1, info1 = env.step("act")
-        expected_next_initial = "[Episode 2] New episode begins.\ninit-1"
+        expected_next_initial = "New episode begins.\ninit-1"
         assert reward1 == 1.0
         assert done1 is False
         assert obs1 == f"terminal-0\n\n{expected_next_initial}"
@@ -53,7 +72,7 @@ def test_boundary_metadata_non_reflection_combined_observation() -> None:
         env.close()
 
 
-def test_boundary_metadata_reflection_reset_step() -> None:
+def test_success_skips_reflection_when_enabled() -> None:
     env = MultiEpisodeEnv(
         inner_env_class=_InnerAlwaysDoneEnv,
         total_step_cap=3,
@@ -62,13 +81,37 @@ def test_boundary_metadata_reflection_reset_step() -> None:
     )
     try:
         env.reset(seed=1, task={"seed": 1})
-        _, reward1, done1, info1 = env.step("act")
+        obs1, reward1, done1, info1 = env.step("act")
+        expected_next_initial = "New episode begins.\ninit-1"
         assert reward1 == 1.0
         assert done1 is False
+        assert obs1 == f"terminal-0\n\n{expected_next_initial}"
+        assert env.reflection_prompt not in obs1
+        assert info1["boundary_transition"] is True
+        assert info1["boundary_has_combined_observation"] is True
+        assert info1["boundary_terminal_observation"] == "terminal-0"
+        assert info1["boundary_next_initial_observation"] == expected_next_initial
+    finally:
+        env.close()
+
+
+def test_boundary_metadata_reflection_reset_step() -> None:
+    env = MultiEpisodeEnv(
+        inner_env_class=_InnerAlwaysFailedEnv,
+        total_step_cap=3,
+        episode_header="New episode begins.",
+        enable_reflection=True,
+    )
+    try:
+        env.reset(seed=1, task={"seed": 1})
+        obs1, reward1, done1, info1 = env.step("act")
+        assert reward1 == 0.0
+        assert done1 is False
         assert info1["boundary_transition"] is False
+        assert env.reflection_prompt in obs1
 
         obs2, reward2, done2, info2 = env.step("reflection")
-        expected_next_initial = "[Episode 2] New episode begins.\ninit-1"
+        expected_next_initial = "New episode begins.\ninit-1"
         assert obs2 == expected_next_initial
         assert reward2 == 0.0
         assert done2 is False
@@ -80,9 +123,9 @@ def test_boundary_metadata_reflection_reset_step() -> None:
         env.close()
 
 
-def test_reflection_is_required_even_when_step_cap_is_hit() -> None:
+def test_reflection_is_required_even_when_failed_episode_hits_step_cap() -> None:
     env = MultiEpisodeEnv(
-        inner_env_class=_InnerAlwaysDoneEnv,
+        inner_env_class=_InnerAlwaysFailedEnv,
         total_step_cap=1,
         episode_header="New episode begins.",
         enable_reflection=True,
@@ -90,10 +133,9 @@ def test_reflection_is_required_even_when_step_cap_is_hit() -> None:
     try:
         env.reset(seed=1, task={"seed": 1})
 
-        # This step reaches step cap and ends the inner episode, but should still
-        # ask for one final reflection turn.
+        # Failed episode at step cap still requests one final reflection turn.
         obs1, reward1, done1, info1 = env.step("act")
-        assert reward1 == 1.0
+        assert reward1 == 0.0
         assert done1 is False
         assert info1["episode_done"] is True
         assert env.reflection_prompt in obs1
@@ -111,11 +153,32 @@ def test_reflection_is_required_even_when_step_cap_is_hit() -> None:
         env.close()
 
 
+def test_success_at_step_cap_finishes_without_reflection_when_enabled() -> None:
+    env = MultiEpisodeEnv(
+        inner_env_class=_InnerAlwaysDoneEnv,
+        total_step_cap=1,
+        episode_header="New episode begins.",
+        enable_reflection=True,
+    )
+    try:
+        env.reset(seed=1, task={"seed": 1})
+
+        obs1, reward1, done1, info1 = env.step("act")
+        assert reward1 == 1.0
+        assert done1 is True
+        assert info1["episode_done"] is True
+        assert env.reflection_prompt not in obs1
+        assert "metrics" in info1
+        assert info1["metrics"]["episode/total_steps"] == 1
+    finally:
+        env.close()
+
+
 def test_from_dict_applies_custom_reflection_prompt() -> None:
     custom_reflection_prompt = "[Reflection2] custom prompt"
     env = MultiEpisodeEnv.from_dict(
         {
-            "inner_env_class": _InnerAlwaysDoneEnv,
+            "inner_env_class": _InnerAlwaysFailedEnv,
             "total_step_cap": 3,
             "episode_header": "New episode begins.",
             "enable_reflection": True,
@@ -125,7 +188,7 @@ def test_from_dict_applies_custom_reflection_prompt() -> None:
     try:
         env.reset(seed=1, task={"seed": 1})
         obs, reward, done, info = env.step("act")
-        assert reward == 1.0
+        assert reward == 0.0
         assert done is False
         assert info["episode_done"] is True
         assert custom_reflection_prompt in obs

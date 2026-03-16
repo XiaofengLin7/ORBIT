@@ -52,7 +52,7 @@ class MultiEpisodeEnv(BaseEnv):
             total_step_cap: Maximum number of steps across all episodes.
             success_reward: Reward assigned when an episode succeeds.
             episode_header: Text prepended to observations at episode start.
-            enable_reflection: Whether to prompt for reflection after each episode.
+            enable_reflection: Whether to prompt for reflection after unsuccessful episodes.
             reflection_prompt: The prompt to use for reflection.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
@@ -254,9 +254,10 @@ class MultiEpisodeEnv(BaseEnv):
             self._episode_successes.append(success)
             self._episode_lengths.append(self._episode_step)
 
-            # If reflection is enabled, always require one reflection action.
-            # At step cap, trajectory completion is deferred until that action.
-            if self.enable_reflection:
+            # If reflection is enabled, require one reflection action only
+            # after unsuccessful episodes. At step cap, trajectory completion
+            # is deferred until that action.
+            if self.enable_reflection and not success:
                 self._waiting_for_reflection = True
                 self._pending_outer_done_after_reflection = bool(outer_done)
                 if isinstance(observation, str):
@@ -560,7 +561,7 @@ class MultiEpisodeEnv(BaseEnv):
                 return self.inner_env.reset()
 
     def _format_observation(self, observation: Any, episode_index: int) -> Any:
-        """Prepend episode marker to observation.
+        """Prepend the configured episode header text to an observation.
 
         Args:
             observation: Raw observation from inner environment.
@@ -569,9 +570,10 @@ class MultiEpisodeEnv(BaseEnv):
         Returns:
             Observation with episode header prepended.
         """
-        header = f"[Episode {episode_index + 1}] {self.episode_header}".strip()
+        del episode_index
+        header = str(self.episode_header).strip()
         if isinstance(observation, str):
-            return f"{header}\n{observation}"
+            return f"{header}\n{observation}" if header else observation
         return observation
 
     @staticmethod
