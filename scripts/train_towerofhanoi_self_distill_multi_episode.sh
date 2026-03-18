@@ -65,8 +65,8 @@ if [ "$DISTILL_MODE" != "sdpo_self" ] && [ "$DISTILL_MODE" != "sdpo_pure" ]; the
     exit 1
 fi
 
-if [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_hindsight" ]     && [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_latest_success_hindsight" ]     && [ "$DISTILL_TRAJECTORY_SELECTION" != "selective_retry_success_n2" ]; then
-    echo "Error: DISTILL_TRAJECTORY_SELECTION must be one of: first_attempt_hindsight, first_attempt_latest_success_hindsight, selective_retry_success_n2"
+if [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_hindsight" ]     && [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_latest_success_hindsight" ]     && [ "$DISTILL_TRAJECTORY_SELECTION" != "first_attempt_latest_success_hindsight_first_failure_only" ]     && [ "$DISTILL_TRAJECTORY_SELECTION" != "selective_retry_success_n2" ]; then
+    echo "Error: DISTILL_TRAJECTORY_SELECTION must be one of: first_attempt_hindsight, first_attempt_latest_success_hindsight, first_attempt_latest_success_hindsight_first_failure_only, selective_retry_success_n2"
     exit 1
 fi
 

@@ -277,6 +277,15 @@ def test_load_distill_settings_trajectory_selection_validates_modes() -> None:
     settings = trainer._load_distill_settings()
     assert settings.trajectory_selection == "first_attempt_latest_success_hindsight"
 
+    trainer.config = _make_settings_config(
+        {
+            "trajectory_selection": "first_attempt_latest_success_hindsight_first_failure_only",
+            "teacher_context_attempts": 7,
+        }
+    )
+    settings = trainer._load_distill_settings()
+    assert settings.trajectory_selection == "first_attempt_latest_success_hindsight_first_failure_only"
+
     trainer.config = _make_settings_config({"trajectory_selection": "bad_selection"})
     try:
         trainer._load_distill_settings()
@@ -1460,6 +1469,110 @@ def test_prepare_distill_payload_first_attempt_latest_success_hindsight_uses_lat
     assert payload.kept_indices.tolist() == [0]
 
 
+def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_failure_only_uses_latest_success_context() -> None:
+    class _PromptTokenizer:
+        pad_token_id = 0
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            mapping = {
+                "system:s0": [99],
+                "user:u0<assistant>": [1, 2, 3],
+            }
+            return list(mapping.get(text, []))
+
+    class _PromptParser:
+        assistant_token = "<assistant>"
+
+        def parse(
+            self,
+            messages: list[dict[str, str]],
+            add_generation_prompt: bool = False,
+            is_first_msg: bool = False,
+        ) -> str:
+            del is_first_msg
+            text = "".join(
+                (
+                    f"{message['role']}:{message.get('content', '')}"
+                    if message["role"] != "assistant"
+                    else f"{self.assistant_token}{message.get('content', '')}"
+                )
+                for message in messages
+            )
+            if add_generation_prompt:
+                text = f"{text}{self.assistant_token}"
+            return text
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _PromptTokenizer()
+    trainer.agent_execution_engine = SimpleNamespace(chat_parser=_PromptParser())
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.teacher_context_attempts = 9
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer._latest_token_trajectories = [
+        {
+            "chat_completions": [
+                {"role": "system", "content": "s0"},
+                {"role": "user", "content": "u0"},
+                {"role": "assistant", "content": "a0"},
+            ],
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": False,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": True,
+                },
+                {
+                    "episode_index": 2,
+                    "prompt_ids": [1, 2, 10, 20, 30, 11, 21, 40],
+                    "completion_ids": [12],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": False,
+                    "episode_done": True,
+                },
+            ],
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is not None
+    assert metrics["distill/skipped_selective_gate"] == 0.0
+    assert metrics["distill/skipped_attempt_incomplete"] == 0.0
+    assert payload.student_batch.batch["responses"][0].tolist() == [55, 90, 56]
+    assert payload.teacher_batch.batch["prompts"][0].tolist() == [99, 30, 11, 21, 1, 2, 3]
+    assert payload.teacher_batch.batch["responses"][0].tolist() == [55, 90, 56]
+    assert payload.distill_mask[0].tolist() == [1.0, 0.0, 1.0]
+
+
 def test_prepare_distill_payload_first_attempt_latest_success_hindsight_without_success_skips_sample() -> None:
     trainer = _build_trainer_for_unit_tests()
     trainer.distill_settings.context_limit = 100000
@@ -1508,6 +1621,147 @@ def test_prepare_distill_payload_first_attempt_latest_success_hindsight_without_
     assert metrics["distill/skipped_hindsight_unavailable"] == 1.0
     assert metrics["distill/skipped_hindsight_teacher_context_unavailable"] == 1.0
     assert metrics["distill/skipped_hindsight_system_strip_unavailable"] == 0.0
+
+
+def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_failure_only_gate_skips_first_attempt_success() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer._latest_token_trajectories = [
+        {
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": True,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": True,
+                    "episode_done": True,
+                },
+            ]
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is None
+    assert metrics["distill/skipped_selective_gate"] == 1.0
+    assert metrics["distill/skipped_attempt_incomplete"] == 0.0
+
+
+def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_failure_only_gate_skips_without_later_success() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer._latest_token_trajectories = [
+        {
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": False,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": False,
+                    "episode_done": True,
+                },
+            ]
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is None
+    assert metrics["distill/skipped_selective_gate"] == 1.0
+    assert metrics["distill/skipped_attempt_incomplete"] == 0.0
+
+
+def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_failure_only_missing_first_attempt_summary_skips_sample() -> None:
+    trainer = _build_trainer_for_unit_tests()
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer._latest_token_trajectories = [
+        {
+            "step_records": [
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": True,
+                    "episode_done": True,
+                },
+            ]
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is None
+    assert metrics["distill/skipped_selective_gate"] == 0.0
+    assert metrics["distill/skipped_attempt_incomplete"] == 1.0
 
 
 def test_prepare_distill_payload_first_attempt_latest_success_hindsight_mismatched_system_prefix_skips_sample() -> None:
@@ -2709,6 +2963,100 @@ def test_prepare_distill_payload_reflection_frozenlake_n2_den_num_sanity() -> No
     # c_N should start from the first attempt's initial prompt+response history.
     first_turn_prefix = list(step_records[0]["prompt_ids"]) + list(step_records[0]["completion_ids"])
     assert hindsight_context[: len(first_turn_prefix)].tolist() == first_turn_prefix
+
+
+def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_failure_only_computes_student_old_log_probs_for_clip() -> None:
+    class _PromptTokenizer:
+        pad_token_id = 0
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            mapping = {
+                "system:s0": [99],
+                "user:u0<assistant>": [1, 2, 3],
+            }
+            return list(mapping.get(text, []))
+
+    class _PromptParser:
+        assistant_token = "<assistant>"
+
+        def parse(
+            self,
+            messages: list[dict[str, str]],
+            add_generation_prompt: bool = False,
+            is_first_msg: bool = False,
+        ) -> str:
+            del is_first_msg
+            text = "".join(
+                (
+                    f"{message['role']}:{message.get('content', '')}"
+                    if message["role"] != "assistant"
+                    else f"{self.assistant_token}{message.get('content', '')}"
+                )
+                for message in messages
+            )
+            if add_generation_prompt:
+                text = f"{text}{self.assistant_token}"
+            return text
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _PromptTokenizer()
+    trainer.agent_execution_engine = SimpleNamespace(chat_parser=_PromptParser())
+    trainer.actor_rollout_wg = _FakeActorRolloutWG()
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer.distill_settings.is_clip = 2.0
+    trainer._latest_token_trajectories = [
+        {
+            "chat_completions": [
+                {"role": "system", "content": "s0"},
+                {"role": "user", "content": "u0"},
+                {"role": "assistant", "content": "a0"},
+            ],
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": False,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": True,
+                    "episode_done": True,
+                },
+            ],
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is not None
+    assert metrics["distill/skipped_selective_gate"] == 0.0
+    assert metrics["distill/skipped_attempt_incomplete"] == 0.0
+    assert payload.kept_samples == 1
+    assert payload.student_old_log_probs is not None
 
 
 def test_selective_retry_success_n2_rollout_consistent_with_and_without_reflection() -> None:

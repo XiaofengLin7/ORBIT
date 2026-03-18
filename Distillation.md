@@ -77,7 +77,11 @@ Semantics:
 - `lambda`: scalar weight for SDPO term. In direct-loss mode, scales the SDPO loss added to the actor objective. In advantage-bonus mode, scales the bonus added to PPO advantages.
 - `mode`: `sdpo_self` (self-distillation, shared-weight model acts as both student and teacher) or `sdpo_pure` (separate teacher model).
 - `denominator_mode`: currently `teacher_adapted_feedback`.
-- `trajectory_selection`: how to select which trajectory tokens to distill. Currently `first_attempt_hindsight` (distill first-attempt tokens with hindsight context from complete attempts).
+- `trajectory_selection`: how to select which trajectory tokens to distill.
+  - `first_attempt_hindsight`: distill first-attempt tokens with hindsight context from complete attempts.
+  - `first_attempt_latest_success_hindsight`: distill first-attempt tokens with teacher context set to the isolated latest successful attempt.
+  - `first_attempt_latest_success_hindsight_first_failure_only`: same as `first_attempt_latest_success_hindsight`, but only when the first completed attempt failed.
+  - `selective_retry_success_n2`: distill retry-success trajectories for the 2-attempt selective gate.
 - `teacher_context_attempts`:
   - integer `N`: require at least `N` complete attempts and use the first `N`.
   - `null`: use last available complete-attempt context.
@@ -122,6 +126,7 @@ Denominator context construction is unchanged from earlier logic:
 - reconstruct complete attempts from `step_records` using episode transitions + boundary metadata.
 - build denominator prompt as `concat(hindsight_context_tokens, student_prompt_tokens)`.
 - denominator response is the first-attempt prefix response sequence.
+- for `first_attempt_latest_success_hindsight_first_failure_only`, samples are further gated to those with a failed first completed attempt and at least one later completed successful attempt; the teacher context remains the isolated latest successful attempt only.
 
 Context overflow guard:
 - `L_den = len(denominator_prompt_tokens) + len(first_attempt_prefix_tokens)`

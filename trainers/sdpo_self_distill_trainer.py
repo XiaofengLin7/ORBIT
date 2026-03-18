@@ -668,6 +668,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         valid_trajectory_selection = {
             "first_attempt_hindsight",
             "first_attempt_latest_success_hindsight",
+            "first_attempt_latest_success_hindsight_first_failure_only",
             "selective_retry_success_n2",
         }
         if trajectory_selection not in valid_trajectory_selection:
@@ -860,9 +861,14 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
 
         response_mask = batch.batch["response_mask"].float()
         trajectory_selection = self.distill_settings.trajectory_selection
+        latest_success_hindsight_modes = {
+            "first_attempt_latest_success_hindsight",
+            "first_attempt_latest_success_hindsight_first_failure_only",
+        }
         uses_first_attempt_target = trajectory_selection in {
             "first_attempt_hindsight",
             "first_attempt_latest_success_hindsight",
+            "first_attempt_latest_success_hindsight_first_failure_only",
         }
         first_attempt_mask: torch.Tensor | None = None
         first_attempt_distill_mask: torch.Tensor | None = None
@@ -973,6 +979,29 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                     skipped_hindsight_unavailable += 1
                     skipped_hindsight_missing_first_attempt_mask += 1
                     continue
+                if trajectory_selection == "first_attempt_latest_success_hindsight_first_failure_only":
+                    complete_attempts = collect_complete_attempt_summaries(step_records)
+                    if complete_attempts is None:
+                        skipped_hindsight_unavailable += 1
+                        skipped_hindsight_complete_attempts_unavailable += 1
+                        continue
+                    first_attempt_summary = get_attempt_summary(
+                        complete_attempts,
+                        episode_index=0,
+                    )
+                    if first_attempt_summary is None:
+                        skipped_attempt_incomplete += 1
+                        continue
+                    if first_attempt_summary.success:
+                        skipped_selective_gate += 1
+                        continue
+                    has_later_success = any(
+                        int(attempt.episode_index) > 0 and bool(attempt.success)
+                        for attempt in complete_attempts
+                    )
+                    if not has_later_success:
+                        skipped_selective_gate += 1
+                        continue
                 first_attempt_prefix = extract_first_attempt_prefix(
                     response_tokens=batch.batch["responses"][i],
                     response_mask=response_mask[i],
@@ -990,7 +1019,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                     response_mask=prefix_response_mask,
                     distill_mask=prefix_distill_mask,
                 )
-                if trajectory_selection == "first_attempt_latest_success_hindsight":
+                if trajectory_selection in latest_success_hindsight_modes:
                     teacher_context_tokens = (
                         build_hindsight_prompt_tokens_latest_successful_complete_attempt(
                             step_records=step_records,
@@ -1014,7 +1043,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             student_prompt_tokens = batch.batch["prompts"][i][prompt_attention_row > 0].long()
             teacher_system_prefix: torch.Tensor | None = None
             if (
-                trajectory_selection == "first_attempt_latest_success_hindsight"
+                trajectory_selection in latest_success_hindsight_modes
                 or self.distill_settings.strip_system_from_teacher_prompt
             ):
                 prompt_parts = self._split_student_prompt_system_prefix(
@@ -1028,7 +1057,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 teacher_system_prefix, teacher_suffix = prompt_parts
             else:
                 teacher_suffix = student_prompt_tokens
-            if trajectory_selection == "first_attempt_latest_success_hindsight":
+            if trajectory_selection in latest_success_hindsight_modes:
                 assert teacher_system_prefix is not None
                 teacher_prompt_tokens = torch.cat(
                     [
