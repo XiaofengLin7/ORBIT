@@ -6,6 +6,7 @@ import sys
 from types import SimpleNamespace
 import types
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -21,7 +22,72 @@ if "polars" not in sys.modules:
 elif getattr(sys.modules["polars"], "__spec__", None) is None:
     sys.modules["polars"].__spec__ = importlib.machinery.ModuleSpec("polars", loader=None)
 
-from trainers.sdpo_actor import SDPODistillParams, SDPODataParallelPPOActor, _compute_sdpo_per_token_loss, _segmented_reverse_cumsum
+from trainers.sdpo_actor import (
+    SDPODistillParams,
+    SDPODataParallelPPOActor,
+    _compute_sdpo_per_token_loss,
+    _count_active_distill_sequences,
+    _segmented_reverse_cumsum,
+)
+
+
+class _FakeActorDataProto:
+    def __init__(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        meta_info: dict[str, object] | None = None,
+        non_tensor_batch: dict[str, object] | None = None,
+    ) -> None:
+        self.batch = batch
+        self.meta_info = {} if meta_info is None else dict(meta_info)
+        self.non_tensor_batch = {} if non_tensor_batch is None else dict(non_tensor_batch)
+
+    def select(
+        self,
+        *,
+        batch_keys: list[str],
+        non_tensor_batch_keys: list[str],
+    ) -> "_FakeActorDataProto":
+        selected_batch = {key: self.batch[key] for key in batch_keys if key in self.batch}
+        selected_non_tensor = {
+            key: self.non_tensor_batch[key] for key in non_tensor_batch_keys if key in self.non_tensor_batch
+        }
+        return _FakeActorDataProto(
+            selected_batch,
+            meta_info=self.meta_info,
+            non_tensor_batch=selected_non_tensor,
+        )
+
+    def split(self, batch_size: int) -> list["_FakeActorDataProto"]:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        total = next(iter(self.batch.values())).shape[0]
+        out: list[_FakeActorDataProto] = []
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            out.append(
+                _FakeActorDataProto(
+                    {key: value[start:end] for key, value in self.batch.items()},
+                    meta_info=self.meta_info,
+                    non_tensor_batch=self.non_tensor_batch,
+                )
+            )
+        return out
+
+    def to(self, device: object) -> "_FakeActorDataProto":
+        del device
+        return self
+
+
+class _DummyTrainModule:
+    def train(self) -> None:
+        return None
+
+
+class _DummyOptimizer:
+    def zero_grad(self) -> None:
+        return None
 
 
 def _make_distill_params(**overrides: object) -> SDPODistillParams:
@@ -493,6 +559,10 @@ def test_compute_sdpo_loss_non_full_uses_cumulative_advantage() -> None:
 
     assert torch.allclose(sdpo_loss, expected_loss, atol=1e-6), f"{sdpo_loss} != {expected_loss}"
     assert metrics["distill/token_count"] == float(distill_mask.sum().item())
+    masked_adv = adv[distill_mask > 0]
+    assert metrics["distill/active_seq_count"] == 1.0
+    assert abs(metrics["distill/sdpo_adv_abs_mean"] - float(masked_adv.abs().mean().item())) < 1e-6
+    assert abs(metrics["distill/sdpo_adv_abs_max"] - float(masked_adv.abs().max().item())) < 1e-6
 
 
 def test_compute_sdpo_loss_ignores_loss_agg_mode_arg() -> None:
@@ -544,21 +614,32 @@ def test_compute_sdpo_loss_ignores_loss_agg_mode_arg() -> None:
         assert abs(v - vals[0]) < 1e-6, f"Losses differ across agg modes: {results}"
 
 
+def test_count_active_distill_sequences_counts_only_nonempty_rows() -> None:
+    distill_mask = torch.tensor(
+        [
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
+    assert _count_active_distill_sequences(distill_mask) == 2
+
+
 # ---------------------------------------------------------------------------
 # PPO-style clipping tests
 # ---------------------------------------------------------------------------
 
-def _build_clip_actor_and_inputs(
-    student_lp_vals: list[float],
-    teacher_lp_vals: list[float],
-    old_lp_vals: list[float],
-    mask_vals: list[float],
+def _build_indexed_non_full_actor_and_inputs(
+    *,
+    student_lp_rows: list[list[float]],
+    teacher_lp_rows: list[list[float]],
+    old_lp_rows: list[list[float]] | None,
+    mask_rows: list[list[float]],
     clip_ratio_low: float = 0.2,
     clip_ratio_high: float = 0.2,
-    loss_variant: str = "non_full",
     requires_grad: bool = True,
-):
-    """Helper: construct a minimal actor + model_inputs for clip tests."""
+) -> tuple[SDPODataParallelPPOActor, dict[str, torch.Tensor], torch.Tensor]:
+    """Construct a non-full actor whose fake forward pass is row-index stable."""
     actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
     actor_mod = object()
     teacher_mod = object()
@@ -572,35 +653,67 @@ def _build_clip_actor_and_inputs(
         clip_ratio_high=clip_ratio_high,
     )
 
-    student_lp = torch.tensor([student_lp_vals], requires_grad=requires_grad)
-    teacher_lp = torch.tensor([teacher_lp_vals])
-    old_lp = torch.tensor([old_lp_vals])
-    distill_mask = torch.tensor([mask_vals])
+    student_lp = torch.tensor(student_lp_rows, dtype=torch.float32, requires_grad=requires_grad)
+    teacher_lp = torch.tensor(teacher_lp_rows, dtype=torch.float32)
+    distill_mask = torch.tensor(mask_rows, dtype=torch.float32)
+    old_lp = None if old_lp_rows is None else torch.tensor(old_lp_rows, dtype=torch.float32)
 
-    def fake_forward(model_inputs, *, temperature, module):
-        del model_inputs, temperature
-        if module is actor_mod:
-            return student_lp
-        return teacher_lp
-
-    actor._forward_with_module_log_probs = fake_forward
-
-    n_resp = len(student_lp_vals)
+    batch_size, n_resp = student_lp.shape
     n_prompt = 2
-    student_input_ids = torch.tensor([list(range(n_prompt)) + list(range(100, 100 + n_resp))], dtype=torch.long)
-    teacher_input_ids = torch.tensor([list(range(200, 200 + n_prompt)) + list(range(100, 100 + n_resp))], dtype=torch.long)
+    row_ids = torch.arange(batch_size, dtype=torch.long)
+    row_markers = (1000 + row_ids).unsqueeze(1)
+    second_prompt = (2000 + row_ids).unsqueeze(1)
+    shared_responses = torch.arange(100, 100 + n_resp, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+    student_input_ids = torch.cat([row_markers, second_prompt, shared_responses], dim=1)
+    teacher_input_ids = torch.cat([row_markers, second_prompt + 1000, shared_responses], dim=1)
+    full_attention = torch.ones(batch_size, n_prompt + n_resp, dtype=torch.long)
+    full_positions = torch.arange(n_prompt + n_resp, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+
+    def fake_forward(model_inputs, *, temperature, module):  # noqa: ANN202
+        del temperature
+        row_idx = (model_inputs["input_ids"][:, 0] - 1000).long()
+        if module is actor_mod:
+            return student_lp.index_select(0, row_idx)
+        return teacher_lp.index_select(0, row_idx)
+
+    actor._forward_with_module_log_probs = fake_forward  # type: ignore[method-assign]
+
     model_inputs = {
         "distill_mask": distill_mask,
-        "distill_student_responses": torch.tensor([list(range(100, 100 + n_resp))], dtype=torch.long),
+        "distill_student_responses": shared_responses.clone(),
         "distill_student_input_ids": student_input_ids,
-        "distill_student_attention_mask": torch.ones(1, n_prompt + n_resp, dtype=torch.long),
-        "distill_student_position_ids": torch.arange(n_prompt + n_resp).unsqueeze(0),
-        "distill_teacher_responses": torch.tensor([list(range(100, 100 + n_resp))], dtype=torch.long),
+        "distill_student_attention_mask": full_attention.clone(),
+        "distill_student_position_ids": full_positions.clone(),
+        "distill_teacher_responses": shared_responses.clone(),
         "distill_teacher_input_ids": teacher_input_ids,
-        "distill_teacher_attention_mask": torch.ones(1, n_prompt + n_resp, dtype=torch.long),
-        "distill_teacher_position_ids": torch.arange(n_prompt + n_resp).unsqueeze(0),
-        "distill_student_old_log_probs": old_lp,
+        "distill_teacher_attention_mask": full_attention.clone(),
+        "distill_teacher_position_ids": full_positions.clone(),
     }
+    if old_lp is not None:
+        model_inputs["distill_student_old_log_probs"] = old_lp
+    return actor, model_inputs, student_lp
+
+
+def _build_clip_actor_and_inputs(
+    student_lp_vals: list[float],
+    teacher_lp_vals: list[float],
+    old_lp_vals: list[float],
+    mask_vals: list[float],
+    clip_ratio_low: float = 0.2,
+    clip_ratio_high: float = 0.2,
+    loss_variant: str = "non_full",
+    requires_grad: bool = True,
+):
+    """Helper: construct a minimal actor + model_inputs for clip tests."""
+    actor, model_inputs, student_lp = _build_indexed_non_full_actor_and_inputs(
+        student_lp_rows=[student_lp_vals],
+        teacher_lp_rows=[teacher_lp_vals],
+        old_lp_rows=[old_lp_vals],
+        mask_rows=[mask_vals],
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+        requires_grad=requires_grad,
+    )
     params = _make_distill_params(
         loss_variant=loss_variant,
         alpha=1.0,
@@ -608,6 +721,61 @@ def _build_clip_actor_and_inputs(
         teacher_regularization="ema",
     )
     return actor, model_inputs, params, student_lp
+
+
+def _slice_model_inputs_rows(model_inputs: dict[str, torch.Tensor], rows: list[int]) -> dict[str, torch.Tensor]:
+    """Slice a model-input dict across the batch dimension."""
+    row_index = torch.tensor(rows, dtype=torch.long)
+    return {key: value.index_select(0, row_index) for key, value in model_inputs.items()}
+
+
+def _compute_partitioned_sdpo_loss(
+    actor: SDPODataParallelPPOActor,
+    model_inputs: dict[str, torch.Tensor],
+    distill_params: SDPODistillParams,
+    partitions: list[list[int]],
+) -> torch.Tensor:
+    """Compute the scaled SDPO contribution by summing across micro-batch partitions."""
+    total_active_sequences = _count_active_distill_sequences(model_inputs["distill_mask"])
+    if total_active_sequences <= 0:
+        raise ValueError("Expected at least one active distill sequence in partition test.")
+
+    total_loss: torch.Tensor | None = None
+    for rows in partitions:
+        micro_inputs = _slice_model_inputs_rows(model_inputs, rows)
+        micro_loss, micro_metrics = actor._compute_sdpo_loss(
+            model_inputs=micro_inputs,
+            temperature=1.0,
+            loss_agg_mode="seq-mean-token-mean",
+            distill_params=distill_params,
+        )
+        micro_scale = micro_metrics["distill/active_seq_count"] / float(total_active_sequences)
+        contribution = micro_loss * micro_scale
+        total_loss = contribution if total_loss is None else total_loss + contribution
+
+    if total_loss is None:
+        raise ValueError("Expected at least one partition contribution.")
+    return total_loss
+
+
+def _expected_clipped_non_full_loss(
+    *,
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    student_old_log_probs: torch.Tensor,
+    distill_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+) -> torch.Tensor:
+    """Compute the expected clipped non-full loss for test assertions."""
+    delta = (student_log_probs - teacher_log_probs).detach()
+    advantage = _segmented_reverse_cumsum(delta, distill_mask)
+    per_token_loss = advantage * student_log_probs
+    ratio = torch.exp(torch.clamp(student_log_probs - student_old_log_probs, min=-20.0, max=20.0))
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    clipped_per_token_loss = torch.maximum(per_token_loss * ratio, per_token_loss * clipped_ratio)
+    seq_mean = (clipped_per_token_loss * distill_mask).sum(dim=1) / distill_mask.sum(dim=1).clamp(min=1.0)
+    return seq_mean.mean()
 
 
 def test_sdpo_ppo_clip_stops_gradient_when_ratio_exceeds_bounds() -> None:
@@ -755,3 +923,320 @@ def test_sdpo_ppo_clip_handles_mixed_sign_per_token_loss() -> None:
     sdpo_loss.backward()
     assert student_lp.grad is not None
     assert not torch.allclose(student_lp.grad, torch.zeros_like(student_lp.grad))
+
+
+@pytest.mark.parametrize(
+    ("clip_ratio_low", "clip_ratio_high", "student_rows", "teacher_rows", "old_rows", "mask_rows"),
+    [
+        (
+            0.0,
+            0.2,
+            [[-0.5]],
+            [[-0.3]],
+            [[-0.5 - torch.log(torch.tensor(0.9)).item()]],
+            [[1.0]],
+        ),
+        (
+            0.2,
+            0.0,
+            [[-0.5]],
+            [[-1.0]],
+            [[-0.5 - torch.log(torch.tensor(1.1)).item()]],
+            [[1.0]],
+        ),
+        (
+            0.0,
+            0.0,
+            [[-0.5], [-0.5]],
+            [[-0.3], [-1.0]],
+            [
+                [-0.5 - torch.log(torch.tensor(0.9)).item()],
+                [-0.5 - torch.log(torch.tensor(1.1)).item()],
+            ],
+            [[1.0], [1.0]],
+        ),
+    ],
+)
+def test_sdpo_clip_honors_explicit_zero_bounds(
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    student_rows: list[list[float]],
+    teacher_rows: list[list[float]],
+    old_rows: list[list[float]],
+    mask_rows: list[list[float]],
+) -> None:
+    actor, model_inputs, _ = _build_indexed_non_full_actor_and_inputs(
+        student_lp_rows=student_rows,
+        teacher_lp_rows=teacher_rows,
+        old_lp_rows=old_rows,
+        mask_rows=mask_rows,
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+        requires_grad=False,
+    )
+    params = _make_distill_params(
+        loss_variant="non_full",
+        alpha=1.0,
+        is_clip=True,
+        teacher_regularization="ema",
+    )
+
+    sdpo_loss, _ = actor._compute_sdpo_loss(
+        model_inputs=model_inputs,
+        temperature=1.0,
+        loss_agg_mode="seq-mean-token-mean",
+        distill_params=params,
+    )
+
+    expected_loss = _expected_clipped_non_full_loss(
+        student_log_probs=torch.tensor(student_rows, dtype=torch.float32),
+        teacher_log_probs=torch.tensor(teacher_rows, dtype=torch.float32),
+        student_old_log_probs=torch.tensor(old_rows, dtype=torch.float32),
+        distill_mask=torch.tensor(mask_rows, dtype=torch.float32),
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+    )
+    assert torch.allclose(sdpo_loss.detach(), expected_loss, atol=1e-6)
+
+
+def test_sdpo_clip_metrics_distinguish_branch_selection_from_ratio_overflow() -> None:
+    ratio = 1.3
+    old_rows = [[-0.5 - torch.log(torch.tensor(ratio)).item()]] * 2
+    actor, model_inputs, _ = _build_indexed_non_full_actor_and_inputs(
+        student_lp_rows=[[-0.5], [-0.5]],
+        teacher_lp_rows=[[-0.3], [-1.0]],
+        old_lp_rows=old_rows,
+        mask_rows=[[1.0], [1.0]],
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        requires_grad=False,
+    )
+    params = _make_distill_params(
+        loss_variant="non_full",
+        alpha=1.0,
+        is_clip=True,
+        teacher_regularization="ema",
+    )
+
+    _, metrics = actor._compute_sdpo_loss(
+        model_inputs=model_inputs,
+        temperature=1.0,
+        loss_agg_mode="seq-mean-token-mean",
+        distill_params=params,
+    )
+
+    assert abs(metrics["distill/sdpo_ratio_gt_clip_frac"] - 1.0) < 1e-6
+    assert abs(metrics["distill/sdpo_clipfrac"] - 0.5) < 1e-6
+
+
+def test_sdpo_truncation_updates_token_count_and_clip_metrics() -> None:
+    actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
+    actor_mod = object()
+    teacher_mod = object()
+    actor.actor_module = actor_mod
+    actor.teacher_module = teacher_mod
+    actor.use_fused_kernels = False
+    actor.use_ulysses_sp = False
+    actor.config = SimpleNamespace(
+        clip_ratio=0.2,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+    )
+
+    student_lp = torch.tensor([[-0.1, -0.5]], dtype=torch.float32, requires_grad=True)
+    teacher_lp = torch.tensor([[-0.3, -0.6]], dtype=torch.float32)
+
+    def fake_forward(model_inputs, *, temperature, module):  # noqa: ANN202
+        del model_inputs, temperature
+        if module is actor_mod:
+            return student_lp
+        return teacher_lp
+
+    actor._forward_with_module_log_probs = fake_forward  # type: ignore[method-assign]
+
+    model_inputs = {
+        "distill_mask": torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32),
+        "distill_student_responses": torch.tensor([[11, 12, 13]], dtype=torch.long),
+        "distill_student_input_ids": torch.tensor([[101, 102, 11, 12, 13]], dtype=torch.long),
+        "distill_student_attention_mask": torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long),
+        "distill_student_position_ids": torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long),
+        "distill_teacher_responses": torch.tensor([[11, 12, 13]], dtype=torch.long),
+        "distill_teacher_input_ids": torch.tensor([[201, 202, 11, 12, 13]], dtype=torch.long),
+        "distill_teacher_attention_mask": torch.tensor([[1, 1, 1, 1, 1]], dtype=torch.long),
+        "distill_teacher_position_ids": torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long),
+        "distill_student_old_log_probs": torch.tensor([[-2.0, -0.5, -0.9]], dtype=torch.float32),
+    }
+    params = _make_distill_params(
+        loss_variant="non_full",
+        alpha=1.0,
+        is_clip=True,
+        teacher_regularization="ema",
+    )
+
+    _, metrics = actor._compute_sdpo_loss(
+        model_inputs=model_inputs,
+        temperature=1.0,
+        loss_agg_mode="seq-mean-token-mean",
+        distill_params=params,
+    )
+
+    assert metrics["distill/token_count"] == 2.0
+    assert abs(metrics["distill/sdpo_clipfrac"] - 0.5) < 1e-6
+    assert abs(metrics["distill/sdpo_ratio_gt_clip_frac"] - 0.5) < 1e-6
+
+
+@pytest.mark.parametrize("active_rows", ([6], [2, 7], list(range(8))))
+def test_sdpo_partition_invariance_matches_full_batch(active_rows: list[int]) -> None:
+    student_rows: list[list[float]] = []
+    teacher_rows: list[list[float]] = []
+    old_rows: list[list[float]] = []
+    mask_rows: list[list[float]] = []
+    for row in range(8):
+        student_row = [-0.2 - 0.05 * row, -0.35 - 0.05 * row, -0.5 - 0.05 * row]
+        teacher_row = [value - 0.15 for value in student_row]
+        student_rows.append(student_row)
+        teacher_rows.append(teacher_row)
+        old_rows.append(student_row[:])
+        mask_rows.append([1.0, 1.0, 1.0] if row in active_rows else [0.0, 0.0, 0.0])
+
+    actor, model_inputs, student_lp = _build_indexed_non_full_actor_and_inputs(
+        student_lp_rows=student_rows,
+        teacher_lp_rows=teacher_rows,
+        old_lp_rows=old_rows,
+        mask_rows=mask_rows,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+    )
+    params = _make_distill_params(
+        loss_variant="non_full",
+        alpha=1.0,
+        is_clip=True,
+        teacher_regularization="ema",
+    )
+    partitions = [[0, 1, 2], [3, 4, 5], [6, 7]]
+
+    full_loss, _ = actor._compute_sdpo_loss(
+        model_inputs=model_inputs,
+        temperature=1.0,
+        loss_agg_mode="seq-mean-token-mean",
+        distill_params=params,
+    )
+    full_loss.backward()
+    full_grad = student_lp.grad.clone()
+    student_lp.grad = None
+
+    partitioned_loss = _compute_partitioned_sdpo_loss(
+        actor=actor,
+        model_inputs=model_inputs,
+        distill_params=params,
+        partitions=partitions,
+    )
+    partitioned_loss.backward()
+    partitioned_grad = student_lp.grad.clone()
+
+    assert torch.allclose(full_loss.detach(), partitioned_loss.detach(), atol=1e-6)
+    assert torch.allclose(full_grad, partitioned_grad, atol=1e-6)
+
+
+def test_update_policy_emits_sdpo_debug_metrics() -> None:
+    actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
+    actor.actor_module = _DummyTrainModule()
+    actor.actor_optimizer = _DummyOptimizer()
+    actor.teacher_module = object()
+    actor.scaler = None
+    actor.use_fused_kernels = False
+    actor.use_ulysses_sp = False
+    actor.config = SimpleNamespace(
+        use_kl_loss=False,
+        use_dynamic_bsz=False,
+        ppo_mini_batch_size=2,
+        ppo_micro_batch_size_per_gpu=1,
+        ppo_epochs=1,
+        entropy_coeff=0.0,
+        loss_agg_mode="seq-mean-token-mean",
+    )
+
+    def fake_forward_micro_batch(model_inputs, *, temperature, calculate_entropy):  # noqa: ANN202
+        del model_inputs, temperature, calculate_entropy
+        log_prob = torch.zeros((1, 2), dtype=torch.float32, requires_grad=True)
+        entropy = torch.zeros((1, 2), dtype=torch.float32)
+        return entropy, log_prob
+
+    def fake_compute_pg_loss(  # noqa: ANN202
+        *,
+        use_grpo_loss: bool,
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        loss_agg_mode: str,
+        rollout_is_weights: torch.Tensor | None,
+    ):
+        del use_grpo_loss, old_log_prob, advantages, response_mask, loss_agg_mode, rollout_is_weights
+        return log_prob.sum() * 0.0, {}
+
+    def fake_compute_sdpo_loss(  # noqa: ANN202
+        *,
+        model_inputs: dict[str, torch.Tensor],
+        temperature: float,
+        loss_agg_mode: str,
+        distill_params: SDPODistillParams,
+    ):
+        del model_inputs, temperature, loss_agg_mode, distill_params
+        return torch.tensor(3.0, dtype=torch.float32), {
+            "distill/sdpo_loss": 3.0,
+            "distill/token_count": 2.0,
+            "distill/sdpo_clipfrac": 0.25,
+            "distill/sdpo_ratio_gt_clip_frac": 0.5,
+            "distill/sdpo_adv_abs_mean": 1.5,
+            "distill/sdpo_adv_abs_max": 2.5,
+            "distill/active_seq_count": 1.0,
+        }
+
+    actor._forward_micro_batch = fake_forward_micro_batch  # type: ignore[method-assign]
+    actor._compute_pg_loss = fake_compute_pg_loss  # type: ignore[method-assign]
+    actor._compute_sdpo_loss = fake_compute_sdpo_loss  # type: ignore[method-assign]
+    actor._optimizer_step = lambda: torch.tensor(0.0)  # type: ignore[method-assign]
+
+    batch = {
+        "responses": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        "response_mask": torch.ones(2, 2, dtype=torch.float32),
+        "input_ids": torch.tensor([[10, 11, 1, 2], [20, 21, 3, 4]], dtype=torch.long),
+        "attention_mask": torch.ones(2, 4, dtype=torch.long),
+        "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long),
+        "old_log_probs": torch.zeros(2, 2, dtype=torch.float32),
+        "advantages": torch.zeros(2, 2, dtype=torch.float32),
+        "distill_student_input_ids": torch.tensor([[10, 11, 1, 2], [20, 21, 3, 4]], dtype=torch.long),
+        "distill_student_attention_mask": torch.ones(2, 4, dtype=torch.long),
+        "distill_student_position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long),
+        "distill_student_responses": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        "distill_teacher_input_ids": torch.tensor([[30, 31, 1, 2], [40, 41, 3, 4]], dtype=torch.long),
+        "distill_teacher_attention_mask": torch.ones(2, 4, dtype=torch.long),
+        "distill_teacher_position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long),
+        "distill_teacher_responses": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        "distill_mask": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+        "distill_student_old_log_probs": torch.zeros(2, 2, dtype=torch.float32),
+    }
+    data = _FakeActorDataProto(
+        batch,
+        meta_info={
+            "temperature": 1.0,
+            "distill_enabled": True,
+            "distill_lambda": 2.0,
+            "distill_loss_variant": "non_full",
+            "distill_alpha": 1.0,
+            "distill_is_clip": True,
+            "distill_use_grpo_loss": False,
+            "distill_teacher_regularization": "ema",
+        },
+    )
+
+    metrics = actor.update_policy(data)
+
+    assert metrics["distill/sdpo_clipfrac"] == [0.25, 0.25]
+    assert metrics["distill/sdpo_ratio_gt_clip_frac"] == [0.5, 0.5]
+    assert metrics["distill/sdpo_adv_abs_mean"] == [1.5, 1.5]
+    assert metrics["distill/sdpo_adv_abs_max"] == [2.5, 2.5]
+    assert metrics["distill/active_seq_count"] == [1.0, 1.0]
+    assert metrics["distill/active_seq_frac"] == [1.0, 1.0]
+    assert metrics["distill/sdpo_loss_scaled"] == [3.0, 3.0]

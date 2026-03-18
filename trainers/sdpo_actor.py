@@ -169,6 +169,31 @@ def _segmented_reverse_cumsum(values: torch.Tensor, mask: torch.Tensor) -> torch
     return segmented.flip(1)
 
 
+def _count_active_distill_sequences(distill_mask: torch.Tensor) -> int:
+    """Count sequences with at least one distill-valid token."""
+    if distill_mask.ndim != 2:
+        raise ValueError(f"distill_mask must have shape [B, T], got shape {tuple(distill_mask.shape)}")
+    return int((distill_mask.sum(dim=-1) > 0).sum().item())
+
+
+def _zero_sdpo_metrics() -> dict[str, float]:
+    """Return zero-valued SDPO metrics for empty micro-batches."""
+    return {
+        "distill/sdpo_loss": 0.0,
+        "distill/token_count": 0.0,
+        "distill/sdpo_clipfrac": 0.0,
+        "distill/sdpo_ratio_gt_clip_frac": 0.0,
+        "distill/sdpo_adv_abs_mean": 0.0,
+        "distill/sdpo_adv_abs_max": 0.0,
+        "distill/active_seq_count": 0.0,
+    }
+
+
+def _resolve_clip_ratio_bound(config_value: float | None, default: float) -> float:
+    """Resolve a clip bound while preserving explicit 0.0 overrides."""
+    return default if config_value is None else float(config_value)
+
+
 class SDPODataParallelPPOActor(DataParallelPPOActor):
     """PPO actor wrapper with additional SDPO loss term support."""
 
@@ -641,7 +666,6 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         distill_mask = model_inputs["distill_mask"].float()
         if distill_mask.ndim != 2:
             raise ValueError(f"distill_mask must have shape [B, T], got shape {tuple(distill_mask.shape)}")
-        token_count = float(distill_mask.sum().item())
         student_inputs = self._build_distill_model_inputs(
             model_inputs,
             prefix="distill_student",
@@ -770,7 +794,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             raise ValueError("student_log_probs must be computed for SDPO loss.")
         if distill_len <= 0:
             zero = student_log_probs.sum() * 0.0
-            return zero, {"distill/sdpo_loss": 0.0, "distill/token_count": 0.0}
+            return zero, _zero_sdpo_metrics()
 
         student_log_probs = student_log_probs[:, :distill_len]
         distill_mask = distill_mask[:, :distill_len].to(
@@ -790,6 +814,12 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             student_topk_log_probs_used = student_topk_log_probs_used[:, :distill_len]
         if teacher_topk_log_probs_used is not None:
             teacher_topk_log_probs_used = teacher_topk_log_probs_used[:, :distill_len]
+
+        token_count = float(distill_mask.sum().item())
+        active_seq_count = float(_count_active_distill_sequences(distill_mask))
+        sdpo_adv_abs_mean = 0.0
+        sdpo_adv_abs_max = 0.0
+        advantage: torch.Tensor | None = None
 
         if stale_student_log_probs is not None and stale_teacher_log_probs is not None:
             # Stale-coefficient path: coefficient from pre-computed old log-probs,
@@ -822,10 +852,15 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 full_logit_topk=distill_params.full_logit_topk,
                 full_logit_add_tail=distill_params.full_logit_add_tail,
             )
+        if advantage is not None and token_count > 0:
+            masked_advantage = advantage[distill_mask > 0]
+            sdpo_adv_abs_mean = float(masked_advantage.abs().mean().item())
+            sdpo_adv_abs_max = float(masked_advantage.abs().max().item())
         if distill_params.negate_sdpo_loss:
             per_token_loss = -per_token_loss
 
         sdpo_clipfrac = 0.0
+        sdpo_ratio_gt_clip_frac = 0.0
         if distill_params.is_clip:
             student_old_log_prob = model_inputs.get("distill_student_old_log_probs")
             if student_old_log_prob is None:
@@ -839,20 +874,24 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             negative_approx_kl = (student_log_probs - student_old_log_prob).detach()
             negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
             ratio = torch.exp(negative_approx_kl)
-            clip_low = getattr(self.config, "clip_ratio_low", None) or self.config.clip_ratio
-            clip_high = getattr(self.config, "clip_ratio_high", None) or self.config.clip_ratio
+            clip_low = _resolve_clip_ratio_bound(getattr(self.config, "clip_ratio_low", None), self.config.clip_ratio)
+            clip_high = _resolve_clip_ratio_bound(getattr(self.config, "clip_ratio_high", None), self.config.clip_ratio)
             clipped_ratio = torch.clamp(ratio, 1.0 - clip_low, 1.0 + clip_high)
             sdpo_unclipped = per_token_loss * ratio
             sdpo_clipped = per_token_loss * clipped_ratio
             per_token_loss = torch.maximum(sdpo_unclipped, sdpo_clipped)
             if token_count > 0:
+                ratio_outside_clip = ((ratio < (1.0 - clip_low)) | (ratio > (1.0 + clip_high))).to(distill_mask.dtype)
+                sdpo_ratio_gt_clip_frac = float((ratio_outside_clip * distill_mask).sum().item() / token_count)
+                # This metric tracks how often the pessimistic clipped branch is selected.
+                # It is intentionally distinct from ratio-out-of-bounds frequency.
                 sdpo_clipfrac = float(((sdpo_clipped > sdpo_unclipped) * distill_mask).sum() / token_count)
 
         if token_count <= 0:
             # Keep graph/collective structure aligned across ranks even when this
             # rank has no distill-valid tokens in the micro-batch.
             zero_sdpo_loss = per_token_loss.sum() * 0.0
-            return zero_sdpo_loss, {"distill/sdpo_loss": 0.0, "distill/token_count": 0.0}
+            return zero_sdpo_loss, _zero_sdpo_metrics()
 
         sdpo_loss = agg_loss(
             loss_mat=per_token_loss,
@@ -860,9 +899,15 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             loss_agg_mode="seq-mean-token-mean",
         )
         return sdpo_loss, {
+            # This is the reduced, unscaled SDPO monitoring loss for the
+            # current micro-batch before lambda or active-sequence scaling.
             "distill/sdpo_loss": float(sdpo_loss.detach().item()),
             "distill/token_count": token_count,
             "distill/sdpo_clipfrac": sdpo_clipfrac,
+            "distill/sdpo_ratio_gt_clip_frac": sdpo_ratio_gt_clip_frac,
+            "distill/sdpo_adv_abs_mean": sdpo_adv_abs_mean,
+            "distill/sdpo_adv_abs_max": sdpo_adv_abs_max,
+            "distill/active_seq_count": active_seq_count,
         }
 
     def update_policy(self, data: DataProto) -> dict[str, list[float]]:
@@ -931,6 +976,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         metrics: dict[str, list[float]] = {}
         for _ in range(self.config.ppo_epochs):
             for mini_batch in mini_batches:
+                mini_batch_distill_seq_count = 0
+                if use_distill:
+                    mini_batch_distill_seq_count = _count_active_distill_sequences(mini_batch.batch["distill_mask"])
+
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -954,6 +1003,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
+                    sdpo_loss_scale_factor = 0.0
+                    if use_distill and mini_batch_distill_seq_count > 0:
+                        sdpo_loss_scale_factor = (
+                            _count_active_distill_sequences(model_inputs["distill_mask"]) / mini_batch_distill_seq_count
+                        )
 
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs,
@@ -980,6 +1034,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     micro_batch_metrics: dict[str, float] = dict(pg_metrics)
                     micro_batch_metrics["distill/use_grpo_loss"] = 1.0 if distill_params.use_grpo_loss else 0.0
                     policy_loss = pg_loss
+                    loss = policy_loss * loss_scale_factor
+                    active_seq_count = 0.0
+                    active_seq_frac = 0.0
+                    sdpo_loss_scaled = 0.0
 
                     if use_distill:
                         sdpo_loss, sdpo_metrics = self._compute_sdpo_loss(
@@ -988,26 +1046,45 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                             loss_agg_mode=loss_agg_mode,
                             distill_params=distill_params,
                         )
-                        policy_loss = policy_loss + distill_params.lambda_coef * sdpo_loss
-                        micro_batch_metrics["distill/sdpo_loss"] = sdpo_metrics["distill/sdpo_loss"] * loss_scale_factor
+                        active_seq_count = sdpo_metrics["distill/active_seq_count"]
+                        active_seq_frac = active_seq_count / max(float(response_mask.shape[0]), 1.0)
+                        sdpo_loss_scaled = (
+                            distill_params.lambda_coef * sdpo_metrics["distill/sdpo_loss"] * sdpo_loss_scale_factor
+                        )
+                        loss = loss + distill_params.lambda_coef * sdpo_loss * sdpo_loss_scale_factor
+                        # distill/sdpo_loss remains a reduced monitoring scalar.
+                        # distill/sdpo_loss_scaled mirrors the exact optimizer term.
+                        micro_batch_metrics["distill/sdpo_loss"] = sdpo_metrics["distill/sdpo_loss"] * sdpo_loss_scale_factor
                         micro_batch_metrics["distill/token_count"] = sdpo_metrics["distill/token_count"]
+                        micro_batch_metrics["distill/sdpo_clipfrac"] = sdpo_metrics["distill/sdpo_clipfrac"]
+                        micro_batch_metrics["distill/sdpo_ratio_gt_clip_frac"] = (
+                            sdpo_metrics["distill/sdpo_ratio_gt_clip_frac"]
+                        )
+                        micro_batch_metrics["distill/sdpo_adv_abs_mean"] = sdpo_metrics["distill/sdpo_adv_abs_mean"]
+                        micro_batch_metrics["distill/sdpo_adv_abs_max"] = sdpo_metrics["distill/sdpo_adv_abs_max"]
                     else:
                         micro_batch_metrics["distill/sdpo_loss"] = 0.0
                         micro_batch_metrics["distill/token_count"] = 0.0
+                        micro_batch_metrics["distill/sdpo_clipfrac"] = 0.0
+                        micro_batch_metrics["distill/sdpo_ratio_gt_clip_frac"] = 0.0
+                        micro_batch_metrics["distill/sdpo_adv_abs_mean"] = 0.0
+                        micro_batch_metrics["distill/sdpo_adv_abs_max"] = 0.0
+
+                    micro_batch_metrics["distill/active_seq_count"] = active_seq_count
+                    micro_batch_metrics["distill/active_seq_frac"] = active_seq_frac
+                    micro_batch_metrics["distill/sdpo_loss_scaled"] = sdpo_loss_scaled
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        policy_loss = policy_loss - entropy_loss * entropy_coeff
+                        loss = loss - entropy_loss * entropy_coeff * loss_scale_factor
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        loss = loss + kl_loss * self.config.kl_loss_coef * loss_scale_factor
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = float(self.config.kl_loss_coef)
-
-                    loss = policy_loss * loss_scale_factor
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -1023,4 +1100,10 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         return metrics
 
 
-__all__ = ["SDPODataParallelPPOActor", "SDPODistillParams", "_compute_sdpo_per_token_loss", "_segmented_reverse_cumsum"]
+__all__ = [
+    "SDPODataParallelPPOActor",
+    "SDPODistillParams",
+    "_compute_sdpo_per_token_loss",
+    "_count_active_distill_sequences",
+    "_segmented_reverse_cumsum",
+]
