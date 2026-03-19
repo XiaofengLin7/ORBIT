@@ -222,6 +222,37 @@ def test_parse_distill_params_accepts_full_logit_topk_zero() -> None:
     assert params.full_logit_topk == 0
 
 
+def test_parse_distill_params_rejects_full_logit_with_clip() -> None:
+    actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
+    try:
+        actor._parse_distill_params(
+            {"distill_loss_variant": "full_logit", "distill_is_clip": True}
+        )
+    except ValueError as exc:
+        assert "distill_is_clip" in str(exc)
+        assert "full_logit" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for full_logit + distill_is_clip")
+
+
+def test_parse_distill_params_rejects_full_logit_with_stale_coefficient() -> None:
+    actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
+    try:
+        actor._parse_distill_params(
+            {
+                "distill_loss_variant": "full_logit",
+                "distill_use_stale_coefficient": True,
+            }
+        )
+    except ValueError as exc:
+        assert "distill_use_stale_coefficient" in str(exc)
+        assert "full_logit" in str(exc)
+    else:
+        raise AssertionError(
+            "Expected ValueError for full_logit + distill_use_stale_coefficient"
+        )
+
+
 def test_row_chunked_logsumexp_matches_torch() -> None:
     actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
     logits = torch.tensor(
@@ -443,6 +474,39 @@ def test_compute_sdpo_loss_requires_distill_student_old_log_probs_for_clip() -> 
         assert "distill_student_old_log_probs" in str(exc)
     else:
         raise AssertionError("Expected ValueError when distill_student_old_log_probs is missing")
+
+
+def test_compute_sdpo_loss_rejects_full_logit_clip_guard() -> None:
+    actor = SDPODataParallelPPOActor.__new__(SDPODataParallelPPOActor)
+    actor.actor_module = object()
+    actor.teacher_module = object()
+    actor.use_fused_kernels = False
+    actor.use_ulysses_sp = False
+
+    model_inputs = {
+        "distill_mask": torch.tensor([[1.0]], dtype=torch.float32),
+        "distill_student_responses": torch.tensor([[11]], dtype=torch.long),
+        "distill_student_input_ids": torch.tensor([[101, 11]], dtype=torch.long),
+        "distill_student_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "distill_student_position_ids": torch.tensor([[0, 1]], dtype=torch.long),
+        "distill_teacher_responses": torch.tensor([[11]], dtype=torch.long),
+        "distill_teacher_input_ids": torch.tensor([[201, 11]], dtype=torch.long),
+        "distill_teacher_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "distill_teacher_position_ids": torch.tensor([[0, 1]], dtype=torch.long),
+    }
+
+    try:
+        actor._compute_sdpo_loss(
+            model_inputs=model_inputs,
+            temperature=1.0,
+            loss_agg_mode="seq-mean-token-mean",
+            distill_params=_make_distill_params(is_clip=True),
+        )
+    except ValueError as exc:
+        assert "is_clip" in str(exc)
+        assert "full_logit" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for full_logit + is_clip in compute path")
 
 
 # ---------------------------------------------------------------------------

@@ -198,7 +198,6 @@ def test_load_distill_settings_sdpo_loss_controls() -> None:
         {
             "loss_variant": "full_logit",
             "alpha": 0.25,
-            "is_clip": 2.0,
             "full_logit_topk": 32,
             "full_logit_add_tail": False,
         }
@@ -206,13 +205,18 @@ def test_load_distill_settings_sdpo_loss_controls() -> None:
     settings = trainer._load_distill_settings()
     assert settings.loss_variant == "full_logit"
     assert abs(settings.alpha - 0.25) < 1e-9
-    assert settings.is_clip == 2.0
+    assert settings.is_clip is False
     assert settings.full_logit_topk == 32
     assert settings.full_logit_add_tail is False
     assert settings.negate_sdpo_loss is False
     assert settings.lambda_coef == 1.0
     assert settings.mode == "sdpo_self"
     assert settings.use_grpo_loss is True
+
+    trainer.config = _make_settings_config({"loss_variant": "non_full", "is_clip": True})
+    settings = trainer._load_distill_settings()
+    assert settings.loss_variant == "non_full"
+    assert settings.is_clip is True
 
     trainer.config = _make_settings_config({"loss_variant": "non_full", "alpha": 0.5})
     try:
@@ -228,6 +232,57 @@ def test_load_distill_settings_negate_sdpo_loss() -> None:
     trainer.config = _make_settings_config({"negate_sdpo_loss": True})
     settings = trainer._load_distill_settings()
     assert settings.negate_sdpo_loss is True
+
+
+def test_load_distill_settings_rejects_numeric_is_clip() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config({"is_clip": 2.0})
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "is_clip" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for numeric is_clip")
+
+
+def test_load_distill_settings_rejects_full_logit_with_is_clip() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config({"loss_variant": "full_logit", "is_clip": True})
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "is_clip" in str(exc)
+        assert "full_logit" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for full_logit + is_clip")
+
+
+def test_load_distill_settings_rejects_full_logit_with_use_stale_coefficient() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {"loss_variant": "full_logit", "use_stale_coefficient": True}
+    )
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "use_stale_coefficient" in str(exc)
+        assert "non_full" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for full_logit + use_stale_coefficient")
+
+
+def test_load_distill_settings_rejects_full_logit_with_merge_to_advantages() -> None:
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {"loss_variant": "full_logit", "merge_to_advantages": True}
+    )
+    try:
+        trainer._load_distill_settings()
+    except ValueError as exc:
+        assert "merge_to_advantages" in str(exc)
+        assert "non_full" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for full_logit + merge_to_advantages")
 
 
 def test_load_distill_settings_allows_full_logit_topk_zero() -> None:
@@ -2204,7 +2259,7 @@ def test_prepare_distill_payload_selective_retry_success_n2_computes_student_old
     trainer.distill_settings.context_limit = 100000
     trainer.distill_settings.teacher_context_attempts = 1
     trainer.distill_settings.trajectory_selection = "selective_retry_success_n2"
-    trainer.distill_settings.is_clip = 2.0
+    trainer.distill_settings.is_clip = True
     trainer._latest_token_trajectories = [
         {
             "chat_completions": [
@@ -2322,7 +2377,7 @@ def test_prepare_distill_payload_clip_pads_compact_batch_to_world_size() -> None
     trainer.distill_settings.context_limit = 100000
     trainer.distill_settings.teacher_context_attempts = 1
     trainer.distill_settings.trajectory_selection = "selective_retry_success_n2"
-    trainer.distill_settings.is_clip = 2.0
+    trainer.distill_settings.is_clip = True
     trainer._latest_token_trajectories = [
         {
             "chat_completions": [
@@ -3007,7 +3062,7 @@ def test_prepare_distill_payload_first_attempt_latest_success_hindsight_first_fa
     trainer.distill_settings.trajectory_selection = (
         "first_attempt_latest_success_hindsight_first_failure_only"
     )
-    trainer.distill_settings.is_clip = 2.0
+    trainer.distill_settings.is_clip = True
     trainer._latest_token_trajectories = [
         {
             "chat_completions": [

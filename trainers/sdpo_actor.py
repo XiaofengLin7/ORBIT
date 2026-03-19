@@ -227,6 +227,16 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         full_logit_topk = int(meta_info.get("distill_full_logit_topk", 64))
         if full_logit_topk < 0:
             raise ValueError(f"distill_full_logit_topk must be non-negative, got {full_logit_topk}")
+        use_stale_coefficient = bool(meta_info.get("distill_use_stale_coefficient", False))
+        if loss_variant == "full_logit" and is_clip:
+            raise ValueError(
+                "distill_is_clip is not supported when distill_loss_variant='full_logit'."
+            )
+        if loss_variant == "full_logit" and use_stale_coefficient:
+            raise ValueError(
+                "distill_use_stale_coefficient is not supported when "
+                "distill_loss_variant='full_logit'."
+            )
 
         teacher_regularization = str(meta_info.get("distill_teacher_regularization", "none")).lower()
         if teacher_regularization not in {"none", "ema", "every_n_steps"}:
@@ -245,7 +255,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             full_logit_topk=full_logit_topk,
             full_logit_add_tail=bool(meta_info.get("distill_full_logit_add_tail", True)),
             negate_sdpo_loss=bool(meta_info.get("distill_negate_sdpo_loss", False)),
-            use_stale_coefficient=bool(meta_info.get("distill_use_stale_coefficient", False)),
+            use_stale_coefficient=use_stale_coefficient,
             teacher_regularization=teacher_regularization,
         )
 
@@ -663,6 +673,16 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         distill_params: SDPODistillParams,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute SDPO loss term and related metrics for a micro-batch."""
+        if distill_params.loss_variant == "full_logit" and distill_params.is_clip:
+            raise ValueError(
+                "distill_params.is_clip is not supported when "
+                "distill_params.loss_variant='full_logit'."
+            )
+        if distill_params.loss_variant == "full_logit" and distill_params.use_stale_coefficient:
+            raise ValueError(
+                "distill_params.use_stale_coefficient is not supported when "
+                "distill_params.loss_variant='full_logit'."
+            )
         distill_mask = model_inputs["distill_mask"].float()
         if distill_mask.ndim != 2:
             raise ValueError(f"distill_mask must have shape [B, T], got shape {tuple(distill_mask.shape)}")

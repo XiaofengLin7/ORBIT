@@ -46,7 +46,7 @@ class DistillSettings:
     min_distill_tokens: int = 1
     loss_variant: str = "non_full"
     alpha: float = 1.0
-    is_clip: float | bool | None = None
+    is_clip: bool = False
     full_logit_topk: int = 64
     full_logit_add_tail: bool = True
     negate_sdpo_loss: bool = False
@@ -694,25 +694,49 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             raise ValueError(f"rllm.distill.alpha must be in [0, 1], got {alpha}")
         if loss_variant == "non_full" and alpha != 1.0:
             raise ValueError("rllm.distill.alpha must be 1.0 when rllm.distill.loss_variant='non_full'.")
-        is_clip_raw = cfg.get("is_clip", None)
-        if is_clip_raw is None or is_clip_raw is False:
-            is_clip: float | bool | None = None
+        is_clip_raw = cfg.get("is_clip", False)
+        if is_clip_raw is None:
+            is_clip = False
+        elif isinstance(is_clip_raw, bool):
+            is_clip = is_clip_raw
         elif isinstance(is_clip_raw, str):
             lowered = is_clip_raw.strip().lower()
             if lowered in {"", "0", "false", "none", "null"}:
-                is_clip = None
-            elif lowered == "true":
+                is_clip = False
+            elif lowered in {"1", "true"}:
                 is_clip = True
             else:
-                is_clip = float(is_clip_raw)
+                raise ValueError(
+                    "rllm.distill.is_clip must be a boolean or boolean-like string, "
+                    f"got {is_clip_raw!r}"
+                )
         else:
-            is_clip = is_clip_raw
+            raise ValueError(
+                "rllm.distill.is_clip must be a boolean or boolean-like string, "
+                f"got value {is_clip_raw!r} of type {type(is_clip_raw).__name__}"
+            )
         full_logit_topk = int(cfg.get("full_logit_topk", 64))
         if full_logit_topk < 0:
             raise ValueError(
                 f"rllm.distill.full_logit_topk must be a non-negative integer, got {full_logit_topk}"
             )
         merge_to_advantages = bool(cfg.get("merge_to_advantages", False))
+        use_stale_coefficient = bool(cfg.get("use_stale_coefficient", False))
+        if merge_to_advantages and loss_variant != "non_full":
+            raise ValueError(
+                "rllm.distill.merge_to_advantages requires "
+                "rllm.distill.loss_variant='non_full'."
+            )
+        if use_stale_coefficient and loss_variant != "non_full":
+            raise ValueError(
+                "rllm.distill.use_stale_coefficient requires "
+                "rllm.distill.loss_variant='non_full'."
+            )
+        if is_clip and loss_variant == "full_logit":
+            raise ValueError(
+                "rllm.distill.is_clip is not supported when "
+                "rllm.distill.loss_variant='full_logit'."
+            )
         return DistillSettings(
             enable=bool(cfg.get("enable", False)),
             lambda_coef=float(cfg.get("lambda", 1.0)),
@@ -728,7 +752,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             full_logit_topk=full_logit_topk,
             full_logit_add_tail=bool(cfg.get("full_logit_add_tail", True)),
             negate_sdpo_loss=bool(cfg.get("negate_sdpo_loss", False)),
-            use_stale_coefficient=bool(cfg.get("use_stale_coefficient", False)),
+            use_stale_coefficient=use_stale_coefficient,
             strip_system_from_teacher_prompt=bool(cfg.get("strip_system_from_teacher_prompt", True)),
             teacher_context_attempts=teacher_context_attempts,
             trajectory_selection=trajectory_selection,
