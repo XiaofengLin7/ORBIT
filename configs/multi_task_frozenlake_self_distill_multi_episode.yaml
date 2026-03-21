@@ -30,5 +30,5 @@ val_tasks:
     total_step_cap: 20
     size: 5
     p: 0.70
-    is_slippery: true
+    is_slippery: false
     test_size: 256
