@@ -149,12 +149,21 @@ Actor wrapper computes PPO and SDPO in the same optimizer step.
 
 #### SDPO branch: `non_full`
 
-Per-token:
-- `per_token = (student_logp - teacher_logp).detach() * student_logp`
+Uses a cumulative future log-ratio advantage (REINFORCE-style):
 
-If `negate_sdpo_loss=true`: `per_token = -per_token`.
+```
+delta[t] = (student_logp[t] - teacher_logp[t]).detach()
+advantage[t] = sum_{t'=t}^{end_of_segment} delta[t']     # reverse cumsum within mask segments
+per_token[t] = advantage[t] * student_logp[t]
+```
 
-This matches the non-full branch in `../SDPO`.
+The reverse cumsum (`_segmented_reverse_cumsum`) operates within contiguous segments of `distill_mask`, so each segment (e.g., separate first-attempt spans) gets its own independent cumulative advantage. `advantage[t]` represents the total future log-ratio sum from position `t` to the end of its segment.
+
+If `use_stale_coefficient=true`, the delta uses pre-computed old log-probs (`stale_s - stale_t`) instead of fresh student/teacher log-probs, with gradient flowing only through the fresh `student_logp` multiplier.
+
+This is the REINFORCE estimator for the gradient of the reverse KL $\text{KL}(\text{student} \| \text{teacher})$ (see `.codex/method.md`). Minimizing this loss pulls the student toward the teacher.
+
+If `negate_sdpo_loss=true`: `per_token = -per_token` (flips gradient direction to push student away from teacher).
 
 #### SDPO branch: `full_logit`
 
@@ -319,3 +328,75 @@ Run:
 conda activate icx
 pytest -q tests/test_sdpo_self_distill.py tests/test_agent_execution_engine_distill.py tests/test_sdpo_actor_loss.py
 ```
+
+## Trajectory Selection Strategies
+
+The `rllm.distill.trajectory_selection` config key controls **which samples are eligible for distillation** and **how the teacher's denominator context is constructed**. All strategies operate per-sample inside `_prepare_distill_batch`. Four strategies are currently implemented:
+
+### 1. `first_attempt_hindsight` (default)
+
+**What is distilled:** First-attempt model tokens (episode 0 response tokens).
+
+**Teacher context:** First-N complete attempts, concatenated in chronological order. Controlled by `teacher_context_attempts`:
+- `null` → use all transition-confirmed complete attempts (context from the last completed attempt, which is cumulative).
+- integer `N` → require at least N complete attempts and use the first N (i.e., cumulative context through attempt N).
+
+**Gating:** None — every sample with valid first-attempt tokens and sufficient hindsight is kept.
+
+**Denominator prompt:** `cat(system_prompt (optional), hindsight_context_tokens, user_prompt_tokens)`, where hindsight context is the accumulated token sequence through the selected complete attempts.
+
+**Intuition:** The teacher sees how the trajectory played out over N attempts, then re-scores the student's first-attempt tokens with that hindsight. This is the broadest strategy — it distills every trajectory that has at least one episode boundary.
+
+### 2. `first_attempt_latest_success_hindsight`
+
+**What is distilled:** First-attempt model tokens (same as above).
+
+**Teacher context:** The **isolated** latest successful complete attempt only — not cumulative context. The isolation is computed by subtracting the previous attempt's cumulative context prefix, yielding only the tokens from the selected successful episode.
+
+**Gating:** The trajectory must contain at least one completed successful attempt. If no successful attempt exists, the sample is skipped (`skipped_hindsight_teacher_context_unavailable`).
+
+**Denominator prompt:** `cat(system_prompt (optional), isolated_success_attempt_tokens, user_prompt_tokens)`. The system prompt is stripped from the student prompt and optionally re-prepended separately.
+
+**Intuition:** Rather than showing the teacher the entire trajectory history, show it only the best (latest) successful attempt. This gives a cleaner teaching signal — the teacher scores first-attempt tokens conditioned on "here is exactly what a successful attempt looks like" without noise from intermediate failed attempts.
+
+### 3. `first_attempt_latest_success_hindsight_first_failure_only`
+
+**What is distilled:** First-attempt model tokens, but only for trajectories where the first completed attempt **failed**.
+
+**Teacher context:** Same as `first_attempt_latest_success_hindsight` — the isolated latest successful attempt.
+
+**Gating (two conditions, both required):**
+1. The first completed attempt (episode 0) must have **failed** (`success=False`). If it succeeded, the sample is skipped (`skipped_selective_gate`).
+2. At least one later completed attempt (episode index > 0) must have **succeeded**. If no later success exists, the sample is skipped (`skipped_selective_gate`).
+
+**Denominator prompt:** Same construction as strategy 2.
+
+**Intuition:** This is the most selective first-attempt strategy. It targets the specific case where the agent initially failed but later figured it out — exactly the trajectories where hindsight distillation is most informative. No loss is applied to trajectories where the first attempt already succeeded (nothing to teach) or where the agent never succeeded (no good teacher signal available).
+
+### 4. `selective_retry_success_n2`
+
+**What is distilled:** **Second-attempt** (episode 1) response tokens — not first-attempt tokens. This is the only strategy that distills non-first-attempt tokens.
+
+**Teacher context:** The first completed attempt's cumulative context tokens (episode 0 context).
+
+**Gating (two conditions, both required):**
+1. The first completed attempt (episode 0) must have **failed**.
+2. The second completed attempt (episode 1) must have **succeeded**.
+
+Requires `teacher_context_attempts=1` (enforced at config validation).
+
+**Denominator prompt:** `cat(first_attempt_context_tokens, student_prompt_tokens)`. The teacher sees the failed first attempt and re-scores the student's successful retry.
+
+**Intuition:** Instead of teaching the agent to do better on its first try, this strategy reinforces successful retry behavior. When the agent fails then succeeds, we distill the successful second attempt with the first attempt as context. This teaches the model "given that you saw a failure, here's how to produce a successful retry."
+
+### Strategy Comparison
+
+| Property | `first_attempt_hindsight` | `latest_success_hindsight` | `latest_success_first_failure_only` | `selective_retry_success_n2` |
+|---|---|---|---|---|
+| **Distill target** | Episode 0 tokens | Episode 0 tokens | Episode 0 tokens | Episode 1 tokens |
+| **Teacher context** | First-N cumulative attempts | Isolated latest success | Isolated latest success | Episode 0 context |
+| **Requires success** | No | Yes (any episode) | Yes (episode > 0) | Yes (episode 1) |
+| **Requires failure** | No | No | Yes (episode 0) | Yes (episode 0) |
+| **Selectivity** | Low (all valid samples) | Medium | High | High |
+| **Uses `teacher_context_attempts`** | Yes | No | No | Must be 1 |
+| **System prompt handling** | `strip_system_from_teacher_prompt` | Always splits system prompt | Always splits system prompt | `strip_system_from_teacher_prompt` |
