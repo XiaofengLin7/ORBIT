@@ -1,5 +1,62 @@
 # SDPO Self-Distillation
 
+## Quick Start
+
+Self-distillation training is launched via task-specific shell scripts. Each script sets environment variables that map to `rllm.distill.*` Hydra overrides.
+
+**Prerequisites:**
+- `conda activate icx`
+- 2+ GPUs (scripts default to 2 GPUs per node)
+- A model checkpoint or HuggingFace model path (defaults to `Qwen/Qwen3-4B`)
+
+**Available scripts:**
+
+| Script | Environment | Default task config |
+|---|---|---|
+| `scripts/train_frozenlake_self_distill_multi_episode.sh` | FrozenLake | `configs/multi_task_frozenlake_self_distill_multi_episode.yaml` |
+| `scripts/train_sokoban_self_distill_multi_episode.sh` | Sokoban | `configs/multi_task_sokoban_self_distill_multi_episode.yaml` |
+| `scripts/train_towerofhanoi_self_distill_multi_episode.sh` | Tower of Hanoi | (single-task, env_id-based) |
+
+**Basic usage (defaults: `selective_retry_success_n2`, EMA teacher, `non_full` loss):**
+
+```bash
+conda activate icx
+bash scripts/train_frozenlake_self_distill_multi_episode.sh
+```
+
+**Customizing via environment variables:**
+
+```bash
+# Use a different model and trajectory selection strategy
+MODEL_PATH=Qwen/Qwen3-1.7B \
+DISTILL_TRAJECTORY_SELECTION=first_attempt_latest_success_hindsight_first_failure_only \
+TEACHER_CONTEXT_ATTEMPTS=null \
+DISTILL_LAMBDA=0.05 \
+  bash scripts/train_frozenlake_self_distill_multi_episode.sh
+
+# Full-logit KL distillation with JSD (alpha=0.5)
+DISTILL_LOSS_VARIANT=full_logit \
+DISTILL_ALPHA=0.5 \
+  bash scripts/train_sokoban_self_distill_multi_episode.sh
+```
+
+**Key environment variables** (all have defaults in each script):
+
+| Env var | Maps to | Description |
+|---|---|---|
+| `DISTILL_LAMBDA` | `rllm.distill.lambda` | SDPO loss weight |
+| `DISTILL_MODE` | `rllm.distill.mode` | `sdpo_self` (PPO+SDPO) or `sdpo_pure` (SDPO only) |
+| `DISTILL_TRAJECTORY_SELECTION` | `rllm.distill.trajectory_selection` | Which trajectories to distill (see Trajectory Selection Strategies) |
+| `TEACHER_CONTEXT_ATTEMPTS` | `rllm.distill.teacher_context_attempts` | Number of complete attempts for teacher context (`null` = all) |
+| `TEACHER_REGULARIZATION` | `rllm.distill.teacher_regularization` | `none`, `ema`, or `every_n_steps` |
+| `DISTILL_LOSS_VARIANT` | `rllm.distill.loss_variant` | `non_full` or `full_logit` |
+| `DISTILL_ALPHA` | `rllm.distill.alpha` | KL interpolation (must be 1.0 for `non_full`) |
+| `DISTILL_IS_CLIP` | `rllm.distill.is_clip` | PPO-style clipping on SDPO term |
+| `NEGATE_SDPO_LOSS` | `rllm.distill.negate_sdpo_loss` | Flip SDPO gradient direction |
+| `MERGE_TO_ADVANTAGES` | `rllm.distill.merge_to_advantages` | Advantage-bonus mode instead of direct loss |
+
+Any extra Hydra overrides can be appended as positional arguments to the script.
+
 ## Overview
 
 This document describes the shared-weight SDPO self-distillation path used in multi-episode training.
@@ -48,14 +105,12 @@ rllm:
     enable: true
     lambda: 0.1
     mode: sdpo_self
-    denominator_mode: teacher_adapted_feedback
     trajectory_selection: first_attempt_hindsight
     teacher_context_attempts: null
     teacher_regularization: none
     teacher_update_rate: 0.05
     teacher_update_interval: 10
     context_limit: null
-    context_overflow_policy: skip_loss
     min_distill_tokens: 1
 
     # SDPO loss controls
@@ -75,8 +130,7 @@ rllm:
 Semantics:
 - `enable`: enable SDPO distillation path.
 - `lambda`: scalar weight for SDPO term. In direct-loss mode, scales the SDPO loss added to the actor objective. In advantage-bonus mode, scales the bonus added to PPO advantages.
-- `mode`: `sdpo_self` (self-distillation, shared-weight model acts as both student and teacher) or `sdpo_pure` (separate teacher model).
-- `denominator_mode`: currently `teacher_adapted_feedback`.
+- `mode`: `sdpo_self` (PPO + SDPO combined loss) or `sdpo_pure` (SDPO loss only, no PPO PG loss component). Both use the same shared-weight self-distillation architecture — the only difference is whether the PPO policy gradient term is included in the actor objective.
 - `trajectory_selection`: how to select which trajectory tokens to distill.
   - `first_attempt_hindsight`: distill first-attempt tokens with hindsight context from complete attempts.
   - `first_attempt_latest_success_hindsight`: distill first-attempt tokens with teacher context set to the isolated latest successful attempt.
@@ -88,8 +142,7 @@ Semantics:
 - `teacher_regularization`: `none` (actor is its own teacher), `ema` (exponential moving average of actor weights), or `every_n_steps` (hard-sync teacher from actor every N steps).
 - `teacher_update_rate`: EMA decay rate when `teacher_regularization=ema`. Lower values = slower teacher drift.
 - `teacher_update_interval`: hard-sync interval (in training steps) when `teacher_regularization=every_n_steps`.
-- `context_limit`: max total tokens for denominator context. If `null`, defaults to `data.max_prompt_length + data.max_response_length`.
-- `context_overflow_policy`: currently only `skip_loss` — skip samples that exceed context limit.
+- `context_limit`: max total tokens for denominator context. If `null`, defaults to `data.max_prompt_length + data.max_response_length`. Samples that exceed this limit are skipped (skip-loss policy).
 - `min_distill_tokens`: if valid distill tokens < this value, distillation is disabled for that batch.
 - `loss_variant`: SDPO branch (`non_full` or `full_logit`). Only applies to direct-loss mode; advantage-bonus mode always uses `non_full`-style log-ratio.
 - `alpha`: KL/JSD interpolation for `full_logit`; for `non_full`, required to be `1.0`.

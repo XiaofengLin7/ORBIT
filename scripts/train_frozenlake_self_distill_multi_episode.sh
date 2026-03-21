@@ -143,8 +143,6 @@ if [ -n "$REFLECTION_PROMPT" ]; then
 fi
 
 # Enum options for overrides used in the command below:
-# - rllm.distill.denominator_mode: teacher_adapted_feedback (currently the only supported mode in this trainer).
-# - rllm.distill.context_overflow_policy: skip_loss (currently the only supported policy).
 # - actor_rollout_ref.actor.loss_agg_mode: token-mean, seq-mean-token-sum, seq-mean-token-mean, seq-mean-token-sum-norm.
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
@@ -161,8 +159,6 @@ python scripts/train_multi_episode.py \
     +rllm.distill.mode=$DISTILL_MODE \
     +rllm.distill.trajectory_selection=$DISTILL_TRAJECTORY_SELECTION \
     +rllm.distill.context_limit=32768 \
-    +rllm.distill.denominator_mode=teacher_adapted_feedback \
-    +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
     +rllm.distill.loss_variant=$DISTILL_LOSS_VARIANT \

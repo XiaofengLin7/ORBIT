@@ -120,8 +120,6 @@ python scripts/train_multi_episode.py \
     +rllm.distill.mode=$DISTILL_MODE \
     +rllm.distill.trajectory_selection=$DISTILL_TRAJECTORY_SELECTION \
     +rllm.distill.context_limit=32768 \
-    +rllm.distill.denominator_mode=teacher_adapted_feedback \
-    +rllm.distill.context_overflow_policy=skip_loss \
     +rllm.distill.min_distill_tokens=$MIN_DISTILL_TOKENS \
     +rllm.distill.teacher_context_attempts=$TEACHER_CONTEXT_ATTEMPTS \
     +rllm.distill.loss_variant=$DISTILL_LOSS_VARIANT \

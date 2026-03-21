@@ -40,9 +40,7 @@ class DistillSettings:
     lambda_coef: float = 1.0
     mode: str = "sdpo_self"
     use_grpo_loss: bool = True
-    denominator_mode: str = "teacher_adapted_feedback"
     context_limit: int | None = None
-    context_overflow_policy: str = "skip_loss"
     min_distill_tokens: int = 1
     loss_variant: str = "non_full"
     alpha: float = 1.0
@@ -742,9 +740,7 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             lambda_coef=float(cfg.get("lambda", 1.0)),
             mode=mode,
             use_grpo_loss=use_grpo_loss,
-            denominator_mode=str(cfg.get("denominator_mode", "teacher_adapted_feedback")),
             context_limit=int(cfg.get("context_limit", default_limit)) if cfg.get("context_limit", None) is not None else default_limit,
-            context_overflow_policy=str(cfg.get("context_overflow_policy", "skip_loss")),
             min_distill_tokens=int(cfg.get("min_distill_tokens", 1)),
             loss_variant=loss_variant,
             alpha=alpha,
@@ -940,12 +936,6 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             if self.distill_settings.context_limit is not None
             else (int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length))
         )
-        if self.distill_settings.context_overflow_policy != "skip_loss":
-            raise ValueError(
-                f"Unsupported context_overflow_policy={self.distill_settings.context_overflow_policy}. "
-                "Only 'skip_loss' is currently supported."
-            )
-
         for i in range(total_samples):
             if (
                 uses_first_attempt_target
