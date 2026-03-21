@@ -258,6 +258,16 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                             # Log with data_source prefix
                             metric_dict[f"val/{data_source}/{key}"] = np.mean(values)
 
+                    # Compute episode_2 - episode_1 success rate gap
+                    gaps = []
+                    for metrics in metrics_list:
+                        ep1 = metrics.get("episode_1/success_rate")
+                        ep2 = metrics.get("episode_2/success_rate")
+                        if ep1 is not None and ep2 is not None and ep1 >= 0 and ep2 >= 0:
+                            gaps.append(ep2 - ep1)
+                    if gaps:
+                        metric_dict[f"val/{data_source}/episode_improvement"] = np.mean(gaps)
+
         # Disable validation mode
         self._is_validation_mode = False
 
@@ -314,7 +324,17 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                             f"traj/{data_source}/{k}_max": v_list.max(),
                         }
                     )
-        
+
+                # Compute episode_2 - episode_1 success rate gap per trajectory
+                gaps = []
+                for m in metrics_list:
+                    ep1 = m.get("episode_1_success_rate")
+                    ep2 = m.get("episode_2_success_rate")
+                    if ep1 is not None and ep2 is not None and ep1 >= 0 and ep2 >= 0:
+                        gaps.append(ep2 - ep1)
+                if gaps:
+                    metrics[f"traj/{data_source}/episode_improvement_mean"] = np.mean(gaps)
+
         return final_gen_batch_output, metrics
 
     def init_envs_and_agents(self, batch):
