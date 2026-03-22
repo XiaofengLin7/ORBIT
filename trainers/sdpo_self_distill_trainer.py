@@ -860,13 +860,25 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         prompt_lens = torch.as_tensor([int(row.numel()) for row in prompt_rows], dtype=torch.long)
         prompt_pos = torch.arange(max_prompt_len).unsqueeze(0)
         prompt_attention = (prompt_pos >= (max_prompt_len - prompt_lens.unsqueeze(1))).long()
-        attention_mask = torch.cat([prompt_attention, response_mask], dim=1)
+
+        # Build response attention mask from actual token lengths so that ALL
+        # real tokens (model + env) are visible.  ``response_mask`` only marks
+        # model tokens; using it for attention would hide env feedback tokens,
+        # producing incorrect log-probs for model tokens that follow env turns.
+        response_lens = torch.as_tensor(
+            [int(row.numel()) for row in response_rows], dtype=torch.long,
+        )
+        resp_pos = torch.arange(max_response_len).unsqueeze(0)
+        response_attention = (resp_pos < response_lens.unsqueeze(1)).long()
+
+        attention_mask = torch.cat([prompt_attention, response_attention], dim=1)
         position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask
         input_ids = torch.cat([prompts, responses], dim=1)
 
         base_batch.batch["prompts"] = prompts
         base_batch.batch["responses"] = responses
         base_batch.batch["response_mask"] = response_mask
+        base_batch.batch["response_attention_mask"] = response_attention
         base_batch.batch["input_ids"] = input_ids
         base_batch.batch["attention_mask"] = attention_mask
         base_batch.batch["position_ids"] = position_ids
@@ -1393,6 +1405,8 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         )
         teacher_responses = torch.full((batch_size, max_distill_len), fill_value=pad_token_id, dtype=torch.long)
         teacher_response_mask = torch.zeros((batch_size, max_distill_len), dtype=torch.long)
+        student_response_attention = torch.zeros((batch_size, max_distill_len), dtype=torch.long)
+        teacher_response_attention = torch.zeros((batch_size, max_distill_len), dtype=torch.long)
         distill_mask = torch.zeros((batch_size, max_distill_len), dtype=torch.float32)
         student_old_log_probs = None
         if payload.student_old_log_probs is not None:
@@ -1410,21 +1424,25 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             student_prompt_attention[kept_idx] = student_prompt_attention_compact[row_idx]
             student_responses[kept_idx] = student_batch["responses"][row_idx].long()
             student_response_mask[kept_idx] = student_batch["response_mask"][row_idx].long()
+            student_response_attention[kept_idx] = student_batch["response_attention_mask"][row_idx].long()
             teacher_prompts[kept_idx] = teacher_batch["prompts"][row_idx].long()
             teacher_prompt_attention[kept_idx] = teacher_prompt_attention_compact[row_idx]
             teacher_responses[kept_idx] = teacher_batch["responses"][row_idx].long()
             teacher_response_mask[kept_idx] = teacher_batch["response_mask"][row_idx].long()
+            teacher_response_attention[kept_idx] = teacher_batch["response_attention_mask"][row_idx].long()
             distill_mask[kept_idx] = payload.distill_mask[row_idx].float()
             if student_old_log_probs is not None and payload.student_old_log_probs is not None:
                 student_old_log_probs[kept_idx] = payload.student_old_log_probs[row_idx]
             if teacher_old_log_probs is not None and payload.teacher_old_log_probs is not None:
                 teacher_old_log_probs[kept_idx] = payload.teacher_old_log_probs[row_idx]
 
-        student_attention_mask = torch.cat([student_prompt_attention, student_response_mask], dim=1)
+        # Use response_attention (all real tokens visible) for attention, not
+        # response_mask (model-only).  See _build_distill_io_batch for details.
+        student_attention_mask = torch.cat([student_prompt_attention, student_response_attention], dim=1)
         student_position_ids = (torch.cumsum(student_attention_mask, dim=1) - 1) * student_attention_mask
         student_input_ids = torch.cat([student_prompts, student_responses], dim=1)
 
-        teacher_attention_mask = torch.cat([teacher_prompt_attention, teacher_response_mask], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt_attention, teacher_response_attention], dim=1)
         teacher_position_ids = (torch.cumsum(teacher_attention_mask, dim=1) - 1) * teacher_attention_mask
         teacher_input_ids = torch.cat([teacher_prompts, teacher_responses], dim=1)
 

@@ -2564,6 +2564,7 @@ def test_attach_distill_payload_to_batch_kept_rows_and_mask_alignment() -> None:
                 "prompts": torch.tensor([[9, 8]], dtype=torch.long),
                 "responses": torch.tensor([[11, 90, 12, 91]], dtype=torch.long),
                 "response_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+                "response_attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.long),
                 "position_ids": torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.long),
             }
@@ -2573,6 +2574,7 @@ def test_attach_distill_payload_to_batch_kept_rows_and_mask_alignment() -> None:
                 "prompts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
                 "responses": torch.tensor([[11, 90, 12, 91]], dtype=torch.long),
                 "response_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+                "response_attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
                 "attention_mask": torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.long),
                 "position_ids": torch.tensor([[0, 0, 1, 2, 3, 4, 5, 6]], dtype=torch.long),
             }
@@ -2601,6 +2603,47 @@ def test_attach_distill_payload_to_batch_kept_rows_and_mask_alignment() -> None:
     assert batch.batch["distill_teacher_responses"][1].tolist() == [0, 0, 0, 0]
 
 
+def test_build_distill_io_batch_env_tokens_visible_in_attention() -> None:
+    """Env tokens within the response must be attended to (attention_mask=1).
+
+    Regression test: _build_distill_io_batch previously used response_mask
+    (which is 0 for env tokens) as the response portion of attention_mask.
+    This hid env feedback from the model, corrupting log-probs for any model
+    tokens that follow an env turn within the same attempt.
+    """
+    trainer = _build_trainer_for_unit_tests()
+    # Simulate a 3-token response: [model_tok, env_tok, model_tok].
+    # response_mask marks env_tok as 0 (excluded from loss), but the model
+    # must still attend to it so that the second model_tok's log-probs
+    # are conditioned on the env feedback.
+    prompt_rows = [torch.tensor([1, 2, 3], dtype=torch.long)]
+    response_rows = [torch.tensor([11, 201, 12], dtype=torch.long)]
+    response_mask_rows = [torch.tensor([1, 0, 1], dtype=torch.long)]
+
+    base_batch = _FakeDataProto({})
+    result = trainer._build_distill_io_batch(
+        base_batch=base_batch,
+        prompt_rows=prompt_rows,
+        response_rows=response_rows,
+        response_mask_rows=response_mask_rows,
+    )
+
+    # response_mask should still reflect model-only tokens (for loss masking).
+    assert result.batch["response_mask"][0].tolist() == [1, 0, 1]
+    # response_attention_mask should be 1 for ALL real tokens (model + env).
+    assert result.batch["response_attention_mask"][0].tolist() == [1, 1, 1]
+    # attention_mask response portion must match response_attention_mask,
+    # NOT response_mask — env tokens must be visible.
+    prompt_len = 3
+    response_attention = result.batch["attention_mask"][0, prompt_len:].tolist()
+    assert response_attention == [1, 1, 1], (
+        f"Expected env token to be visible in attention_mask, got {response_attention}"
+    )
+    # position_ids should be contiguous through env tokens.
+    response_pos = result.batch["position_ids"][0, prompt_len:].tolist()
+    assert response_pos == [3, 4, 5]
+
+
 def test_attach_distill_payload_to_batch_respects_min_token_gate() -> None:
     trainer = _build_trainer_for_unit_tests()
     trainer.distill_settings.min_distill_tokens = 3
@@ -2611,6 +2654,7 @@ def test_attach_distill_payload_to_batch_respects_min_token_gate() -> None:
                 "prompts": torch.tensor([[7, 8]], dtype=torch.long),
                 "responses": torch.tensor([[5, 6]], dtype=torch.long),
                 "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                "response_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
                 "attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
                 "position_ids": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
             }
@@ -2620,6 +2664,7 @@ def test_attach_distill_payload_to_batch_respects_min_token_gate() -> None:
                 "prompts": torch.tensor([[0, 1]], dtype=torch.long),
                 "responses": torch.tensor([[5, 6]], dtype=torch.long),
                 "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                "response_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
                 "attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
                 "position_ids": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
             }
