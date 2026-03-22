@@ -54,6 +54,12 @@ def _renorm_topk_log_probs(log_probs: torch.Tensor) -> torch.Tensor:
     return log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
 
 
+def _topk_entropy(topk_log_probs: torch.Tensor, add_tail: bool) -> torch.Tensor:
+    """Approximate entropy from top-k log-probs. Returns [B, T]."""
+    lp = _add_tail(topk_log_probs) if add_tail else _renorm_topk_log_probs(topk_log_probs)
+    return -(torch.exp(lp) * lp).sum(dim=-1)
+
+
 def _compute_sdpo_per_token_loss(
     student_log_probs: torch.Tensor,
     teacher_log_probs: torch.Tensor | None,
@@ -186,6 +192,11 @@ def _zero_sdpo_metrics() -> dict[str, float]:
         "distill/sdpo_adv_abs_mean": 0.0,
         "distill/sdpo_adv_abs_max": 0.0,
         "distill/active_seq_count": 0.0,
+        "distill/diag_mean_student_logp": 0.0,
+        "distill/diag_mean_teacher_logp": 0.0,
+        "distill/diag_student_entropy": 0.0,
+        "distill/diag_teacher_entropy": 0.0,
+        "distill/diag_kl_per_token_mean": 0.0,
     }
 
 
@@ -711,6 +722,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
         )
         student_log_probs: torch.Tensor | None = None
         teacher_log_probs: torch.Tensor | None = None
+        teacher_token_log_probs: torch.Tensor | None = None
 
         student_all_log_probs_used = None
         teacher_all_log_probs_used = None
@@ -783,7 +795,7 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                 )
                 teacher_distill_inputs = self._truncate_inputs_for_distill(teacher_inputs, distill_len)
                 with torch.no_grad():
-                    _, _, teacher_topk_log_probs_used, _ = self._forward_topk_with_token_log_probs(
+                    teacher_token_log_probs, _, teacher_topk_log_probs_used, _ = self._forward_topk_with_token_log_probs(
                         teacher_distill_inputs,
                         temperature=temperature,
                         module=teacher_module,
@@ -798,11 +810,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                     module=self.actor_module,
                 )
                 with torch.no_grad():
-                    teacher_all_log_probs_used = self._forward_with_all_log_probs(
+                    teacher_token_log_probs, teacher_all_log_probs_used = self._forward_with_all_log_probs(
                         model_inputs=teacher_inputs,
                         temperature=temperature,
                         module=teacher_module,
-                    )[1]
+                    )
                 distill_len = min(
                     distill_len,
                     int(student_log_probs.shape[1]),
@@ -876,6 +888,45 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             masked_advantage = advantage[distill_mask > 0]
             sdpo_adv_abs_mean = float(masked_advantage.abs().mean().item())
             sdpo_adv_abs_max = float(masked_advantage.abs().max().item())
+
+        # --- Diagnostic metrics (no gradient impact) ---
+        diag_mean_student_logp = 0.0
+        diag_mean_teacher_logp = 0.0
+        diag_student_entropy = 0.0
+        diag_teacher_entropy = 0.0
+        diag_kl_per_token_mean = 0.0
+
+        if token_count > 0:
+            diag_mean_student_logp = float((student_log_probs.detach() * distill_mask).sum().item() / token_count)
+            if teacher_token_log_probs is not None:
+                t_logp = teacher_token_log_probs[:, :distill_len].to(
+                    device=student_log_probs.device, dtype=student_log_probs.dtype,
+                )
+                diag_mean_teacher_logp = float((t_logp * distill_mask).sum().item() / token_count)
+            elif teacher_log_probs is not None:
+                diag_mean_teacher_logp = float((teacher_log_probs.detach() * distill_mask).sum().item() / token_count)
+
+            if student_topk_log_probs_used is not None and teacher_topk_log_probs_used is not None:
+                with torch.no_grad():
+                    s_ent = _topk_entropy(student_topk_log_probs_used, distill_params.full_logit_add_tail)
+                    t_ent = _topk_entropy(teacher_topk_log_probs_used, distill_params.full_logit_add_tail)
+                diag_student_entropy = float((s_ent * distill_mask).sum().item() / token_count)
+                diag_teacher_entropy = float((t_ent * distill_mask).sum().item() / token_count)
+            elif (
+                student_all_log_probs_used is not None
+                and teacher_all_log_probs_used is not None
+                and student_all_log_probs_used.shape[-1] <= 10000
+            ):
+                # Guard: skip full-vocab entropy for large vocabularies to avoid OOM.
+                with torch.no_grad():
+                    s_ent = -(torch.exp(student_all_log_probs_used) * student_all_log_probs_used).sum(dim=-1)
+                    t_ent = -(torch.exp(teacher_all_log_probs_used) * teacher_all_log_probs_used).sum(dim=-1)
+                diag_student_entropy = float((s_ent * distill_mask).sum().item() / token_count)
+                diag_teacher_entropy = float((t_ent * distill_mask).sum().item() / token_count)
+
+            if distill_params.loss_variant == "full_logit":
+                diag_kl_per_token_mean = float((per_token_loss.detach() * distill_mask).sum().item() / token_count)
+
         if distill_params.negate_sdpo_loss:
             per_token_loss = -per_token_loss
 
@@ -928,6 +979,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
             "distill/sdpo_adv_abs_mean": sdpo_adv_abs_mean,
             "distill/sdpo_adv_abs_max": sdpo_adv_abs_max,
             "distill/active_seq_count": active_seq_count,
+            "distill/diag_mean_student_logp": diag_mean_student_logp,
+            "distill/diag_mean_teacher_logp": diag_mean_teacher_logp,
+            "distill/diag_student_entropy": diag_student_entropy,
+            "distill/diag_teacher_entropy": diag_teacher_entropy,
+            "distill/diag_kl_per_token_mean": diag_kl_per_token_mean,
         }
 
     def update_policy(self, data: DataProto) -> dict[str, list[float]]:
@@ -1082,6 +1138,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                         )
                         micro_batch_metrics["distill/sdpo_adv_abs_mean"] = sdpo_metrics["distill/sdpo_adv_abs_mean"]
                         micro_batch_metrics["distill/sdpo_adv_abs_max"] = sdpo_metrics["distill/sdpo_adv_abs_max"]
+                        micro_batch_metrics["distill/diag_mean_student_logp"] = sdpo_metrics["distill/diag_mean_student_logp"]
+                        micro_batch_metrics["distill/diag_mean_teacher_logp"] = sdpo_metrics["distill/diag_mean_teacher_logp"]
+                        micro_batch_metrics["distill/diag_student_entropy"] = sdpo_metrics["distill/diag_student_entropy"]
+                        micro_batch_metrics["distill/diag_teacher_entropy"] = sdpo_metrics["distill/diag_teacher_entropy"]
+                        micro_batch_metrics["distill/diag_kl_per_token_mean"] = sdpo_metrics["distill/diag_kl_per_token_mean"]
                     else:
                         micro_batch_metrics["distill/sdpo_loss"] = 0.0
                         micro_batch_metrics["distill/token_count"] = 0.0
@@ -1089,6 +1150,11 @@ class SDPODataParallelPPOActor(DataParallelPPOActor):
                         micro_batch_metrics["distill/sdpo_ratio_gt_clip_frac"] = 0.0
                         micro_batch_metrics["distill/sdpo_adv_abs_mean"] = 0.0
                         micro_batch_metrics["distill/sdpo_adv_abs_max"] = 0.0
+                        micro_batch_metrics["distill/diag_mean_student_logp"] = 0.0
+                        micro_batch_metrics["distill/diag_mean_teacher_logp"] = 0.0
+                        micro_batch_metrics["distill/diag_student_entropy"] = 0.0
+                        micro_batch_metrics["distill/diag_teacher_entropy"] = 0.0
+                        micro_batch_metrics["distill/diag_kl_per_token_mean"] = 0.0
 
                     micro_batch_metrics["distill/active_seq_count"] = active_seq_count
                     micro_batch_metrics["distill/active_seq_frac"] = active_seq_frac

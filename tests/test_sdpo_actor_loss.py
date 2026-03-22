@@ -1255,6 +1255,11 @@ def test_update_policy_emits_sdpo_debug_metrics() -> None:
             "distill/sdpo_adv_abs_mean": 1.5,
             "distill/sdpo_adv_abs_max": 2.5,
             "distill/active_seq_count": 1.0,
+            "distill/diag_mean_student_logp": 0.0,
+            "distill/diag_mean_teacher_logp": 0.0,
+            "distill/diag_student_entropy": 0.0,
+            "distill/diag_teacher_entropy": 0.0,
+            "distill/diag_kl_per_token_mean": 0.0,
         }
 
     actor._forward_micro_batch = fake_forward_micro_batch  # type: ignore[method-assign]
