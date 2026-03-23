@@ -123,6 +123,12 @@ rllm:
     use_stale_coefficient: false  # bool
     strip_system_from_teacher_prompt: true  # bool
 
+    # Teacher context construction
+    teacher_context_mode: token   # token (legacy) | template (decode→template→retokenize)
+    teacher_template: "You are solving a multi-turn task.\n..."  # template string with {attempt_transcript} and {initial_observation}
+    remove_thinking_from_demonstration: false  # strip <think> blocks from transcript
+    teacher_context_log_samples: 0  # print decoded contexts for N samples per step (0 = off)
+
     # Distillation mode
     merge_to_advantages: false    # bool — false: direct loss, true: advantage bonus
 ```
@@ -172,6 +178,71 @@ Distillation is only applied to first-attempt model tokens:
 - interleaved env/model tokens before that endpoint remain in the scored prefix.
 
 If no valid first-attempt token exists, that sample is skipped for distillation.
+
+## Teacher Context Construction
+
+Two modes control how the teacher prompt is built from hindsight context:
+
+### Token mode (`teacher_context_mode=token`, default)
+
+Legacy approach — raw token concatenation:
+```
+teacher_prompt = cat(system_prefix_tokens, isolated_success_tokens, stripped_student_prompt_tokens)
+```
+
+No chat template delimiters are inserted. The teacher sees the same system message as the student, plus the hindsight context tokens spliced in before the student's prompt suffix.
+
+### Template mode (`teacher_context_mode=template`)
+
+Decode → template → retokenize approach:
+1. Extract isolated success tokens via existing hindsight extraction
+2. Decode tokens to text transcript (`tokenizer.decode(skip_special_tokens=True)`)
+3. Extract initial observation (first user message from `chat_completions`)
+4. Format with configurable template and build a single user message (no system message)
+5. Tokenize with `apply_chat_template()` / `convert_messages_to_tokens_and_masks()`
+
+**Teacher vs Student context structure in template mode:**
+
+```
+Student:
+  system: "Solve the task. Return your final answer inside \boxed{}."  ← generic agent instruction
+  user:   "New episode begins.\nYou are playing FrozenLake.\n..."      ← initial observation
+  [first-attempt response tokens]
+
+Teacher:
+  user:   "You are solving a multi-turn task.\n
+           Here is a successful trajectory for this task:\n
+           {decoded successful trajectory}\n\n
+           Now solve this task again.\n\n
+           New episode begins.\nYou are playing FrozenLake.\n..."      ← same initial observation
+  [same first-attempt response tokens]
+```
+
+The teacher has **no system message** — the successful trajectory template replaces it. Both share the same first-attempt response tokens for KL computation.
+
+**Configuration:**
+
+```yaml
+rllm:
+  distill:
+    teacher_context_mode: template
+    teacher_template: "You are solving a multi-turn task.\nHere is a successful trajectory for this task:\n{attempt_transcript}\n\nNow solve this task again.\n\n{initial_observation}"
+    remove_thinking_from_demonstration: false  # strip <think>...</think> blocks from transcript
+```
+
+Template placeholders:
+- `{attempt_transcript}` — decoded text of the successful trajectory
+- `{initial_observation}` — first user message from the student's chat history
+
+### Context logging
+
+To inspect the actual teacher/student contexts during training, set `teacher_context_log_samples` to a positive integer. This prints decoded prompts for N samples per training step to stdout:
+
+```yaml
+rllm:
+  distill:
+    teacher_context_log_samples: 2  # log 2 samples per step (0 = off)
+```
 
 ## Hindsight / Denominator Construction
 

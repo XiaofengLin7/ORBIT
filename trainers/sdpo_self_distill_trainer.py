@@ -14,6 +14,7 @@ If ``L_den > context_limit``, the sample is excluded from distillation.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -56,6 +57,16 @@ class DistillSettings:
     teacher_update_rate: float = 0.05
     teacher_update_interval: int = 10
     merge_to_advantages: bool = False
+    teacher_context_mode: str = "token"
+    teacher_template: str = (
+        "You are solving a multi-turn task.\n"
+        "Here is a successful trajectory for this task:\n"
+        "{attempt_transcript}\n\n"
+        "Now solve this task again.\n\n"
+        "{initial_observation}"
+    )
+    remove_thinking_from_demonstration: bool = False
+    teacher_context_log_samples: int = 0
 
 
 @dataclass
@@ -431,6 +442,29 @@ def extract_initial_messages_before_first_assistant(
     return initial_messages
 
 
+def extract_initial_observation_text(
+    chat_completions: Any,
+) -> str | None:
+    """Extract the initial observation (first user message) from chat history.
+
+    Args:
+        chat_completions: Full chat history from token trajectory metadata.
+
+    Returns:
+        Text content of the first ``user``-role message, or ``None`` when
+        unavailable.
+    """
+    if not isinstance(chat_completions, list):
+        return None
+    for message in chat_completions:
+        if not isinstance(message, dict):
+            return None
+        if message.get("role") == "user":
+            content = message.get("content", "")
+            return content if isinstance(content, str) else str(content)
+    return None
+
+
 def should_skip_denominator_overflow(
     denominator_prompt_len: int,
     first_attempt_sequence_len: int,
@@ -612,6 +646,139 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
         _, stripped_prompt_tokens = prompt_parts
         return stripped_prompt_tokens
 
+    def _decode_attempt_transcript(
+        self,
+        context_tokens: torch.Tensor,
+        *,
+        remove_thinking: bool = False,
+    ) -> str:
+        """Decode isolated attempt tokens to a text transcript.
+
+        Args:
+            context_tokens: Token IDs for one attempt (isolated or cumulative).
+            remove_thinking: If ``True``, strip ``<think>...</think>`` blocks.
+
+        Returns:
+            Decoded and stripped text.
+        """
+        text = self.tokenizer.decode(context_tokens.tolist(), skip_special_tokens=True)
+        if remove_thinking:
+            text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        return text.strip()
+
+    def _build_teacher_prompt_tokens_via_template(
+        self,
+        *,
+        trajectory: dict[str, Any],
+        step_records: list[dict[str, Any]],
+        trajectory_selection: str,
+    ) -> torch.Tensor | None:
+        """Build teacher prompt tokens using text templates.
+
+        Constructs a single user message containing the successful trajectory
+        transcript and the initial observation.  No system message is included.
+
+        Returns:
+            1-D token tensor for the teacher prompt, or ``None`` on failure.
+        """
+        chat_completions = trajectory.get("chat_completions")
+        initial_obs = extract_initial_observation_text(chat_completions)
+        if initial_obs is None:
+            return None
+
+        # --- Extract teacher context tokens using existing functions ---
+        latest_success_hindsight_modes = {
+            "first_attempt_latest_success_hindsight",
+            "first_attempt_latest_success_hindsight_first_failure_only",
+        }
+        if trajectory_selection in latest_success_hindsight_modes:
+            teacher_context_tokens = (
+                build_hindsight_prompt_tokens_latest_successful_complete_attempt(
+                    step_records=step_records,
+                )
+            )
+        else:
+            teacher_context_tokens = build_hindsight_prompt_tokens_first_n_complete_attempts(
+                step_records=step_records,
+                teacher_context_attempts=self.distill_settings.teacher_context_attempts,
+            )
+        if teacher_context_tokens is None:
+            return None
+
+        # --- Decode tokens to text ---
+        # For first_attempt_hindsight the cumulative tokens include the system
+        # prefix.  Strip it before decoding so only interaction content remains.
+        if trajectory_selection not in latest_success_hindsight_modes:
+            initial_messages = extract_initial_messages_before_first_assistant(
+                chat_completions,
+            )
+            system_messages = []
+            if initial_messages:
+                for msg in initial_messages:
+                    if msg.get("role") != "system":
+                        break
+                    system_messages.append(msg)
+            if system_messages:
+                parser = self._get_distill_chat_parser()
+                if parser is not None:
+                    try:
+                        system_ids, _ = convert_messages_to_tokens_and_masks(
+                            system_messages,
+                            tokenizer=self.tokenizer,
+                            parser=parser,
+                            contains_first_msg=True,
+                            contains_generation_msg=False,
+                        )
+                        prefix_len = len(system_ids) if isinstance(system_ids, list) else 0
+                        if 0 < prefix_len < int(teacher_context_tokens.numel()):
+                            teacher_context_tokens = teacher_context_tokens[prefix_len:]
+                    except Exception:
+                        pass  # decode full tokens if stripping fails
+
+        transcript = self._decode_attempt_transcript(
+            teacher_context_tokens,
+            remove_thinking=self.distill_settings.remove_thinking_from_demonstration,
+        )
+        if not transcript:
+            return None
+
+        # --- Build a single user message via the template ---
+        user_content = self.distill_settings.teacher_template.format(
+            attempt_transcript=transcript,
+            initial_observation=initial_obs,
+        )
+        messages: list[dict[str, str]] = [{"role": "user", "content": user_content}]
+
+        # --- Tokenize through the chat template ---
+        parser = self._get_distill_chat_parser()
+        if parser is not None:
+            try:
+                token_ids, _ = convert_messages_to_tokens_and_masks(
+                    messages,
+                    tokenizer=self.tokenizer,
+                    parser=parser,
+                    contains_first_msg=True,
+                    contains_generation_msg=True,
+                )
+                if isinstance(token_ids, list) and token_ids:
+                    return torch.as_tensor(token_ids, dtype=torch.long)
+            except Exception:
+                pass  # fall through to apply_chat_template fallback
+
+        # Fallback: use tokenizer.apply_chat_template directly.
+        try:
+            encoded = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            if isinstance(encoded, list) and encoded:
+                return torch.as_tensor(encoded, dtype=torch.long)
+        except Exception:
+            pass
+
+        return None
+
     def _load_distill_settings(self) -> DistillSettings:
         """Load distillation settings from config with robust defaults."""
         default_limit = int(self.config.data.max_prompt_length) + int(self.config.data.max_response_length)
@@ -735,6 +902,21 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 "rllm.distill.is_clip is not supported when "
                 "rllm.distill.loss_variant='full_logit'."
             )
+        teacher_context_mode = str(cfg.get("teacher_context_mode", "token")).lower()
+        if teacher_context_mode not in {"token", "template"}:
+            raise ValueError(
+                f"rllm.distill.teacher_context_mode must be 'token' or 'template', got {teacher_context_mode}"
+            )
+        teacher_template_default = (
+            "You are solving a multi-turn task.\n"
+            "Here is a successful trajectory for this task:\n"
+            "{attempt_transcript}\n\n"
+            "Now solve this task again.\n\n"
+            "{initial_observation}"
+        )
+        teacher_template = str(cfg.get("teacher_template", teacher_template_default))
+        remove_thinking_from_demonstration = bool(cfg.get("remove_thinking_from_demonstration", False))
+        teacher_context_log_samples = int(cfg.get("teacher_context_log_samples", 0))
         return DistillSettings(
             enable=bool(cfg.get("enable", False)),
             lambda_coef=float(cfg.get("lambda", 1.0)),
@@ -756,6 +938,10 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
             teacher_update_rate=teacher_update_rate,
             teacher_update_interval=teacher_update_interval,
             merge_to_advantages=merge_to_advantages,
+            teacher_context_mode=teacher_context_mode,
+            teacher_template=teacher_template,
+            remove_thinking_from_demonstration=remove_thinking_from_demonstration,
+            teacher_context_log_samples=teacher_context_log_samples,
         )
 
     def _transform_agent_trajectories(
@@ -1060,44 +1246,62 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 skipped_hindsight_unavailable += 1
                 skipped_hindsight_selected_attempt_missing += 1
                 continue
-            if teacher_context_tokens is None:
-                skipped_hindsight_unavailable += 1
-                skipped_hindsight_teacher_context_unavailable += 1
-                continue
 
             prompt_attention_row = batch.batch["attention_mask"][i, :-original_response_len]
             student_prompt_tokens = batch.batch["prompts"][i][prompt_attention_row > 0].long()
-            teacher_system_prefix: torch.Tensor | None = None
-            if (
-                trajectory_selection in latest_success_hindsight_modes
-                or self.distill_settings.strip_system_from_teacher_prompt
-            ):
-                prompt_parts = self._split_student_prompt_system_prefix(
-                    trajectory=trajectory,
-                    student_prompt_tokens=student_prompt_tokens,
-                )
-                if prompt_parts is None:
+
+            if self.distill_settings.teacher_context_mode == "template":
+                # --- Template mode: decode → template → retokenize ---
+                if teacher_context_tokens is None:
                     skipped_hindsight_unavailable += 1
-                    skipped_hindsight_system_strip_unavailable += 1
+                    skipped_hindsight_teacher_context_unavailable += 1
                     continue
-                teacher_system_prefix, teacher_suffix = prompt_parts
-            else:
-                teacher_suffix = student_prompt_tokens
-            if trajectory_selection in latest_success_hindsight_modes:
-                assert teacher_system_prefix is not None
-                teacher_prompt_tokens = torch.cat(
-                    [
-                        teacher_system_prefix.long(),
-                        teacher_context_tokens.long(),
-                        teacher_suffix.long(),
-                    ],
-                    dim=0,
+                teacher_prompt_tokens = self._build_teacher_prompt_tokens_via_template(
+                    trajectory=trajectory,
+                    step_records=step_records,
+                    trajectory_selection=trajectory_selection,
                 )
+                if teacher_prompt_tokens is None:
+                    skipped_hindsight_unavailable += 1
+                    skipped_hindsight_teacher_context_unavailable += 1
+                    continue
             else:
-                teacher_prompt_tokens = torch.cat(
-                    [teacher_context_tokens.long(), teacher_suffix.long()],
-                    dim=0,
-                )
+                # --- Legacy token-splicing mode ---
+                if teacher_context_tokens is None:
+                    skipped_hindsight_unavailable += 1
+                    skipped_hindsight_teacher_context_unavailable += 1
+                    continue
+                teacher_system_prefix: torch.Tensor | None = None
+                if (
+                    trajectory_selection in latest_success_hindsight_modes
+                    or self.distill_settings.strip_system_from_teacher_prompt
+                ):
+                    prompt_parts = self._split_student_prompt_system_prefix(
+                        trajectory=trajectory,
+                        student_prompt_tokens=student_prompt_tokens,
+                    )
+                    if prompt_parts is None:
+                        skipped_hindsight_unavailable += 1
+                        skipped_hindsight_system_strip_unavailable += 1
+                        continue
+                    teacher_system_prefix, teacher_suffix = prompt_parts
+                else:
+                    teacher_suffix = student_prompt_tokens
+                if trajectory_selection in latest_success_hindsight_modes:
+                    assert teacher_system_prefix is not None
+                    teacher_prompt_tokens = torch.cat(
+                        [
+                            teacher_system_prefix.long(),
+                            teacher_context_tokens.long(),
+                            teacher_suffix.long(),
+                        ],
+                        dim=0,
+                    )
+                else:
+                    teacher_prompt_tokens = torch.cat(
+                        [teacher_context_tokens.long(), teacher_suffix.long()],
+                        dim=0,
+                    )
 
             denominator_prompt_len = int(teacher_prompt_tokens.numel())
             distill_response_len = int(selected_attempt.response_tokens.numel())
@@ -1146,6 +1350,30 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 "distill/kept_ratio": 0.0,
                 **hindsight_skip_metrics,
             }
+
+        # --- Log decoded teacher/student contexts for inspection ---
+        n_log = self.distill_settings.teacher_context_log_samples
+        if n_log > 0:
+            step = getattr(self, "global_steps", "?")
+            n_show = min(n_log, len(kept_indices))
+            for log_i in range(n_show):
+                s_tok = student_prompt_tokens_per_sample[log_i]
+                t_tok = teacher_prompt_tokens_per_sample[log_i]
+                r_tok = student_response_tokens_per_sample[log_i]
+                s_text = self.tokenizer.decode(s_tok.tolist(), skip_special_tokens=False)
+                t_text = self.tokenizer.decode(t_tok.tolist(), skip_special_tokens=False)
+                r_text = self.tokenizer.decode(r_tok.tolist(), skip_special_tokens=False)
+                sep = "=" * 72
+                print(f"\n{sep}")
+                print(f"[SDPO Context Log] step={step}  sample={log_i+1}/{n_show}")
+                print(f"{sep}")
+                print(f"--- STUDENT PROMPT ({s_tok.numel()} tokens) ---")
+                print(s_text)
+                print(f"\n--- TEACHER PROMPT ({t_tok.numel()} tokens) ---")
+                print(t_text)
+                print(f"\n--- SHARED RESPONSE ({r_tok.numel()} tokens) ---")
+                print(r_text)
+                print(sep)
 
         selected_student = batch.select_idxs(np.array(kept_indices))
         selected_teacher = batch.select_idxs(np.array(kept_indices))

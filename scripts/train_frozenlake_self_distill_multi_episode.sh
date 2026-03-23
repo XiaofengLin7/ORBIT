@@ -164,6 +164,8 @@ python scripts/train_multi_episode.py \
     +rllm.distill.loss_variant=$DISTILL_LOSS_VARIANT \
     +rllm.distill.alpha=$DISTILL_ALPHA \
     +rllm.distill.is_clip=$DISTILL_IS_CLIP \
+    +rllm.distill.teacher_context_mode=template \
+    +rllm.distill.teacher_context_log_samples=1 \
     +rllm.distill.full_logit_topk=$FULL_LOGIT_TOPK \
     +rllm.distill.full_logit_add_tail=$FULL_LOGIT_ADD_TAIL \
     +rllm.distill.negate_sdpo_loss=$NEGATE_SDPO_LOSS \

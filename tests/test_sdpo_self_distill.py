@@ -34,6 +34,7 @@ from trainers.sdpo_self_distill_trainer import (
     build_hindsight_prompt_tokens_latest_successful_complete_attempt,
     extract_attempt_response_sequence,
     extract_initial_messages_before_first_assistant,
+    extract_initial_observation_text,
     extract_first_attempt_prefix,
     should_skip_denominator_overflow,
 )
@@ -3420,3 +3421,431 @@ def test_selective_retry_success_n2_rollout_consistent_with_and_without_reflecti
         assert metrics["distill/skipped_selective_gate"] == 0.0
         assert metrics["distill/skipped_attempt_incomplete"] == 0.0
         assert payload.kept_samples == 1
+
+
+# ---------------------------------------------------------------------------
+# Template-based teacher context tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_initial_observation_text_returns_first_user_message() -> None:
+    chat = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "initial obs"},
+        {"role": "assistant", "content": "resp"},
+    ]
+    assert extract_initial_observation_text(chat) == "initial obs"
+
+
+def test_extract_initial_observation_text_none_for_invalid_input() -> None:
+    assert extract_initial_observation_text(None) is None
+    assert extract_initial_observation_text("not a list") is None
+    assert extract_initial_observation_text([]) is None
+    assert extract_initial_observation_text([{"role": "system", "content": "sys"}]) is None
+
+
+def test_decode_attempt_transcript_basic() -> None:
+    """Verify _decode_attempt_transcript decodes tokens and strips thinking."""
+
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+            del skip_special_tokens
+            # Simple mapping: each id → a character
+            return "".join(chr(65 + t) for t in token_ids)
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return []
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _Tok()
+    tokens = torch.tensor([0, 1, 2], dtype=torch.long)  # "ABC"
+    assert trainer._decode_attempt_transcript(tokens) == "ABC"
+
+
+def test_decode_attempt_transcript_strips_thinking() -> None:
+    class _Tok:
+        pad_token_id = 0
+
+        def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+            del token_ids, skip_special_tokens
+            return "<think>internal thought</think> actual content"
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return []
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _Tok()
+    tokens = torch.tensor([1], dtype=torch.long)
+    result = trainer._decode_attempt_transcript(tokens, remove_thinking=True)
+    assert result == "actual content"
+    assert "<think>" not in result
+
+
+def test_build_teacher_prompt_via_template_latest_success() -> None:
+    """Template mode produces a single user message with transcript + initial obs."""
+
+    # Tokenizer that can decode isolated success tokens and encode template text.
+    class _TemplateTok:
+        pad_token_id = 0
+
+        def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+            del skip_special_tokens
+            # Isolated success tokens [30, 11, 21] decode to a transcript
+            if token_ids == [30, 11, 21]:
+                return "moved right; reached goal"
+            return f"decoded:{token_ids}"
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            # Return token ids based on text content.
+            # The parser will produce text like "user:You are solving..." for the
+            # template message.  We return predictable ids.
+            if text.startswith("user:"):
+                return [501, 502, 503, 504, 505]
+            if text.startswith("system:"):
+                return [99]
+            return [999]
+
+    class _TemplateParser:
+        assistant_token = "<assistant>"
+
+        def parse(
+            self,
+            messages: list[dict[str, str]],
+            add_generation_prompt: bool = False,
+            is_first_msg: bool = False,
+        ) -> str:
+            del is_first_msg
+            text = "".join(
+                f"{m['role']}:{m.get('content', '')}"
+                if m["role"] != "assistant"
+                else f"{self.assistant_token}{m.get('content', '')}"
+                for m in messages
+            )
+            if add_generation_prompt:
+                text = f"{text}{self.assistant_token}"
+            return text
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _TemplateTok()
+    trainer.agent_execution_engine = SimpleNamespace(chat_parser=_TemplateParser())
+    trainer.distill_settings.teacher_context_mode = "template"
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight"
+    )
+    trainer.distill_settings.teacher_template = (
+        "You are solving a multi-turn task.\n"
+        "Here is a successful trajectory:\n"
+        "{attempt_transcript}\n\n"
+        "Now solve this task again.\n\n"
+        "{initial_observation}"
+    )
+
+    # Same trajectory as the existing latest_success test:
+    # ep0 fails, ep1 succeeds. Isolated success tokens = [30, 11, 21].
+    trajectory = {
+        "chat_completions": [
+            {"role": "system", "content": "s0"},
+            {"role": "user", "content": "initial board state"},
+            {"role": "assistant", "content": "a0"},
+        ],
+        "step_records": [
+            {
+                "episode_index": 0,
+                "prompt_ids": [1, 2],
+                "completion_ids": [10],
+                "boundary_transition": True,
+                "boundary_terminal_env_token_len": 1,
+                "boundary_next_initial_env_token_len": 1,
+                "episode_success": False,
+            },
+            {
+                "episode_index": 1,
+                "prompt_ids": [1, 2, 10, 20, 30],
+                "completion_ids": [11],
+                "boundary_transition": True,
+                "boundary_terminal_env_token_len": 1,
+                "boundary_next_initial_env_token_len": 1,
+                "episode_success": True,
+            },
+            {
+                "episode_index": 2,
+                "prompt_ids": [1, 2, 10, 20, 30, 11, 21, 40],
+                "completion_ids": [12],
+                "boundary_transition": False,
+                "boundary_terminal_env_token_len": 0,
+                "boundary_next_initial_env_token_len": 0,
+                "episode_success": False,
+                "episode_done": True,
+            },
+        ],
+    }
+
+    result = trainer._build_teacher_prompt_tokens_via_template(
+        trajectory=trajectory,
+        step_records=trajectory["step_records"],
+        trajectory_selection="first_attempt_latest_success_hindsight",
+    )
+
+    assert result is not None
+    # The parser formats as "user:<content><assistant>" for the single user message
+    # with contains_first_msg=True and contains_generation_msg=True.
+    # encode("user:...") returns [501, 502, 503, 504, 505]
+    assert result.tolist() == [501, 502, 503, 504, 505]
+
+
+def test_prepare_distill_payload_template_mode_produces_valid_payload() -> None:
+    """Full integration: template mode produces a valid payload with teacher prompt."""
+
+    class _TemplateTok:
+        pad_token_id = 0
+
+        def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+            del skip_special_tokens
+            if token_ids == [30, 11, 21]:
+                return "success transcript"
+            return f"decoded:{token_ids}"
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            if text.startswith("user:"):
+                return [601, 602, 603]
+            if text.startswith("system:"):
+                return [99]
+            return [999]
+
+    class _TemplateParser:
+        assistant_token = "<assistant>"
+
+        def parse(self, messages, add_generation_prompt=False, is_first_msg=False):
+            del is_first_msg
+            text = "".join(
+                f"{m['role']}:{m.get('content', '')}"
+                if m["role"] != "assistant"
+                else f"{self.assistant_token}{m.get('content', '')}"
+                for m in messages
+            )
+            if add_generation_prompt:
+                text = f"{text}{self.assistant_token}"
+            return text
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _TemplateTok()
+    trainer.agent_execution_engine = SimpleNamespace(chat_parser=_TemplateParser())
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.teacher_context_attempts = 9
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight_first_failure_only"
+    )
+    trainer.distill_settings.teacher_context_mode = "template"
+    trainer._latest_token_trajectories = [
+        {
+            "chat_completions": [
+                {"role": "system", "content": "s0"},
+                {"role": "user", "content": "initial obs"},
+                {"role": "assistant", "content": "a0"},
+            ],
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": False,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": True,
+                },
+                {
+                    "episode_index": 2,
+                    "prompt_ids": [1, 2, 10, 20, 30, 11, 21, 40],
+                    "completion_ids": [12],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": False,
+                    "episode_done": True,
+                },
+            ],
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor(
+                [[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32
+            ),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is not None
+    assert payload.kept_samples == 1
+    assert metrics["distill/skipped_hindsight_unavailable"] == 0.0
+    # Teacher prompt comes from template tokenization: [601, 602, 603]
+    teacher_prompts = payload.teacher_batch.batch["prompts"][0]
+    # Filter out padding
+    teacher_prompt_tokens = teacher_prompts[teacher_prompts != 0].tolist()
+    assert teacher_prompt_tokens == [601, 602, 603]
+    # Student prompt stays as original: [99, 1, 2, 3]
+    student_prompts = payload.student_batch.batch["prompts"][0]
+    student_prompt_tokens = student_prompts[student_prompts != 0].tolist()
+    assert student_prompt_tokens == [99, 1, 2, 3]
+    # Response tokens are the same for both
+    assert payload.student_batch.batch["responses"][0].tolist() == [55, 90, 56]
+    assert payload.teacher_batch.batch["responses"][0].tolist() == [55, 90, 56]
+    # Distill mask marks model tokens only
+    assert payload.distill_mask[0].tolist() == [1.0, 0.0, 1.0]
+
+
+def test_prepare_distill_payload_token_mode_unchanged() -> None:
+    """Verify that token mode (default) still produces same results as before."""
+
+    class _PromptTokenizer:
+        pad_token_id = 0
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            del add_special_tokens
+            mapping = {
+                "system:s0": [99],
+                "user:u0<assistant>": [1, 2, 3],
+            }
+            return list(mapping.get(text, []))
+
+    class _PromptParser:
+        assistant_token = "<assistant>"
+
+        def parse(self, messages, add_generation_prompt=False, is_first_msg=False):
+            del is_first_msg
+            text = "".join(
+                f"{m['role']}:{m.get('content', '')}"
+                if m["role"] != "assistant"
+                else f"{self.assistant_token}{m.get('content', '')}"
+                for m in messages
+            )
+            if add_generation_prompt:
+                text = f"{text}{self.assistant_token}"
+            return text
+
+    trainer = _build_trainer_for_unit_tests()
+    trainer.tokenizer = _PromptTokenizer()
+    trainer.agent_execution_engine = SimpleNamespace(chat_parser=_PromptParser())
+    trainer.distill_settings.context_limit = 100000
+    trainer.distill_settings.teacher_context_attempts = 9
+    trainer.distill_settings.trajectory_selection = (
+        "first_attempt_latest_success_hindsight"
+    )
+    # Explicitly set token mode (default)
+    trainer.distill_settings.teacher_context_mode = "token"
+    trainer._latest_token_trajectories = [
+        {
+            "chat_completions": [
+                {"role": "system", "content": "s0"},
+                {"role": "user", "content": "u0"},
+                {"role": "assistant", "content": "a0"},
+            ],
+            "step_records": [
+                {
+                    "episode_index": 0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [10],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": False,
+                },
+                {
+                    "episode_index": 1,
+                    "prompt_ids": [1, 2, 10, 20, 30],
+                    "completion_ids": [11],
+                    "boundary_transition": True,
+                    "boundary_terminal_env_token_len": 1,
+                    "boundary_next_initial_env_token_len": 1,
+                    "episode_success": True,
+                },
+                {
+                    "episode_index": 2,
+                    "prompt_ids": [1, 2, 10, 20, 30, 11, 21, 40],
+                    "completion_ids": [12],
+                    "boundary_transition": False,
+                    "boundary_terminal_env_token_len": 0,
+                    "boundary_next_initial_env_token_len": 0,
+                    "episode_success": False,
+                    "episode_done": True,
+                },
+            ],
+        }
+    ]
+
+    batch = _FakeDataProto(
+        {
+            "prompts": torch.tensor([[99, 1, 2, 3]], dtype=torch.long),
+            "responses": torch.tensor([[55, 90, 56, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+            "first_attempt_response_mask": torch.tensor(
+                [[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32
+            ),
+            "attention_mask": torch.ones((1, 8), dtype=torch.long),
+            "distill_traj_idx": torch.tensor([0], dtype=torch.long),
+        }
+    )
+
+    payload, metrics = trainer._prepare_distill_payload(batch)
+
+    assert payload is not None
+    # Same assertions as original test — token mode unchanged
+    assert payload.teacher_batch.batch["prompts"][0].tolist() == [99, 30, 11, 21, 1, 2, 3]
+    assert payload.teacher_batch.batch["responses"][0].tolist() == [55, 90, 56]
+    assert payload.distill_mask[0].tolist() == [1.0, 0.0, 1.0]
+
+
+def test_load_distill_settings_template_mode_fields() -> None:
+    """Verify new template config fields are parsed correctly."""
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {
+            "enable": True,
+            "mode": "sdpo_self",
+            "teacher_context_mode": "template",
+            "teacher_template": "Custom: {attempt_transcript}\n{initial_observation}",
+            "remove_thinking_from_demonstration": True,
+        }
+    )
+    settings = trainer._load_distill_settings()
+    assert settings.teacher_context_mode == "template"
+    assert settings.teacher_template == "Custom: {attempt_transcript}\n{initial_observation}"
+    assert settings.remove_thinking_from_demonstration is True
+
+
+def test_load_distill_settings_template_mode_defaults() -> None:
+    """Verify template defaults when fields not specified."""
+    trainer = JointSDPOSelfDistillTrainer.__new__(JointSDPOSelfDistillTrainer)
+    trainer.config = _make_settings_config(
+        {
+            "enable": True,
+            "mode": "sdpo_self",
+        }
+    )
+    settings = trainer._load_distill_settings()
+    assert settings.teacher_context_mode == "token"
+    assert "{attempt_transcript}" in settings.teacher_template
+    assert "{initial_observation}" in settings.teacher_template
+    assert settings.remove_thinking_from_demonstration is False
