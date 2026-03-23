@@ -37,6 +37,8 @@ from trainers.sdpo_self_distill_trainer import (
     extract_initial_observation_text,
     extract_first_attempt_prefix,
     should_skip_denominator_overflow,
+    _identify_reflection_step_indices,
+    _zero_out_reflection_in_mask,
 )
 
 
@@ -3849,3 +3851,117 @@ def test_load_distill_settings_template_mode_defaults() -> None:
     assert "{attempt_transcript}" in settings.teacher_template
     assert "{initial_observation}" in settings.teacher_template
     assert settings.remove_thinking_from_demonstration is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for reflection step exclusion from distillation
+# ---------------------------------------------------------------------------
+
+
+def test_identify_reflection_step_indices_empty():
+    """No step_records → empty set."""
+    assert _identify_reflection_step_indices([]) == set()
+
+
+def test_identify_reflection_step_indices_no_reflection():
+    """Normal boundary step (episode_done=True) is NOT flagged as reflection."""
+    step_records = [
+        {"episode_index": 0, "boundary_transition": False, "episode_done": False},
+        {"episode_index": 0, "boundary_transition": True, "episode_done": True},
+        {"episode_index": 1, "boundary_transition": False, "episode_done": False},
+    ]
+    assert _identify_reflection_step_indices(step_records) == set()
+
+
+def test_identify_reflection_step_indices_with_reflection():
+    """Reflection boundary (episode_done=False) IS flagged."""
+    step_records = [
+        {"episode_index": 0, "boundary_transition": False, "episode_done": False},
+        # Failure step: episode_done=True, boundary_transition=False (reflection pending)
+        {"episode_index": 0, "boundary_transition": False, "episode_done": True},
+        # Reflection step: boundary_transition=True but episode_done=False
+        {"episode_index": 0, "boundary_transition": True, "episode_done": False},
+        {"episode_index": 1, "boundary_transition": False, "episode_done": False},
+    ]
+    assert _identify_reflection_step_indices(step_records) == {2}
+
+
+def test_identify_reflection_step_indices_ignores_ep1():
+    """Only episode_index=0 steps are considered."""
+    step_records = [
+        {"episode_index": 0, "boundary_transition": False, "episode_done": False},
+        {"episode_index": 0, "boundary_transition": True, "episode_done": True},
+        {"episode_index": 1, "boundary_transition": True, "episode_done": False},
+    ]
+    assert _identify_reflection_step_indices(step_records) == set()
+
+
+def test_zero_out_reflection_in_mask_no_reflection():
+    """Without reflection steps, mask is returned unchanged."""
+    step_records = [
+        {
+            "episode_index": 0,
+            "boundary_transition": True,
+            "episode_done": True,
+            "prompt_ids": [10, 11, 12],
+            "completion_ids": [20, 21],
+        },
+    ]
+    mask = torch.tensor([1, 1], dtype=torch.float32)
+    result = _zero_out_reflection_in_mask(mask, step_records)
+    assert torch.equal(result, mask)
+
+
+def test_zero_out_reflection_in_mask_zeros_reflection_tokens():
+    """Reflection step completion tokens are zeroed in the mask."""
+    # 3 steps: normal action, failure action, reflection
+    # Response layout:
+    #   step0: comp=[20,21]        → positions 0,1 (mask=1,1)
+    #   step1: env=[30], comp=[22] → positions 2,3 (mask=0,1)
+    #   step2: env=[31], comp=[23] → positions 4,5 (mask=0,1)
+    # step2 is reflection → zero out position 5 (comp of step2)
+    step_records = [
+        {
+            "episode_index": 0,
+            "boundary_transition": False,
+            "episode_done": False,
+            "prompt_ids": [10, 11, 12],
+            "completion_ids": [20, 21],
+        },
+        {
+            "episode_index": 0,
+            "boundary_transition": False,
+            "episode_done": True,
+            "prompt_ids": [10, 11, 12, 20, 21, 30],
+            "completion_ids": [22],
+        },
+        {
+            "episode_index": 0,
+            "boundary_transition": True,
+            "episode_done": False,  # reflection step
+            "prompt_ids": [10, 11, 12, 20, 21, 30, 22, 31],
+            "completion_ids": [23],
+        },
+    ]
+    # mask: positions 0-5 → [1, 1, 0, 1, 0, 1]
+    mask = torch.tensor([1, 1, 0, 1, 0, 1], dtype=torch.float32)
+    result = _zero_out_reflection_in_mask(mask, step_records)
+    expected = torch.tensor([1, 1, 0, 1, 0, 0], dtype=torch.float32)
+    assert torch.equal(result, expected), f"Expected {expected}, got {result}"
+
+
+def test_zero_out_reflection_in_mask_does_not_mutate_input():
+    """Original mask tensor is not modified."""
+    step_records = [
+        {
+            "episode_index": 0,
+            "boundary_transition": True,
+            "episode_done": False,
+            "prompt_ids": [10, 11],
+            "completion_ids": [20],
+        },
+    ]
+    mask = torch.tensor([1], dtype=torch.float32)
+    original = mask.clone()
+    _zero_out_reflection_in_mask(mask, step_records)
+    assert torch.equal(mask, original)

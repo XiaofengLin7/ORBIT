@@ -478,6 +478,65 @@ def should_skip_denominator_overflow(
     return (denominator_prompt_len + first_attempt_sequence_len) > context_limit
 
 
+def _identify_reflection_step_indices(step_records: list[dict]) -> set[int]:
+    """Identify step indices that are reflection responses.
+
+    A reflection step in episode 0 has ``boundary_transition=True`` but
+    ``episode_done=False``.  This happens because the env returns next-episode
+    info (episode_done=False, episode_start=True) when it consumes the
+    reflection action, unlike a normal boundary step which has
+    ``episode_done=True``.
+    """
+    indices: set[int] = set()
+    for i, rec in enumerate(step_records):
+        if (
+            int(rec.get("episode_index", -1)) == 0
+            and bool(rec.get("boundary_transition", False))
+            and not bool(rec.get("episode_done", True))
+        ):
+            indices.add(i)
+    return indices
+
+
+def _zero_out_reflection_in_mask(
+    first_attempt_mask: torch.Tensor,
+    step_records: list[dict],
+) -> torch.Tensor:
+    """Zero out reflection completion tokens in first_attempt_response_mask.
+
+    Replays token accumulation from step_records to locate which response
+    positions correspond to reflection step completions, then zeroes them.
+    Returns a new tensor (the original is not mutated).
+    """
+    reflection_indices = _identify_reflection_step_indices(step_records)
+    if not reflection_indices or not step_records:
+        return first_attempt_mask
+
+    mask = first_attempt_mask.clone()
+
+    # Replay response assembly: for each step, response = env_delta + completion
+    accumulated_len = len(step_records[0].get("prompt_ids", []))
+    pos = 0  # current position in response token sequence
+
+    for i, rec in enumerate(step_records):
+        prompt_ids = rec.get("prompt_ids", [])
+        completion_ids = rec.get("completion_ids", [])
+
+        env_delta_len = 0 if i == 0 else (len(prompt_ids) - accumulated_len)
+        comp_len = len(completion_ids)
+        comp_start = pos + env_delta_len
+
+        if i in reflection_indices:
+            end = min(comp_start + comp_len, mask.numel())
+            if comp_start < end:
+                mask[comp_start:end] = 0
+
+        pos = comp_start + comp_len
+        accumulated_len = len(prompt_ids) + comp_len
+
+    return mask
+
+
 def extract_first_attempt_prefix(
     response_tokens: torch.Tensor,
     response_mask: torch.Tensor,
@@ -966,6 +1025,10 @@ class JointSDPOSelfDistillTrainer(MultiEpisodeAgentPPOTrainer):
                 continue
             if not isinstance(mask, torch.Tensor):
                 mask = torch.as_tensor(mask, dtype=torch.float32)
+            # Exclude reflection completion tokens from first-attempt mask
+            step_records = traj.get("step_records", [])
+            if isinstance(step_records, list) and step_records:
+                mask = _zero_out_reflection_in_mask(mask, step_records)
             usable = min(response_len, int(mask.numel()))
             if usable > 0:
                 first_attempt_masks[i, :usable] = mask[:usable].float()
