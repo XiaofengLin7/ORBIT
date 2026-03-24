@@ -46,60 +46,86 @@ TEACHER_REGULARIZATION=ema \
 
 ### Exp 1 Results
 
-**Wandb run:** `yn5srku9` (160 training steps, full_logit, alpha=1, lambda=0.01, EMA teacher)
+#### Run 1a (buggy attention mask): `yn5srku9`
+
+**Note:** This run had a bug in the distillation context construction — the attention mask was incorrect, causing the teacher/student to not properly attend to context tokens. Results are kept for reference but superseded by Run 1b.
+
+| Phase (steps) | student_logp | teacher_logp | student_entropy | teacher_entropy | kl_per_token |
+|---------------|-------------|-------------|-----------------|-----------------|-------------|
+| 0–39 | -0.248 | -0.296 | 0.019 | 0.019 | 0.084 |
+| 40–79 | -0.534 | -0.575 | 0.044 | 0.046 | 0.100 |
+| 80–119 | -0.632 | -0.666 | 0.052 | 0.054 | 0.088 |
+| 120–159 | -0.799 | -0.825 | 0.051 | 0.054 | 0.084 |
+
+#### Run 1b (attention mask fixed): `hw9278mu`
+
+**Wandb run:** `hw9278mu` (168 training steps, full_logit, alpha=1, lambda=0.01, EMA teacher)
 **Baseline run:** `zzcyem9j` (no SDPO, same FrozenLake config)
 
-#### Diagnostic Metrics Over Training
+##### Diagnostic Metrics Over Training
 
-| Phase (steps) | student_logp | teacher_logp | logp diff (t-s) | student_entropy | teacher_entropy | entropy ratio (t/s) | kl_per_token |
-|---------------|-------------|-------------|-----------------|-----------------|-----------------|---------------------|-------------|
-| 0–39 | -0.362 | -0.385 | -0.023 | 2.093 | 2.037 | 0.97 | 0.0055 |
-| 40–79 | -0.357 | -0.390 | -0.033 | 1.974 | 1.937 | 0.98 | 0.0077 |
-| 80–119 | -0.353 | -0.394 | -0.041 | 1.808 | 1.832 | 1.01 | 0.0103 |
-| 120–159 | -0.386 | -0.432 | -0.046 | 1.789 | 1.898 | 1.06 | 0.0107 |
+| Phase (steps) | student_logp | teacher_logp | logp diff (t-s) | student_entropy | teacher_entropy | kl_per_token |
+|---------------|-------------|-------------|-----------------|-----------------|-----------------|-------------|
+| 0–42 | -0.004 | -0.121 | -0.117 | 0.0022 | 0.0019 | 0.128 |
+| 42–84 | -0.001 | -0.123 | -0.121 | 0.0002 | 0.0004 | 0.120 |
+| 84–126 | -0.002 | -0.163 | -0.161 | 0.0004 | 0.0006 | 0.167 |
+| 126–168 | -0.001 | -0.164 | -0.163 | 0.0001 | 0.0007 | 0.165 |
 
-#### Baseline Comparison (at step 160)
+##### Baseline Comparison (late phase)
 
-| Metric | SDPO (yn5srku9) | Baseline (zzcyem9j) | Delta |
+| Metric | SDPO (hw9278mu) | Baseline (zzcyem9j) | Delta |
 |--------|----------------|---------------------|-------|
-| ep1 success | ~0.30 | ~0.60 | -0.30 |
-| ep2 success | ~0.55 | ~0.68 | -0.13 |
-| ep1-ep2 gap | ~0.25 | ~0.08 | +0.17 |
-| response length | ~1200 | ~3500 | -2300 |
+| ep1 success | ~0.62 | ~0.63 | -0.01 |
+| ep2 success | ~0.77 | ~0.79 | -0.02 |
+| overall success | ~0.87 | ~0.87 | ~0 |
+| response length | ~4763 | ~5017 | -254 |
 | active_seq_frac | 5–23% | n/a | — |
+
+##### Key Changes from Run 1a → 1b (attention mask fix)
+
+| Metric | Run 1a (buggy) | Run 1b (fixed) |
+|--------|---------------|----------------|
+| Student logp | -0.25 → -0.80 | **-0.004 → -0.001** (near-deterministic) |
+| Teacher logp | -0.30 → -0.83 | -0.12 → -0.16 |
+| Student entropy | 0.019 → 0.051 | **0.0001 → 0.002** (~25x lower) |
+| KL per token | 0.08 → 0.10 | **0.12 → 0.17** (~2x higher) |
+| SDPO loss | 0.008 → 0.022 | **0.016 → 0.036** (~2x higher) |
+| Grad norm | 0.14 → 0.58 | **0.32 → 1.59** (~2-3x higher) |
+| Performance | degraded vs baseline | **~same as baseline** |
 
 #### Analysis
 
-1. **H2 (teacher too peaked) — RULED OUT.** Teacher entropy ≈ student entropy throughout training (ratio 0.97→1.06). The teacher is not over-certain; hindsight context does not collapse the teacher distribution.
+1. **H2 (teacher too peaked) — RULED OUT.** Both student and teacher entropies are very low and comparable. The teacher is not over-certain relative to the student.
 
-2. **Teacher assigns lower log-prob than student on actual tokens.** The teacher logp is consistently lower than student logp (gap widens from -0.023 to -0.046 over training). This means the teacher is *less confident* on the tokens the student generates. Under reverse KL (alpha=1, mode-seeking), this pushes the student to concentrate on modes of the teacher distribution — which may differ from the student's current modes.
+2. **Student is near-deterministic on distilled tokens.** Student logp ≈ 0 (P ≈ 1) — the student already assigns nearly all probability mass to its own generated tokens. This is expected: with the corrected attention mask, the student can properly attend to prior context, so it's very confident on tokens it generated during rollout.
 
-3. **KL divergence is growing.** `kl_per_token_mean` nearly doubles (0.0055 → 0.0107), indicating student and teacher distributions are diverging over training rather than converging. The SDPO signal is not achieving alignment.
+3. **Teacher is less confident than student.** Teacher logp is -0.12 to -0.16 (≈ 85–88% probability) vs student's ≈100%. The hindsight context makes the teacher *less sure* about the student's token choices, not more. The logp gap is stable at -0.12 to -0.16 throughout training.
 
-4. **Very low SDPO coverage.** `active_seq_frac` ranges 5–23%, meaning SDPO fires on only a small fraction of the batch (requires ep1 failure + later success). The signal is sparse but still causes significant performance degradation. This suggests the per-sample impact is outsized.
+4. **KL is higher than the buggy run** (0.12–0.17 vs 0.08–0.10) and grows over training. The divergence is driven by the student being near-deterministic while the teacher spreads probability more broadly.
 
-5. **Both entropies decline together.** Student entropy drops from 2.09→1.79, teacher from 2.04→1.90. The student entropy drops faster early on, consistent with response length collapse. By late training the teacher is actually slightly *higher* entropy than the student.
+5. **SDPO signal is stronger but performance is neutral.** Despite 2x higher SDPO loss and 2–3x higher grad norms vs the buggy run, task performance is now essentially identical to the baseline. This suggests the SDPO gradient is largely **orthogonal to task-relevant directions** — it changes the distribution without improving (or in this config, meaningfully hurting) downstream performance.
 
-#### Updated Hypothesis Status
+6. **The hindsight context produces a slightly less confident teacher, not a better one.** The teacher doesn't appear to learn a substantially different policy from seeing the successful attempt — it just becomes slightly less certain about the student's specific token choices. This raises the question: is the hindsight context providing a useful teaching signal at all?
+
+#### Hypothesis Status (after Exp 1 + Exp 2 partial)
 
 | Hypothesis | Status | Evidence |
 |-----------|--------|----------|
 | H1 (gradient sign wrong) | Ruled out | Code audit confirmed correct direction |
-| H2 (teacher too peaked) | **Ruled out** | Entropy ratio ≈ 1.0 throughout |
-| H3 (gradient magnitude) | Open | KL growing suggests possible magnitude issue |
-| H5 (teacher kills exploration) | Partially addressed | Teacher not peaked, but reverse KL mode-seeking may still suppress student exploration |
-| H7 (selection bias) | Open | Very low coverage (5-23%) amplifies per-sample impact |
-| H8 (reverse KL wrong direction) | **Now highest priority** | Teacher logp < student logp + growing KL + mode-seeking KL = student collapses onto wrong modes |
+| H2 (teacher too peaked) | Ruled out | Both entropies near-zero and comparable |
+| H3 (gradient magnitude) | Open | SDPO loss dominates pg_loss by ~100x; grad norms 2-3x higher with reverse KL |
+| H5 (teacher kills exploration) | **Partially confirmed** | Reverse KL collapses student entropy to 0.002; forward KL preserves at 0.101 |
+| H7 (selection bias) | Open | Very low coverage (5-23%) |
+| H8 (reverse KL wrong direction) | **Confirmed** | Forward KL outperforms reverse KL on all metrics; 50x more entropy preserved |
+| H9 (weak teacher signal) | Open | Teacher logp -0.12 to -0.39 vs student ≈0; hindsight context produces a less confident teacher, not a clearly better one |
 
 #### Revised Priority
 
-Given Exp 1 findings, the most actionable next experiments are:
-
-1. **Exp 2 (alpha comparison)** — highest priority. The growing KL + mode-seeking dynamics strongly suggest reverse KL (alpha=1) may be the wrong divergence. Forward KL (alpha=0) would mean-seek instead of mode-seek, potentially avoiding the collapse.
-2. **Exp 4 (selection gate)** — the very low active_seq_frac (5-23%) means SDPO only fires on the hardest cases (ep1 failed). Broadening the gate may reduce per-sample impact and improve signal quality.
-3. **Exp 5 (lambda sweep)** — KL per token is small (~0.01) but with lambda=0.01 still causes degradation. Understanding the dose-response is important.
-4. **Exp 3 (teacher context)** — lower priority now that H2 is ruled out. The teacher distribution is not problematic in aggregate, so context changes may have limited effect.
-5. **Exp 6 (negation)** — deferred; we already know negation helps, understanding *why* the positive direction hurts is more urgent.
+1. ~~**Exp 2 (alpha comparison)**~~ — **2A, 2B done.** H8 confirmed: forward KL > reverse KL. **2C (JSD) still pending.**
+2. **Exp 3 (teacher context)** — does richer context produce a stronger teacher signal? (H9)
+3. **Exp 4 (selection gate)** — broadening gate may increase SDPO coverage beyond 5-23%.
+4. **Exp 5 (lambda sweep)** — dose-response, especially with forward KL as the new default.
+5. **Exp 6 (negation)** — lower priority now that forward KL works well.
 
 ---
 
@@ -144,6 +170,52 @@ TEACHER_REGULARIZATION=ema \
 ```
 
 **What to look for:** If alpha=0 shows less length collapse + better ep1 → reverse KL is wrong direction (H8). If all alphas degrade similarly → teacher signal itself is the problem.
+
+### Exp 2 Partial Results (2A vs 2B)
+
+**Run 2A (reverse KL, α=1):** `hw9278mu` — 170 steps, crashed
+**Run 2B (forward KL, α=0):** `xuxe4l9q` — 168 steps, still running
+
+#### Validation Performance
+
+| Metric (val) | Forward KL (α=0) | Reverse KL (α=1) |
+|---|---|---|
+| overall success (late) | **0.867** | 0.849 |
+| ep1 success (late) | **0.648** | 0.590 |
+| ep2 success (late) | **0.794** | 0.760 |
+
+#### Training Performance
+
+| Metric (train, late) | Forward KL (α=0) | Reverse KL (α=1) |
+|---|---|---|
+| overall success | **0.867** | 0.837 |
+| ep1 success | **0.703** | 0.651 |
+| ep2 success | **0.792** | 0.763 |
+
+#### Distillation Diagnostics
+
+| Metric | Phase | Forward KL (α=0) | Reverse KL (α=1) |
+|---|---|---|---|
+| student_logp | Late | -0.065 (soft) | -0.001 (peaked) |
+| teacher_logp | Late | -0.386 | -0.157 |
+| student_entropy | Late | **0.052** | 0.0002 |
+| teacher_entropy | Late | 0.015 | 0.0006 |
+| KL/token | Late | **0.085** (stable) | 0.160 (growing) |
+| sdpo_loss | Late | 0.011 | 0.017 |
+| actor/entropy | Late | **0.101** | 0.002 |
+| grad_norm (early) | Early | **0.506** | 1.311 |
+
+#### Analysis
+
+1. **H8 (reverse KL wrong direction) — CONFIRMED.** Forward KL outperforms reverse KL on all val metrics (+0.018 overall, +0.058 ep1, +0.034 ep2). The mechanism is clear: reverse KL (mode-seeking) collapses the student to near-deterministic (entropy 0.002), while forward KL (mean-seeking) preserves 50x more entropy (0.101). This entropy preservation translates directly to better exploration and higher ep1 success.
+
+2. **Forward KL keeps the student soft.** Student logp is -0.065 (forward) vs -0.001 (reverse). The forward KL student maintains a broader distribution rather than collapsing onto a single mode.
+
+3. **Forward KL has more stable optimization.** Early grad norms are 0.51 (forward) vs 1.31 (reverse), and KL/token is stable at 0.085 vs growing to 0.160 for reverse.
+
+4. **Teacher logp is much lower under forward KL** (-0.39 vs -0.16). This is expected: the softer student distribution produces tokens that the teacher is less confident about, but the mean-seeking objective handles this gracefully by spreading probability rather than concentrating it.
+
+5. **Run 2C (JSD, α=0.5) still pending** — would test whether a middle ground between forward and reverse KL finds a sweet spot.
 
 ---
 
@@ -283,13 +355,14 @@ Adjust `entropy_coeff` until response length roughly matches 6B.
 | `distill/active_seq_frac` | actor logs | What fraction of batch gets SDPO |
 | `distill/kept_ratio` | trainer logs | Samples kept vs skipped |
 
-## Priority Order (updated after Exp 1)
+## Priority Order (updated after Exp 2 partial)
 
-1. ~~**Exp 1**~~ — **DONE.** H2 ruled out; teacher not peaked. Key finding: reverse KL + growing KL divergence → H8 is top suspect.
-2. **Exp 2** — alpha comparison (3 runs) — **highest priority.** Tests H8 directly.
-3. **Exp 4** — selection gate ablation — low active_seq_frac (5-23%) suggests gate bias worth investigating.
-4. **Exp 5** — lambda sweep (6 runs) — dose-response to quantify magnitude effects.
-5. **Exp 3** — teacher context ablation — lower priority since H2 is ruled out.
-6. **Exp 6** — negation analysis — deferred; positive direction is the priority.
+1. ~~**Exp 1**~~ — **DONE.** H2 ruled out. Teacher signal is weak (H9).
+2. ~~**Exp 2A/2B**~~ — **DONE.** H8 confirmed: forward KL (α=0) > reverse KL (α=1). Forward KL preserves 50x more entropy, better val performance.
+3. **Exp 2C** — JSD (α=0.5) — does a middle ground improve further?
+4. **Exp 3** — teacher context ablation — can richer context strengthen the weak teacher signal (H9)?
+5. **Exp 4** — selection gate ablation — increase SDPO coverage beyond 5-23%.
+6. **Exp 5** — lambda sweep with forward KL as new default α.
+7. **Exp 6** — negation analysis — lower priority.
 
 **Note:** Many runs overlap — Runs 2A, 3B, 4A, 5D are all the same config. Runs 3A, 5A, 6A are all the same baseline. Plan carefully to avoid redundant runs.
