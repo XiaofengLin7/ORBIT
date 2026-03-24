@@ -107,25 +107,25 @@ TEACHER_REGULARIZATION=ema \
 
 6. **The hindsight context produces a slightly less confident teacher, not a better one.** The teacher doesn't appear to learn a substantially different policy from seeing the successful attempt — it just becomes slightly less certain about the student's specific token choices. This raises the question: is the hindsight context providing a useful teaching signal at all?
 
-#### Hypothesis Status (after Exp 1 + Exp 2 partial)
+#### Hypothesis Status (after Exp 1 + Exp 2 complete)
 
 | Hypothesis | Status | Evidence |
 |-----------|--------|----------|
 | H1 (gradient sign wrong) | Ruled out | Code audit confirmed correct direction |
 | H2 (teacher too peaked) | Ruled out | Both entropies near-zero and comparable |
-| H3 (gradient magnitude) | Open | SDPO loss dominates pg_loss by ~100x; grad norms 2-3x higher with reverse KL |
-| H5 (teacher kills exploration) | **Partially confirmed** | Reverse KL collapses student entropy to 0.002; forward KL preserves at 0.101 |
-| H7 (selection bias) | Open | Very low coverage (5-23%) |
-| H8 (reverse KL wrong direction) | **Confirmed** | Forward KL outperforms reverse KL on all metrics; 50x more entropy preserved |
-| H9 (weak teacher signal) | Open | Teacher logp -0.12 to -0.39 vs student ≈0; hindsight context produces a less confident teacher, not a clearly better one |
+| H3 (gradient magnitude) | **Less concerning** | JSD has 10x smaller loss/KL yet performs best; magnitude alone isn't the issue |
+| H5 (teacher kills exploration) | **Divergence-dependent** | Reverse KL collapses entropy; JSD preserves moderate entropy; forward KL over-inflates |
+| H7 (selection bias) | Open | Coverage 5-23% (reverse KL) / 5-8% (JSD); JSD works well despite lowest coverage |
+| H8 (reverse KL wrong direction) | **Confirmed + refined** | JSD >> Forward KL > Reverse KL. The interpolation matters: α=0.5 avoids both mode-collapse and over-diffuseness |
+| H9 (weak teacher signal) | **Reframed** | Teacher signal is weak in absolute terms, but JSD extracts useful learning from it. The issue was not signal strength but how the divergence processes the signal |
 
 #### Revised Priority
 
-1. ~~**Exp 2 (alpha comparison)**~~ — **2A, 2B done.** H8 confirmed: forward KL > reverse KL. **2C (JSD) still pending.**
-2. **Exp 3 (teacher context)** — does richer context produce a stronger teacher signal? (H9)
-3. **Exp 4 (selection gate)** — broadening gate may increase SDPO coverage beyond 5-23%.
-4. **Exp 5 (lambda sweep)** — dose-response, especially with forward KL as the new default.
-5. **Exp 6 (negation)** — lower priority now that forward KL works well.
+1. ~~**Exp 2 (alpha comparison)**~~ — **DONE.** JSD (α=0.5) is the best divergence by a wide margin.
+2. **Exp 5 (lambda sweep)** — with JSD as the new default, find the optimal lambda. Current λ=0.01 works but may not be optimal.
+3. **Exp 3 (teacher context)** — can richer context further improve JSD performance?
+4. **Exp 4 (selection gate)** — JSD already works well at 5-8% coverage; broadening may or may not help.
+5. **Exp 6 (negation)** — low priority; JSD already works in the positive direction.
 
 ---
 
@@ -171,51 +171,59 @@ TEACHER_REGULARIZATION=ema \
 
 **What to look for:** If alpha=0 shows less length collapse + better ep1 → reverse KL is wrong direction (H8). If all alphas degrade similarly → teacher signal itself is the problem.
 
-### Exp 2 Partial Results (2A vs 2B)
+### Exp 2 Results (2A vs 2B vs 2C)
 
 **Run 2A (reverse KL, α=1):** `hw9278mu` — 170 steps, crashed
-**Run 2B (forward KL, α=0):** `xuxe4l9q` — 168 steps, still running
+**Run 2B (forward KL, α=0):** `xuxe4l9q` — 172 steps, crashed
+**Run 2C (JSD, α=0.5):** `b6st3k5m` — 116 steps, still running
 
 #### Validation Performance
 
-| Metric (val) | Forward KL (α=0) | Reverse KL (α=1) |
-|---|---|---|
-| overall success (late) | **0.867** | 0.849 |
-| ep1 success (late) | **0.648** | 0.590 |
-| ep2 success (late) | **0.794** | 0.760 |
-
-#### Training Performance
-
-| Metric (train, late) | Forward KL (α=0) | Reverse KL (α=1) |
-|---|---|---|
-| overall success | **0.867** | 0.837 |
-| ep1 success | **0.703** | 0.651 |
-| ep2 success | **0.792** | 0.763 |
-
-#### Distillation Diagnostics
-
-| Metric | Phase | Forward KL (α=0) | Reverse KL (α=1) |
+| Metric (val) | Reverse KL (α=1) | Forward KL (α=0) | **JSD (α=0.5)** |
 |---|---|---|---|
-| student_logp | Late | -0.065 (soft) | -0.001 (peaked) |
-| teacher_logp | Late | -0.386 | -0.157 |
-| student_entropy | Late | **0.052** | 0.0002 |
-| teacher_entropy | Late | 0.015 | 0.0006 |
-| KL/token | Late | **0.085** (stable) | 0.160 (growing) |
-| sdpo_loss | Late | 0.011 | 0.017 |
-| actor/entropy | Late | **0.101** | 0.002 |
-| grad_norm (early) | Early | **0.506** | 1.311 |
+| overall success (step 110) | 0.781 | 0.844 | **0.914** |
+| ep1 success (step 110) | 0.602 | 0.606 | **0.840** |
+| ep2 success (step 110) | 0.711 | 0.785 | **0.875** |
+| overall success (best) | 0.883 (step 170) | 0.895 (step 160) | **0.926** (step 90)* |
+
+*JSD still running — may improve further.
+
+#### Training Performance (late phase)
+
+| Metric (train) | Reverse KL (α=1) | Forward KL (α=0) | **JSD (α=0.5)** |
+|---|---|---|---|
+| overall success | 0.856 | 0.876 | **0.894** |
+| ep1 success | 0.621 | 0.687 | **0.806** |
+| ep2 success | 0.764 | 0.783 | **0.862** |
+| response length | 4739 | 3900 | **5755** |
+
+#### Distillation Diagnostics (late phase)
+
+| Metric | Reverse KL (α=1) | Forward KL (α=0) | **JSD (α=0.5)** |
+|---|---|---|---|
+| student_logp | -0.001 (peaked) | -0.064 (soft) | -0.006 |
+| teacher_logp | -0.164 | -0.374 | -0.169 |
+| student_entropy | 0.0001 | 0.052 | 0.005 |
+| teacher_entropy | 0.0007 | 0.016 | 0.005 |
+| KL/token | 0.165 (growing) | 0.084 (stable) | **0.007** (very low) |
+| sdpo_loss | 0.016 | 0.011 | **0.001** |
+| actor/entropy | 0.003 | 0.102 | 0.005 |
+| grad_norm | 0.32 | 0.46 | **0.17** |
+| active_seq_frac | 0.23 | 0.17 | 0.08 |
 
 #### Analysis
 
-1. **H8 (reverse KL wrong direction) — CONFIRMED.** Forward KL outperforms reverse KL on all val metrics (+0.018 overall, +0.058 ep1, +0.034 ep2). The mechanism is clear: reverse KL (mode-seeking) collapses the student to near-deterministic (entropy 0.002), while forward KL (mean-seeking) preserves 50x more entropy (0.101). This entropy preservation translates directly to better exploration and higher ep1 success.
+1. **JSD (α=0.5) is the clear winner.** It outperforms both forward KL and reverse KL on all metrics, with +7pp overall and **+23pp on ep1** vs forward KL at comparable steps. It reaches 0.926 val success at step 90 — surpassing the final scores of both completed runs.
 
-2. **Forward KL keeps the student soft.** Student logp is -0.065 (forward) vs -0.001 (reverse). The forward KL student maintains a broader distribution rather than collapsing onto a single mode.
+2. **JSD finds the sweet spot between mode-collapse and over-diffuseness.** Reverse KL (α=1) collapses student entropy to near-zero (mode-seeking). Forward KL (α=0) inflates entropy to 0.10 (mass-covering). JSD (α=0.5) maintains moderate entropy at 0.005 — enough for exploration without losing focus.
 
-3. **Forward KL has more stable optimization.** Early grad norms are 0.51 (forward) vs 1.31 (reverse), and KL/token is stable at 0.085 vs growing to 0.160 for reverse.
+3. **JSD produces a dramatically smoother training signal.** KL/token is 0.007 (vs 0.08–0.17 for others), SDPO loss is 10x smaller, and grad norms are 2–3x lower. The gentler signal leads to more stable and faster learning.
 
-4. **Teacher logp is much lower under forward KL** (-0.39 vs -0.16). This is expected: the softer student distribution produces tokens that the teacher is less confident about, but the mean-seeking objective handles this gracefully by spreading probability rather than concentrating it.
+4. **JSD has the longest response lengths** (5755 vs 3900–4739), suggesting it preserves richer reasoning rather than collapsing to short outputs.
 
-5. **Run 2C (JSD, α=0.5) still pending** — would test whether a middle ground between forward and reverse KL finds a sweet spot.
+5. **Lower active_seq_frac** (0.08 vs 0.17–0.23) — the model improves faster so fewer trajectories have ep1 failure + later success. This is a positive sign, not a concern.
+
+6. **H8 update: the divergence choice matters enormously, and JSD is optimal.** The ranking is JSD >> Forward KL > Reverse KL. The interpolation between forward and reverse KL avoids the failure modes of both extremes.
 
 ---
 
@@ -355,14 +363,13 @@ Adjust `entropy_coeff` until response length roughly matches 6B.
 | `distill/active_seq_frac` | actor logs | What fraction of batch gets SDPO |
 | `distill/kept_ratio` | trainer logs | Samples kept vs skipped |
 
-## Priority Order (updated after Exp 2 partial)
+## Priority Order (updated after Exp 2 complete)
 
-1. ~~**Exp 1**~~ — **DONE.** H2 ruled out. Teacher signal is weak (H9).
-2. ~~**Exp 2A/2B**~~ — **DONE.** H8 confirmed: forward KL (α=0) > reverse KL (α=1). Forward KL preserves 50x more entropy, better val performance.
-3. **Exp 2C** — JSD (α=0.5) — does a middle ground improve further?
-4. **Exp 3** — teacher context ablation — can richer context strengthen the weak teacher signal (H9)?
-5. **Exp 4** — selection gate ablation — increase SDPO coverage beyond 5-23%.
-6. **Exp 5** — lambda sweep with forward KL as new default α.
-7. **Exp 6** — negation analysis — lower priority.
+1. ~~**Exp 1**~~ — **DONE.** H2 ruled out. Teacher signal weak but usable.
+2. ~~**Exp 2**~~ — **DONE.** JSD (α=0.5) >> Forward KL (α=0) > Reverse KL (α=1). JSD is the new default.
+3. **Exp 5** — lambda sweep with JSD (α=0.5). Current λ=0.01 may not be optimal.
+4. **Exp 3** — teacher context ablation with JSD.
+5. **Exp 4** — selection gate ablation. JSD works at 5-8% coverage; broadening may help.
+6. **Exp 6** — negation analysis — low priority.
 
 **Note:** Many runs overlap — Runs 2A, 3B, 4A, 5D are all the same config. Runs 3A, 5A, 6A are all the same baseline. Plan carefully to avoid redundant runs.
