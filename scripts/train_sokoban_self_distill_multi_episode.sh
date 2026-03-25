@@ -15,7 +15,7 @@ if [ ! -f "$TASKS_CONFIG" ]; then
 fi
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
-ACTOR_LR=${ACTOR_LR:-1e-5}
+ACTOR_LR=${ACTOR_LR:-1e-6}
 DISTILL_LAMBDA=${DISTILL_LAMBDA:-0.1}
 # Distillation mode options: sdpo_self, sdpo_pure.
 DISTILL_MODE=${DISTILL_MODE:-sdpo_self}
