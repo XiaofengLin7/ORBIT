@@ -1,0 +1,171 @@
+"""WebShop adapter for rLLM multi-episode wrappers.
+
+Wraps GEM's WebshopEnv through the ``BaseEnv`` interface expected by
+``MultiEpisodeEnv``.  Uses the ``session`` parameter for deterministic task
+selection (bypasses the random session-ID bug in webshop.py:80-81) and
+concatenates prefix/suffix to form ORBIT-style observations.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
+
+from rllm.agents.agent import Action  # type: ignore
+from rllm.environments.base.base_env import BaseEnv  # type: ignore
+
+try:
+    import gem  # type: ignore
+    import gem.envs  # type: ignore  # noqa: F401  # populate registries
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "The 'gem' package is required for WebShopEnvAdapter. "
+        "Install it via `pip install gem-llm` or ensure it is on PYTHONPATH."
+    ) from exc
+
+
+class WebShopEnvAdapter(BaseEnv):
+    """Adapter wrapping GEM's WebshopEnv with deterministic task selection.
+
+    Instead of relying on ``random.seed()`` for reproducibility, this adapter
+    passes ``session=seed % num_goals`` directly to ``WebshopEnv.reset()``,
+    which triggers deterministic goal lookup via ``get_goal_by_idx(session_int)``.
+
+    This also bypasses the double ``random.choices`` bug in WebshopEnv that
+    produces 1-character session IDs.
+    """
+
+    def __init__(
+        self,
+        env_id: str = "webshop",
+        env_kwargs: Optional[Dict[str, Any]] = None,
+        **_: Any,
+    ) -> None:
+        env_kwargs = dict(env_kwargs or {})
+
+        # Extract WebShop-specific parameters
+        split = env_kwargs.pop("split", "test")
+        observation_mode = env_kwargs.pop("observation_mode", "text")
+        max_turns = env_kwargs.pop("max_turns", 15)
+        error_tolerance = env_kwargs.pop("error_tolerance", 15)
+        format_error_reward = env_kwargs.pop("format_error_reward", -0.1)
+
+        self.env_id = env_id
+        self._split = split
+        self._observation_mode = observation_mode
+        self._max_turns = max_turns
+
+        # Construct GEM env_id: e.g. "webshop:test-text"
+        gem_env_id = f"webshop:{split}-{observation_mode}"
+        self._env = gem.make(
+            gem_env_id,
+            max_turns=max_turns,
+            error_tolerance=error_tolerance,
+            format_error_reward=format_error_reward,
+        )
+
+        # Number of goals in this split, for deterministic seed → goal mapping.
+        # cum_weights has length num_goals + 1 (starts with a leading 0).
+        self._num_goals = len(self._env.server.cum_weights) - 1
+
+    # ------------------------------------------------------------------
+    # BaseEnv interface
+    # ------------------------------------------------------------------
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        task: Optional[dict] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Reset and select a deterministic task via goal index.
+
+        Args:
+            seed: Used to compute ``session_int = seed % num_goals`` for
+                deterministic goal selection.
+            task: Optional task dict (may contain ``seed`` key).
+
+        Returns:
+            observation: Formatted string (prefix + obs + suffix).
+            info: Metadata dictionary.
+        """
+        # Resolve seed from arguments or task dict
+        if seed is None and task is not None:
+            seed = task.get("seed")
+
+        session_int = seed % self._num_goals if seed is not None else None
+        obs, info = self._env.reset(session=session_int)
+
+        formatted_obs = info.get("prefix", "") + obs + info.get("suffix", "")
+
+        normalized_info: Dict[str, Any] = {
+            "env_id": self.env_id,
+            "turn": 0,
+            "max_turns": self._max_turns,
+            "terminated": False,
+            "truncated": False,
+            "raw_reward": 0.0,
+        }
+        return formatted_obs, normalized_info
+
+    def step(self, action: Any) -> Tuple[str, float, bool, Dict[str, Any]]:
+        """Execute one step in the WebShop environment.
+
+        Args:
+            action: Action string or ``Action`` object.  Expected to contain
+                ``\\boxed{search[...]}`` or ``\\boxed{click[...]}``.
+
+        Returns:
+            observation: Formatted string (prefix + obs + suffix).
+            reward: WebShop reward (0-1 on buy, 0 otherwise).
+            done: True when terminated or truncated.
+            info: Metadata dictionary.
+        """
+        raw_action = action.action if isinstance(action, Action) else action
+        obs, reward, terminated, truncated, info = self._env.step(raw_action)
+
+        done = bool(terminated or truncated)
+        formatted_obs = info.get("prefix", "") + obs + info.get("suffix", "")
+
+        normalized_info: Dict[str, Any] = {
+            "env_id": self.env_id,
+            "turn": getattr(self._env, "turn_count", 0),
+            "max_turns": self._max_turns,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "raw_reward": float(reward),
+            "parsed_action": info.get("parsed_action", str(raw_action)),
+        }
+        return formatted_obs, float(reward), done, normalized_info
+
+    def close(self) -> None:
+        """No-op — WebshopEnv has no resources to release."""
+        pass
+
+    @staticmethod
+    def from_dict(info: dict) -> "WebShopEnvAdapter":
+        """Factory to create the adapter from a configuration dictionary.
+
+        Extracts passthrough keys (``max_turns``, ``seed``, ``split``,
+        ``observation_mode``) into ``env_kwargs``, mirroring the pattern
+        used by ``ALFWorldEnvAdapter.from_dict()``.
+        """
+        env_kwargs = dict(info.get("env_kwargs", {}) or {})
+        passthrough_keys = (
+            "max_turns",
+            "seed",
+            "split",
+            "observation_mode",
+            "error_tolerance",
+            "format_error_reward",
+        )
+        for key in passthrough_keys:
+            if key in info and key not in env_kwargs:
+                env_kwargs[key] = info[key]
+        return WebShopEnvAdapter(
+            env_id=info.get("env_id", "webshop"),
+            env_kwargs=env_kwargs,
+        )
+
+    @staticmethod
+    def is_multithread_safe() -> bool:
+        """WebshopEnv is not thread-safe (mutable browser/session state)."""
+        return False
