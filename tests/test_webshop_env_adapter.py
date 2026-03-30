@@ -292,3 +292,147 @@ class TestIntegrationWithMultiEpisodeEnv:
         metrics = env.get_metrics()
         assert "episode/success_rate" in metrics
         assert "episode/num_episodes" in metrics
+
+
+@needs_webshop_data
+class TestEpisodeFeedback:
+    """Test that the adapter returns correct feedback for each outcome scenario."""
+
+    def _make_adapter(self):
+        from envs.webshop_env_adapter import WebShopEnvAdapter
+
+        return WebShopEnvAdapter.from_dict({
+            "env_id": "webshop",
+            "split": "test",
+            "observation_mode": "text",
+        })
+
+    def test_feedback_timeout(self):
+        """Episode times out without a purchase → truncation message."""
+        from envs.webshop_env_adapter import WebShopEnvAdapter
+
+        adapter = WebShopEnvAdapter.from_dict({
+            "env_id": "webshop",
+            "split": "test",
+            "observation_mode": "text",
+            "max_turns": 3,
+        })
+        adapter.reset(seed=0)
+        # Exhaust all turns with searches (never buy)
+        for _ in range(3):
+            obs, reward, done, info = adapter.step("\\boxed{search[laptop]}")
+        assert done is True
+        assert info["truncated"] is True
+        assert "max_turns" in obs
+        assert "did not make a purchase" in obs
+
+    def test_feedback_zero_reward(self):
+        """Error tolerance exceeded with 0 reward → 'You failed.'"""
+        from envs.webshop_env_adapter import WebShopEnvAdapter
+
+        adapter = WebShopEnvAdapter.from_dict({
+            "env_id": "webshop",
+            "split": "test",
+            "observation_mode": "text",
+            "error_tolerance": 0,
+            "format_error_reward": 0.0,
+        })
+        adapter.reset(seed=0)
+        # One invalid action exceeds error_tolerance=0 → done with reward=0
+        obs, reward, done, info = adapter.step("invalid action without boxed")
+        assert done is True
+        assert reward == 0.0
+        assert info["terminated"] is True
+        assert obs == "You failed."
+
+    def test_feedback_partial_reward(self):
+        """Buy an item with partial match → score only, no congratulations."""
+        adapter = self._make_adapter()
+        adapter.reset(seed=0)
+        # Search → click product → buy now (partial match expected)
+        adapter.step("\\boxed{search[slim fit mens henleys short sleeve]}")
+        adapter.step("\\boxed{click[b09qqp3356]}")
+        obs, reward, done, info = adapter.step("\\boxed{click[buy now]}")
+        assert done is True
+        assert 0 < reward < 1.0
+        assert "Your score:" in obs
+        assert "Congratulations" not in obs
+        assert "failed" not in obs
+
+    def test_feedback_perfect_reward(self):
+        """Buy with perfect match → Congratulations message.
+
+        Finding a perfect match is hard in the test set, so we test
+        the formatting logic directly via _format_step_obs.
+        """
+        adapter = self._make_adapter()
+        obs = adapter._format_step_obs("raw", {}, 1.0, terminated=True, truncated=False)
+        assert "Congratulations" in obs
+        assert "1.00 / 1.00" in obs
+
+    def test_three_episode_feedback_sequence(self):
+        """Multi-episode trajectory with mixed outcomes across 3 episodes.
+
+        Episode 1: timeout after 5 turns (no purchase)
+        Episode 2: partial match (search + click + buy = 3 turns, done early)
+        Episode 3: timeout after 5 turns (no purchase)
+        total_step_cap = 13 = 5 + 3 + 5
+        """
+        from envs.multi_episode_env import MultiEpisodeEnv
+
+        env = MultiEpisodeEnv.from_dict({
+            "inner_env_class": "envs.webshop_env_adapter.WebShopEnvAdapter",
+            "env_id": "webshop",
+            "seed": 0,
+            "uid": "webshop-0",
+            "data_source": "webshop",
+            "max_turns_per_episode": 5,
+            "total_step_cap": 13,
+            "split": "test",
+            "observation_mode": "text",
+            "success_reward": 1.0,
+            "enable_reflection": False,
+        })
+        obs, _ = env.reset(seed=0)
+
+        # --- Episode 1: just search, times out after 5 turns ---
+        for _ in range(5):
+            obs, reward, done, info = env.step("\\boxed{search[laptop]}")
+        # Should see timeout feedback + Episode 2 header
+        assert "did not make a purchase" in obs
+        assert "[Episode 2]" in obs
+        assert done is False
+
+        # --- Episode 2: search → click → buy now (partial match, 3 turns) ---
+        obs, _, _, _ = env.step("\\boxed{search[slim fit mens henleys short sleeve]}")
+        obs, _, _, _ = env.step("\\boxed{click[b09qqp3356]}")
+        obs, reward, done, info = env.step("\\boxed{click[buy now]}")
+        # Buy terminates before max_turns → score feedback + Episode 3 header
+        assert "Your score:" in obs
+        assert "Congratulations" not in obs  # partial, not perfect
+        assert "[Episode 3]" in obs
+        assert done is False
+
+        # --- Episode 3: search until budget exhausted (5 more turns) ---
+        for _ in range(5):
+            obs, reward, done, info = env.step("\\boxed{search[phone]}")
+        # Inner truncation + outer done coincide at step 13
+        assert "did not make a purchase" in obs
+        assert done is True
+
+        # Verify per-episode metrics
+        metrics = env.get_metrics()
+        # Episode 1: timeout → no reward
+        assert metrics["episode_1/success_rate"] == 0.0
+        assert metrics["episode_1/reward"] == 0.0
+        # Episode 2: partial match → positive reward
+        assert metrics["episode_2/success_rate"] == 1.0
+        assert 0 < metrics["episode_2/reward"] < 1.0
+        # Aggregate: avg_reward reflects the partial score
+        assert metrics["episode/avg_reward"] > 0.0
+        assert metrics["episode/num_episodes"] == 3
+        # Check raw rewards list
+        rewards = env._episode_rewards
+        assert rewards[0] == 0.0    # episode 1: timeout
+        assert 0 < rewards[1] < 1.0  # episode 2: partial match
+        assert rewards[2] == 0.0    # episode 3: timeout

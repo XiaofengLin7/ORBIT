@@ -156,18 +156,18 @@ class WebShopEnvAdapter(BaseEnv):
         boilerplate) is replaced with a clear outcome message.  Non-terminal
         steps keep the standard prefix + obs + suffix format.
         """
+        if terminated and not truncated and reward == 1.0:
+            # Perfect purchase
+            return (
+                f"Your score: {reward:.2f} / 1.00.\n"
+                f"Congratulations! You successfully completed the task."
+            )
         if terminated and not truncated and reward > 0:
-            # Successful purchase
-            return (
-                f"You purchased an item. Your score: {reward:.2f} / 1.00.\n"
-                f"Congratulations! You have completed the task successfully."
-            )
+            # Partial match — show score only, no success/failure label
+            return f"Your score: {reward:.2f} / 1.00."
         if terminated and not truncated:
-            # Episode ended (buy with 0 reward, or error tolerance exceeded)
-            return (
-                f"Episode finished. Your score: {reward:.2f} / 1.00.\n"
-                f"The task was not completed successfully."
-            )
+            # Zero reward (total mismatch or error tolerance exceeded)
+            return "You failed."
         if truncated:
             return (
                 f"Episode stopped because max_turns ({self._max_turns}) was reached. "
