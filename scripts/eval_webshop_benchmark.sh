@@ -87,6 +87,8 @@ bash scripts/train_multi_task_multi_episode.sh \
     trainer.experiment_name="webshop-orbit-actor-hf-reflection"
 echo "ORBIT completed with exit code: $?"
 
+# --- 4. GPU keep-alive ---
 echo "=========================================="
-echo "All WebShop evaluations complete."
+echo "All WebShop evaluations complete. Starting GPU keep-alive..."
 echo "=========================================="
+CUDA_VISIBLE_DEVICES=0 python /projectnb/replearn/xfl/REIL/data/dummy.py --gpus 0
