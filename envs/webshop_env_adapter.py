@@ -114,7 +114,7 @@ class WebShopEnvAdapter(BaseEnv):
                 ``\\boxed{search[...]}`` or ``\\boxed{click[...]}``.
 
         Returns:
-            observation: Formatted string (prefix + obs + suffix).
+            observation: Formatted string with explicit success/failure feedback.
             reward: WebShop reward (0-1 on buy, 0 otherwise).
             done: True when terminated or truncated.
             info: Metadata dictionary.
@@ -123,7 +123,9 @@ class WebShopEnvAdapter(BaseEnv):
         obs, reward, terminated, truncated, info = self._env.step(raw_action)
 
         done = bool(terminated or truncated)
-        formatted_obs = info.get("prefix", "") + obs + info.get("suffix", "")
+        formatted_obs = self._format_step_obs(
+            obs, info, reward, terminated, truncated,
+        )
 
         normalized_info: Dict[str, Any] = {
             "env_id": self.env_id,
@@ -135,6 +137,44 @@ class WebShopEnvAdapter(BaseEnv):
             "parsed_action": info.get("parsed_action", str(raw_action)),
         }
         return formatted_obs, float(reward), done, normalized_info
+
+    # ------------------------------------------------------------------
+    # Observation formatting
+    # ------------------------------------------------------------------
+
+    def _format_step_obs(
+        self,
+        obs: str,
+        info: Dict[str, Any],
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+    ) -> str:
+        """Format step observation with explicit success/failure feedback.
+
+        On terminal steps the raw WebShop done-page observation (noisy MTurk
+        boilerplate) is replaced with a clear outcome message.  Non-terminal
+        steps keep the standard prefix + obs + suffix format.
+        """
+        if terminated and not truncated and reward > 0:
+            # Successful purchase
+            return (
+                f"You purchased an item. Your score: {reward:.2f} / 1.00.\n"
+                f"Congratulations! You have completed the task successfully."
+            )
+        if terminated and not truncated:
+            # Episode ended (buy with 0 reward, or error tolerance exceeded)
+            return (
+                f"Episode finished. Your score: {reward:.2f} / 1.00.\n"
+                f"The task was not completed successfully."
+            )
+        if truncated:
+            return (
+                f"Episode stopped because max_turns ({self._max_turns}) was reached. "
+                f"You did not make a purchase."
+            )
+        # Normal (non-terminal) step — keep standard format
+        return info.get("prefix", "") + obs + info.get("suffix", "")
 
     def close(self) -> None:
         """No-op — WebshopEnv has no resources to release."""
