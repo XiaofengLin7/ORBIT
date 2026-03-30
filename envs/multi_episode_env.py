@@ -379,7 +379,7 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode/total_steps": self.total_step_cap,
                 "episode/truncated": 1.0,
             }
-            if self._episode_rewards:
+            if self._has_continuous_rewards() and self._episode_rewards:
                 metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
                 metrics["episode/max_reward"] = max(self._episode_rewards)
             if self._maze_visited_positions is not None:
@@ -394,10 +394,11 @@ class MultiEpisodeEnv(BaseEnv):
                     metrics[f"episode_{idx}/steps"] = self._episode_lengths[idx - 1]
                 else:
                     metrics[f"episode_{idx}/steps"] = max_turns
-                if idx <= len(self._episode_rewards):
-                    metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
-                else:
-                    metrics[f"episode_{idx}/reward"] = 0.0
+                if self._has_continuous_rewards():
+                    if idx <= len(self._episode_rewards):
+                        metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+                    else:
+                        metrics[f"episode_{idx}/reward"] = 0.0
 
             return metrics
         
@@ -412,7 +413,7 @@ class MultiEpisodeEnv(BaseEnv):
             "episode/total_steps": self._total_steps,
             "episode/truncated": 0.0,
         }
-        if self._episode_rewards:
+        if self._has_continuous_rewards() and self._episode_rewards:
             metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
             metrics["episode/max_reward"] = max(self._episode_rewards)
         if self._maze_visited_positions is not None:
@@ -430,11 +431,12 @@ class MultiEpisodeEnv(BaseEnv):
             else:
                 metrics[f"episode_{idx}/steps"] = -1  # Will be filtered
 
-        for idx in range(1, minimum_episodes + 1):
-            if idx <= len(self._episode_rewards):
-                metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
-            else:
-                metrics[f"episode_{idx}/reward"] = -1.0  # Will be filtered
+        if self._has_continuous_rewards():
+            for idx in range(1, minimum_episodes + 1):
+                if idx <= len(self._episode_rewards):
+                    metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+                else:
+                    metrics[f"episode_{idx}/reward"] = -1.0  # Will be filtered
 
         return metrics
 
@@ -467,6 +469,19 @@ class MultiEpisodeEnv(BaseEnv):
         if self._maze_visited_positions is not None:
             info["unique_visited_states"] = len(self._maze_visited_positions)
         return info
+
+    def _has_continuous_rewards(self) -> bool:
+        """Return True iff the inner env uses continuous (non-binary) rewards.
+
+        Currently only WebShop has continuous 0-1 partial match scores.
+        Other envs use binary rewards so avg_reward would just duplicate
+        success_rate — we skip emitting reward metrics for them.
+        """
+        try:
+            from envs.webshop_env_adapter import WebShopEnvAdapter
+        except Exception:
+            return False
+        return isinstance(self.inner_env, WebShopEnvAdapter)
 
     def _is_maze_inner_env(self) -> bool:
         """Return True iff the wrapped env is `MazeEnvAdapter`."""
