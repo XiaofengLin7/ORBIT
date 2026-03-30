@@ -28,7 +28,7 @@ EXPERIMENT_NAME="gem-multi-task-${CONFIG_NAME}-${MODEL_NAME}"
 # Multi-episode via environment wrapper (uses AgentExecutionEngine instead of workflow)
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
-    data.val_batch_size=128 \
+    data.val_batch_size=134 \
     data.max_prompt_length=1024 \
     data.max_response_length=31744 \
     +data.tasks_config_path="$TASKS_CONFIG" \
@@ -77,7 +77,7 @@ python scripts/train_multi_episode.py \
     trainer.project_name='rllm-agent' \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     trainer.val_before_train=True \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
     trainer.test_freq=10 \

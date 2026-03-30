@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Type
 from rllm.agents.agent import Action  # type: ignore
 from rllm.environments.base.base_env import BaseEnv  # type: ignore
 
-from prompts.prompt import reflection_prompt
+from prompts.prompt import reflection_prompt_2 as reflection_prompt
 
 class MultiEpisodeEnv(BaseEnv):
     """Wrapper environment that runs multiple episodes of an inner environment.
@@ -85,6 +85,8 @@ class MultiEpisodeEnv(BaseEnv):
         self._seed: Optional[int] = None
         # Store the initial task from dataset (extracted in from_dict)
         self._initial_task: Optional[dict] = None
+        # Task type (e.g. ALFWorld task category), captured from inner env info
+        self._task_type: Optional[str] = None
 
         # Reflection state
         self._waiting_for_reflection: bool = False
@@ -137,6 +139,9 @@ class MultiEpisodeEnv(BaseEnv):
         # Reset inner environment
         observation, info = self._reset_inner_env()
         self._maybe_track_maze_state()
+        # Capture task_type from inner env if provided (e.g. ALFWorld task category)
+        if isinstance(info, dict) and "task_type" in info:
+            self._task_type = info["task_type"]
 
         # Format observation with episode header
         observation = self._format_observation(observation, self._episode_index)
@@ -455,6 +460,11 @@ class MultiEpisodeEnv(BaseEnv):
         except Exception:
             # Tracking must never break the main env loop.
             return
+
+    @property
+    def task_type(self) -> Optional[str]:
+        """Task type captured from inner env (e.g. ALFWorld task category)."""
+        return self._task_type
 
     @property
     def is_correct(self) -> bool:
