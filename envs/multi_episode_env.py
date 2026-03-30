@@ -221,9 +221,14 @@ class MultiEpisodeEnv(BaseEnv):
         # Handle episode completion
         if inner_done:
             # Record the just-finished episode.
+            # Use raw_reward from info when available (e.g. WebShop stores the
+            # continuous 0-1 score there while env_reward is binarized for
+            # success determination).
             self._episode_successes.append(success)
             self._episode_lengths.append(self._episode_step)
-            self._episode_rewards.append(float(env_reward))
+            self._episode_rewards.append(
+                float(info.get("raw_reward", env_reward))
+            )
 
             if not outer_done:
                 # If reflection is enabled, we prompt for reflection instead of immediate reset

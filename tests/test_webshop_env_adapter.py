@@ -346,7 +346,11 @@ class TestEpisodeFeedback:
         assert obs == "You failed."
 
     def test_feedback_partial_reward(self):
-        """Buy an item with partial match → score only, no congratulations."""
+        """Buy an item with partial match → score only, no congratulations.
+
+        Reward is binarized: partial match → reward=0.0 (not a success).
+        The actual WebShop score is in info["raw_reward"].
+        """
         adapter = self._make_adapter()
         adapter.reset(seed=0)
         # Search → click product → buy now (partial match expected)
@@ -354,7 +358,8 @@ class TestEpisodeFeedback:
         adapter.step("\\boxed{click[b09qqp3356]}")
         obs, reward, done, info = adapter.step("\\boxed{click[buy now]}")
         assert done is True
-        assert 0 < reward < 1.0
+        assert reward == 0.0  # binarized: partial match is NOT success
+        assert 0 < info["raw_reward"] < 1.0  # actual score preserved
         assert "Your score:" in obs
         assert "Congratulations" not in obs
         assert "failed" not in obs
@@ -422,17 +427,19 @@ class TestEpisodeFeedback:
 
         # Verify per-episode metrics
         metrics = env.get_metrics()
-        # Episode 1: timeout → no reward
+        # Episode 1: timeout → no reward, not success
         assert metrics["episode_1/success_rate"] == 0.0
         assert metrics["episode_1/reward"] == 0.0
-        # Episode 2: partial match → positive reward
-        assert metrics["episode_2/success_rate"] == 1.0
-        assert 0 < metrics["episode_2/reward"] < 1.0
-        # Aggregate: avg_reward reflects the partial score
+        # Episode 2: partial match → raw_reward tracked, but NOT success
+        # (only reward == 1.0 counts as success for WebShop)
+        assert metrics["episode_2/success_rate"] == 0.0
+        assert 0 < metrics["episode_2/reward"] < 1.0  # raw score preserved
+        # Aggregate: success_rate=0 (no perfect match), but avg_reward > 0
+        assert metrics["episode/success_rate"] == 0.0
         assert metrics["episode/avg_reward"] > 0.0
         assert metrics["episode/num_episodes"] == 3
-        # Check raw rewards list
+        # Check raw rewards list (from info["raw_reward"])
         rewards = env._episode_rewards
         assert rewards[0] == 0.0    # episode 1: timeout
-        assert 0 < rewards[1] < 1.0  # episode 2: partial match
+        assert 0 < rewards[1] < 1.0  # episode 2: partial match raw score
         assert rewards[2] == 0.0    # episode 3: timeout

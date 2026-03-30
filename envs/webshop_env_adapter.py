@@ -115,17 +115,23 @@ class WebShopEnvAdapter(BaseEnv):
 
         Returns:
             observation: Formatted string with explicit success/failure feedback.
-            reward: WebShop reward (0-1 on buy, 0 otherwise).
+            reward: 1.0 only on perfect match (raw == 1.0), else 0.0.
+                The actual WebShop score is preserved in info["raw_reward"].
             done: True when terminated or truncated.
             info: Metadata dictionary.
         """
         raw_action = action.action if isinstance(action, Action) else action
-        obs, reward, terminated, truncated, info = self._env.step(raw_action)
+        obs, raw_reward, terminated, truncated, info = self._env.step(raw_action)
 
         done = bool(terminated or truncated)
         formatted_obs = self._format_step_obs(
-            obs, info, reward, terminated, truncated,
+            obs, info, raw_reward, terminated, truncated,
         )
+
+        # WebShop-specific: only perfect match (raw_reward == 1.0) counts as
+        # success for MultiEpisodeEnv._is_episode_success (checks reward > 0).
+        # The continuous score is preserved in info["raw_reward"] for avg_reward.
+        reward = 1.0 if raw_reward == 1.0 else 0.0
 
         normalized_info: Dict[str, Any] = {
             "env_id": self.env_id,
@@ -133,10 +139,10 @@ class WebShopEnvAdapter(BaseEnv):
             "max_turns": self._max_turns,
             "terminated": bool(terminated),
             "truncated": bool(truncated),
-            "raw_reward": float(reward),
+            "raw_reward": float(raw_reward),
             "parsed_action": info.get("parsed_action", str(raw_action)),
         }
-        return formatted_obs, float(reward), done, normalized_info
+        return formatted_obs, reward, done, normalized_info
 
     # ------------------------------------------------------------------
     # Observation formatting
