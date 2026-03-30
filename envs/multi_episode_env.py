@@ -78,6 +78,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._episode_step: int = 0
         self._episode_successes: List[bool] = []
         self._episode_lengths: List[int] = []
+        self._episode_rewards: List[float] = []
         # Maze-only: track unique visited positions across the full trajectory.
         # This is intentionally scoped to Maze to keep this wrapper simple.
         self._maze_visited_positions: Optional[Set[Tuple[int, int]]] = None
@@ -129,6 +130,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._episode_step = 0
         self._episode_successes = []
         self._episode_lengths = []
+        self._episode_rewards = []
         self._maze_visited_positions = set() if self._is_maze_inner_env() else None
         # Use provided task, or fall back to initial task from dataset
         self._task = task if task is not None else self._initial_task
@@ -221,6 +223,7 @@ class MultiEpisodeEnv(BaseEnv):
             # Record the just-finished episode.
             self._episode_successes.append(success)
             self._episode_lengths.append(self._episode_step)
+            self._episode_rewards.append(float(env_reward))
 
             if not outer_done:
                 # If reflection is enabled, we prompt for reflection instead of immediate reset
@@ -266,6 +269,7 @@ class MultiEpisodeEnv(BaseEnv):
             # Current episode didn't complete, count it as attempted but not successful
             self._episode_successes.append(False)
             self._episode_lengths.append(self._episode_step)
+            self._episode_rewards.append(0.0)
 
         # Augment info with multi-episode metadata
         augmented_info = self._augment_info(
@@ -370,9 +374,12 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode/total_steps": self.total_step_cap,
                 "episode/truncated": 1.0,
             }
+            if self._episode_rewards:
+                metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
+                metrics["episode/max_reward"] = max(self._episode_rewards)
             if self._maze_visited_positions is not None:
                 metrics["maze/unique_visited_states"] = float(len(self._maze_visited_positions))
-            
+
             for idx in range(1, minimum_episodes + 1):
                 if idx <= len(self._episode_successes):
                     metrics[f"episode_{idx}/success_rate"] = 1.0 if self._episode_successes[idx - 1] else 0.0
@@ -382,7 +389,11 @@ class MultiEpisodeEnv(BaseEnv):
                     metrics[f"episode_{idx}/steps"] = self._episode_lengths[idx - 1]
                 else:
                     metrics[f"episode_{idx}/steps"] = max_turns
-            
+                if idx <= len(self._episode_rewards):
+                    metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+                else:
+                    metrics[f"episode_{idx}/reward"] = 0.0
+
             return metrics
         
         # Normal completion: use recorded episode data
@@ -396,6 +407,9 @@ class MultiEpisodeEnv(BaseEnv):
             "episode/total_steps": self._total_steps,
             "episode/truncated": 0.0,
         }
+        if self._episode_rewards:
+            metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
+            metrics["episode/max_reward"] = max(self._episode_rewards)
         if self._maze_visited_positions is not None:
             metrics["maze/unique_visited_states"] = float(len(self._maze_visited_positions))
 
@@ -410,6 +424,12 @@ class MultiEpisodeEnv(BaseEnv):
                 metrics[f"episode_{idx}/steps"] = self._episode_lengths[idx - 1]
             else:
                 metrics[f"episode_{idx}/steps"] = -1  # Will be filtered
+
+        for idx in range(1, minimum_episodes + 1):
+            if idx <= len(self._episode_rewards):
+                metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+            else:
+                metrics[f"episode_{idx}/reward"] = -1.0  # Will be filtered
 
         return metrics
 
@@ -432,6 +452,7 @@ class MultiEpisodeEnv(BaseEnv):
         info: Dict[str, Any] = {
             "multi_episode": True,
             "episode_successes": list(self._episode_successes),
+            "episode_rewards": list(self._episode_rewards),
             "success_count": sum(self._episode_successes),
             "num_episodes": len(self._episode_successes),
             "total_steps": self._total_steps,
