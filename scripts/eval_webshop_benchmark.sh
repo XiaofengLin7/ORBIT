@@ -28,6 +28,7 @@ source /share/pkg.7/miniconda/23.1.0/install/etc/profile.d/conda.sh
 conda activate icx
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export MKL_THREADING_LAYER=GNU  # Avoid MKL/libgomp conflict in vLLM workers
 
 # Verify prerequisites
 if [ ! -f ".cache/webshop/webshop.db" ]; then
