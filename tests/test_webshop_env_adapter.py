@@ -95,6 +95,7 @@ class TestActionUnwrapping:
 
     @needs_webshop_data
     def test_action_object(self):
+        from rllm.agents.agent import Action
         from envs.webshop_env_adapter import WebShopEnvAdapter
 
         adapter = WebShopEnvAdapter.from_dict({
@@ -104,9 +105,8 @@ class TestActionUnwrapping:
         })
         adapter.reset(seed=0)
 
-        # Create a mock Action object
-        action = MagicMock()
-        action.action = "\\boxed{search[laptop]}"
+        # Use a real Action object so isinstance() check works
+        action = Action(action="\\boxed{search[laptop]}")
         obs, reward, done, info = adapter.step(action)
         assert isinstance(obs, str)
         assert isinstance(reward, float)

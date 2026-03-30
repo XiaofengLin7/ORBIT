@@ -16,6 +16,7 @@ set -x
 #          --input .cache/webshop/resources \
 #          --index .cache/webshop/indexes \
 #          --generator DefaultLuceneDocumentGenerator \
+#          --storeRaw \
 #          --threads 4
 #
 #   3. Download spaCy model (run once):
