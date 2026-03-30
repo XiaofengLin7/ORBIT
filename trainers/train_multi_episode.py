@@ -75,7 +75,8 @@ def run_ppo_agent(
         )
     )
 
-    timeline_json_file = config.ray_init.get("timeline_json_file", None)
+    ray_init_cfg = config.get("ray_init", None)
+    timeline_json_file = ray_init_cfg.get("timeline_json_file", None) if ray_init_cfg else None
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
 
