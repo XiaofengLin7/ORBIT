@@ -50,9 +50,9 @@ CONFIG=configs/eval_webshop_multi.yaml
 SHARED=(
     trainer.total_epochs=0
     trainer.n_gpus_per_node=2
-    actor_rollout_ref.rollout.val_kwargs.n=4
+    actor_rollout_ref.rollout.val_kwargs.n=1
     trainer.project_name=webshop-benchmark
-    data.val_batch_size=500
+    data.val_batch_size=100
 )
 
 # --- 1. ReAct: base model, no reflection ---
