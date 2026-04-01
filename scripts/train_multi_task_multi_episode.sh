@@ -28,7 +28,7 @@ EXPERIMENT_NAME="gem-multi-task-${CONFIG_NAME}-${MODEL_NAME}"
 # Multi-episode via environment wrapper (uses AgentExecutionEngine instead of workflow)
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
-    data.val_batch_size=134 \
+    data.val_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=31744 \
     +data.tasks_config_path="$TASKS_CONFIG" \
