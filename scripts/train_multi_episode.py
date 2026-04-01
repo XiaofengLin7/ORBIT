@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agents.gem_text_agent import GEMTextAgent  # noqa: E402
+from agents.gem_text_agent_noncumulative import GEMTextAgentNonCumulative  # noqa: E402
 from data.prepare_gem_data import (  # noqa: E402
     prepare_gem_data,
     prepare_multi_task_gem_data,
@@ -30,6 +31,12 @@ from data.prepare_gem_data import (  # noqa: E402
 from envs.multi_episode_env import MultiEpisodeEnv  # noqa: E402
 from rllm.data import DatasetRegistry  # type: ignore  # noqa: E402
 from trainers.train_multi_episode import run_ppo_agent  # noqa: E402
+
+AGENT_CLASSES = {
+    "math_agent": GEMTextAgent,
+    "gem_text_agent": GEMTextAgent,
+    "gem_text_agent_noncumulative": GEMTextAgentNonCumulative,
+}
 
 
 def _default_multi_episode_prompt() -> str:
@@ -102,11 +109,15 @@ def main(cfg) -> None:  # type: ignore
     agent_args = dict(agent_args or {})
     agent_args.setdefault("system_prompt", _default_multi_episode_prompt())
 
+    # Resolve agent class from config (supports action-only non-cumulative agent)
+    agent_name = cfg.rllm.agent.get("name", "math_agent")
+    agent_class = AGENT_CLASSES.get(agent_name, GEMTextAgent)
+
     # Use our custom training function that uses MultiEpisodeAgentPPOTrainer
     run_ppo_agent(
         cfg,
         env_class=MultiEpisodeEnv,
-        agent_class=GEMTextAgent,
+        agent_class=agent_class,
         agent_args=agent_args,
     )
 

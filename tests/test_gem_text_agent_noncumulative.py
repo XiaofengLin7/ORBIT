@@ -291,6 +291,28 @@ class TestMultiEpisodeTrajectory:
         assert _assistant_contents(agent) == ["\\boxed{2}"]
 
 
+class TestNoSystemPrompt:
+    """Agent without system_prompt works (for envs that provide instructions as observations)."""
+
+    def test_no_system_message(self):
+        agent = GEMTextAgentNonCumulative()  # no system_prompt
+        agent.update_from_env("You are an agent. Do the task.", reward=0.0, done=False, info={})
+        agent.update_from_model("<think>ok</think>\\boxed{action1}")
+
+        msgs = agent.chat_completions
+        assert msgs[0]["role"] == "user"  # no system message
+        assert len(msgs) == 2  # user + assistant
+
+    def test_with_system_prompt(self):
+        agent = GEMTextAgentNonCumulative(system_prompt="You are helpful.")
+        agent.update_from_env("obs", reward=0.0, done=False, info={})
+
+        msgs = agent.chat_completions
+        assert msgs[0]["role"] == "system"
+        assert msgs[0]["content"] == "You are helpful."
+        assert len(msgs) == 2  # system + user
+
+
 class TestNoThinkTag:
     """Responses without <think> tags should work normally."""
 

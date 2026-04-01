@@ -42,7 +42,7 @@ class GEMTextAgentNonCumulative(BaseAgent):
     """
 
     def __init__(self, system_prompt: str | None = None, max_steps: int = 20):
-        self.system_prompt = system_prompt or "Solve the task. Return your final answer inside \\boxed{}."
+        self.system_prompt = system_prompt
         self.max_steps = max_steps
         self._messages: list[dict[str, str]] = []
         self._trajectory = Trajectory()
@@ -57,8 +57,10 @@ class GEMTextAgentNonCumulative(BaseAgent):
         return self._trajectory
 
     def reset(self):
-        """Clear history and trajectory; re-add system prompt."""
-        self._messages = [{"role": "system", "content": self.system_prompt}]
+        """Clear history and trajectory; re-add system prompt if provided."""
+        self._messages = []
+        if self.system_prompt:
+            self._messages.append({"role": "system", "content": self.system_prompt})
         self._trajectory = Trajectory()
 
     def update_from_env(self, observation: Any, reward: float, done: bool, info: dict, **kwargs):

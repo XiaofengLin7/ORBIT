@@ -96,12 +96,16 @@ SHARED=(
 
 if [ "$ACTION_ONLY" = "1" ]; then
     echo "Action-only mode: stepwise advantage + non-cumulative context"
+    EXP_SUFFIX="-action-only"
     SHARED+=(
         rllm.stepwise_advantage.enable=True
         rllm.stepwise_advantage.mode=broadcast
         data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-16384}
         data.max_response_length=${ACTION_ONLY_RESPONSE_LEN:-4096}
+        rllm.agent.name=gem_text_agent_noncumulative
     )
+else
+    EXP_SUFFIX=""
 fi
 
 # --- 1. ReAct: base model, no reflection ---
@@ -112,7 +116,7 @@ fi
 # bash scripts/train_multi_task_multi_episode.sh \
 #     "${SHARED[@]}" \
 #     +rllm.env.env_args.enable_reflection=False \
-#     trainer.experiment_name="webshop-react-qwen3-8b"
+#     trainer.experiment_name="webshop-react-qwen3-8b${EXP_SUFFIX}"
 # echo "ReAct completed with exit code: $?"
 
 # # --- 2. Reflexion: base model, with reflection ---
@@ -123,7 +127,7 @@ fi
 # bash scripts/train_multi_task_multi_episode.sh \
 #     "${SHARED[@]}" \
 #     +rllm.env.env_args.enable_reflection=True \
-#     trainer.experiment_name="webshop-reflexion-qwen3-8b"
+#     trainer.experiment_name="webshop-reflexion-qwen3-8b${EXP_SUFFIX}"
 # echo "Reflexion completed with exit code: $?"
 
 # --- 3. ORBIT: fine-tuned model, with reflection ---
@@ -134,7 +138,7 @@ TASKS_CONFIG="$CONFIG" MODEL_PATH="$ORBIT_MODEL" \
 bash scripts/train_multi_task_multi_episode.sh \
     "${SHARED[@]}" \
     +rllm.env.env_args.enable_reflection=False \
-    trainer.experiment_name="webshop-orbit-actor-hf-no-reflection"
+    trainer.experiment_name="webshop-orbit-actor-hf-no-reflection${EXP_SUFFIX}"
 echo "ORBIT completed with exit code: $?"
 
 # --- 4. GPU keep-alive ---
