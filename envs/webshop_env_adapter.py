@@ -48,11 +48,13 @@ class WebShopEnvAdapter(BaseEnv):
         max_turns = env_kwargs.pop("max_turns", 15)
         error_tolerance = env_kwargs.pop("error_tolerance", 15)
         format_error_reward = env_kwargs.pop("format_error_reward", -0.1)
+        enable_purchase_feedback = env_kwargs.pop("enable_purchase_feedback", False)
 
         self.env_id = env_id
         self._split = split
         self._observation_mode = observation_mode
         self._max_turns = max_turns
+        self._enable_purchase_feedback = bool(enable_purchase_feedback)
 
         # Construct GEM env_id: e.g. "webshop:test-text"
         gem_env_id = f"webshop:{split}-{observation_mode}"
@@ -170,10 +172,16 @@ class WebShopEnvAdapter(BaseEnv):
             )
         if terminated and not truncated and reward > 0:
             # Partial match — show score only, no success/failure label
-            return f"Your score: {reward:.2f} / 1.00."
+            msg = f"Your score: {reward:.2f} / 1.00."
+            if self._enable_purchase_feedback:
+                msg += "\n" + self._build_option_feedback()
+            return msg
         if terminated and not truncated:
             # Zero reward (total mismatch or error tolerance exceeded)
-            return "You failed."
+            msg = "You failed."
+            if self._enable_purchase_feedback:
+                msg += "\n" + self._build_option_feedback()
+            return msg
         if truncated:
             return (
                 f"Episode stopped because max_turns ({self._max_turns}) was reached. "
@@ -181,6 +189,44 @@ class WebShopEnvAdapter(BaseEnv):
             )
         # Normal (non-terminal) step — keep standard format
         return info.get("prefix", "") + obs + info.get("suffix", "")
+
+    def _build_option_feedback(self) -> str:
+        """Build concise diagnostic showing required vs. selected options."""
+        try:
+            session_id = self._env.session
+            session = self._env.server.user_sessions[session_id]
+            goal_options = session["goal"].get("goal_options", {})
+            purchased_options = session.get("options", {})
+        except (AttributeError, KeyError):
+            return ""
+
+        if not goal_options:
+            return ""
+
+        if isinstance(goal_options, dict):
+            required_parts = [f"{k}={v}" for k, v in goal_options.items()]
+        else:
+            required_parts = [str(o) for o in goal_options]
+
+        if purchased_options:
+            selected_parts = [f"{k}={v}" for k, v in purchased_options.items()]
+        else:
+            selected_parts = ["(none)"]
+
+        lines = [
+            f"Required options: {', '.join(required_parts)}",
+            f"Your selections: {', '.join(selected_parts)}",
+        ]
+
+        if isinstance(goal_options, dict):
+            missed = [k for k in goal_options if k not in purchased_options]
+            if missed:
+                lines.append(
+                    f"You forgot to select: {', '.join(missed)}. "
+                    f"Click the option on the product page before clicking buy."
+                )
+
+        return "\n".join(lines)
 
     def close(self) -> None:
         """No-op — WebshopEnv has no resources to release."""
@@ -202,6 +248,7 @@ class WebShopEnvAdapter(BaseEnv):
             "observation_mode",
             "error_tolerance",
             "format_error_reward",
+            "enable_purchase_feedback",
         )
         for key in passthrough_keys:
             if key in info and key not in env_kwargs:

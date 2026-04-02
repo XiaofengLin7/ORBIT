@@ -20,3 +20,4 @@ val_tasks:
     inner_env_class: 'envs.webshop_env_adapter.WebShopEnvAdapter'
     split: "test"
     observation_mode: "text"
+    enable_purchase_feedback: true # Show required vs. selected options on purchase
