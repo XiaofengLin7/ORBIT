@@ -87,7 +87,7 @@ ACTION_ONLY=${ACTION_ONLY:-0}
 SHARED=(
     trainer.total_epochs=0
     trainer.n_gpus_per_node=2
-    actor_rollout_ref.rollout.val_kwargs.n=1
+    actor_rollout_ref.rollout.val_kwargs.n=4
     trainer.project_name=webshop-benchmark
     data.val_batch_size=100
     data.max_response_length=$((MAX_CTX - 1024))
@@ -100,7 +100,7 @@ if [ "$ACTION_ONLY" = "1" ]; then
     SHARED+=(
         rllm.stepwise_advantage.enable=True
         rllm.stepwise_advantage.mode=broadcast
-        data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-16384}
+        data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-32768}
         data.max_response_length=${ACTION_ONLY_RESPONSE_LEN:-4096}
         rllm.agent.name=gem_text_agent_noncumulative
     )
@@ -119,7 +119,7 @@ fi
 #     trainer.experiment_name="webshop-react-qwen3-8b${EXP_SUFFIX}"
 # echo "ReAct completed with exit code: $?"
 
-# # --- 2. Reflexion: base model, with reflection ---
+# --- 2. Reflexion: base model, with reflection ---
 # echo "=========================================="
 # echo "[2/3] Reflexion: Qwen3-8B, with reflection"
 # echo "=========================================="
@@ -141,8 +141,22 @@ bash scripts/train_multi_task_multi_episode.sh \
     trainer.experiment_name="webshop-orbit-actor-hf-no-reflection${EXP_SUFFIX}"
 echo "ORBIT completed with exit code: $?"
 
-# --- 4. GPU keep-alive ---
+# --- 4. ORBIT action-only: fine-tuned model, action-only context ---
+# echo "=========================================="
+# echo "[4/4] ORBIT action-only: actor_hf, no reflection, action-only"
+# echo "=========================================="
+# TASKS_CONFIG="$CONFIG" MODEL_PATH="$ORBIT_MODEL" \
+# bash scripts/train_multi_task_multi_episode.sh \
+#     "${SHARED[@]}" \
+#     rllm.stepwise_advantage.enable=True \
+#     rllm.stepwise_advantage.mode=broadcast \
+#     data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-32768} \
+#     data.max_response_length=${ACTION_ONLY_RESPONSE_LEN:-4096} \
+#     rllm.agent.name=gem_text_agent_noncumulative \
+#     +rllm.env.env_args.enable_reflection=False \
+#     trainer.experiment_name="webshop-orbit-actor-hf-no-reflection-action-only"
+# echo "ORBIT action-only completed with exit code: $?"
+
 echo "=========================================="
-echo "All WebShop evaluations complete. Starting GPU keep-alive..."
+echo "All WebShop evaluations complete."
 echo "=========================================="
-CUDA_VISIBLE_DEVICES=0 python /projectnb/replearn/xfl/REIL/data/dummy.py --gpus 0

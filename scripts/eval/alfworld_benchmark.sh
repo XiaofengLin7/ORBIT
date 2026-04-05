@@ -77,7 +77,7 @@ if [ "$ACTION_ONLY" = "1" ]; then
     SHARED+=(
         rllm.stepwise_advantage.enable=True
         rllm.stepwise_advantage.mode=broadcast
-        data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-16384}
+        data.max_prompt_length=${ACTION_ONLY_PROMPT_LEN:-32768}
         data.max_response_length=${ACTION_ONLY_RESPONSE_LEN:-4096}
         rllm.agent.name=gem_text_agent_noncumulative
     )
@@ -118,8 +118,6 @@ echo "Reflexion completed with exit code: $?"
 #     trainer.experiment_name="alfworld-orbit-actor-hf-reflection${EXP_SUFFIX}"
 # echo "ORBIT completed with exit code: $?"
 
-# --- 4. GPU keep-alive ---
 echo "=========================================="
-echo "All evaluations complete. Starting GPU keep-alive..."
+echo "All evaluations complete."
 echo "=========================================="
-CUDA_VISIBLE_DEVICES=0 python /projectnb/replearn/xfl/REIL/data/dummy.py --gpus 0

@@ -6,7 +6,7 @@ This script uses the rLLM AgentExecutionEngine to evaluate OpenAI models
 It collects per-episode metrics and aggregates them by task type.
 
 Example usage:
-    python scripts/eval_openai.py \
+    python scripts/eval/openai.py \
         --config configs/eval_config.yaml \
         --model gpt-4o-mini \
         --n-parallel 32 \

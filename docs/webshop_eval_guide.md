@@ -69,7 +69,7 @@ Evaluates any OpenAI-compatible model (GPT, or a locally-served model via vLLM/S
 
 ```bash
 # Multi-episode (3 episodes x 15 turns per task, 500 test tasks)
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_webshop_multi.yaml \
     --model gpt-4o-mini \
     --env-mode multi \
@@ -77,7 +77,7 @@ python scripts/eval_openai.py \
     --output results/webshop_multi.json
 
 # Single-episode
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_webshop_multi.yaml \
     --model gpt-4o-mini \
     --env-mode single \
@@ -87,7 +87,7 @@ python scripts/eval_openai.py \
 
 To evaluate a locally-served model (e.g. via vLLM):
 ```bash
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_webshop_multi.yaml \
     --model Qwen/Qwen3-8B \
     --base-url http://localhost:8000/v1 \
@@ -101,7 +101,7 @@ Or use the shell wrapper with env var overrides:
 CONFIG=configs/eval_webshop_multi.yaml \
 MODEL=gpt-4o-mini \
 N_PARALLEL=32 \
-bash scripts/run_eval_openai.sh
+bash scripts/eval/openai.sh
 ```
 
 Key flags:
@@ -116,7 +116,7 @@ Key flags:
 Runs ReAct, Reflexion, and ORBIT baselines using the VERL training pipeline with zero training epochs:
 
 ```bash
-bash scripts/eval_webshop_benchmark.sh
+bash scripts/eval/webshop_benchmark.sh
 ```
 
 Edit the script to configure:

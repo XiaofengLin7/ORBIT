@@ -2,7 +2,7 @@
 """Evaluate a random policy on the GridEnvAdapter.
 
 Usage:
-    python scripts/eval_grid_random_policy.py --n 4 --m 4 --episodes 1000 --max-steps 7
+    python scripts/eval/grid_random_policy.py --n 4 --m 4 --episodes 1000 --max-steps 7
 """
 
 from __future__ import annotations

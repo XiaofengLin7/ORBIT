@@ -26,7 +26,7 @@ Evaluates any OpenAI-compatible model (GPT, or a locally-served model via vLLM/S
 
 ```bash
 # Single-episode (1 episode per task)
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_alfworld.yaml \
     --model gpt-4o-mini \
     --env-mode single \
@@ -34,7 +34,7 @@ python scripts/eval_openai.py \
     --output results/alfworld_single.json
 
 # Multi-episode (3 episodes x 10 turns per task)
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_alfworld_multi.yaml \
     --model gpt-4o-mini \
     --env-mode multi \
@@ -44,7 +44,7 @@ python scripts/eval_openai.py \
 
 To evaluate a locally-served model (e.g. via vLLM):
 ```bash
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config configs/eval_alfworld_multi.yaml \
     --model Qwen/Qwen3-8B \
     --base-url http://localhost:8000/v1 \
@@ -66,7 +66,7 @@ Runs ReAct, Reflexion, and ORBIT baselines using the VERL training pipeline with
 
 ```bash
 export ALFWORLD_DATA=/path/to/alfworld_data
-bash scripts/eval_alfworld_benchmark.sh
+bash scripts/eval/alfworld_benchmark.sh
 ```
 
 Edit the script to configure `BASE_MODEL`, `ORBIT_MODEL`, and which baselines to run.
