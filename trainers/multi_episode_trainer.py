@@ -170,6 +170,10 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                         try:
                             env_metrics = env.get_metrics()
                             if isinstance(env_metrics, dict):
+                                # Attach task_type from env property (not in metrics dict)
+                                tt = getattr(env, "task_type", None)
+                                if tt is not None:
+                                    env_metrics["_task_type"] = tt
                                 batch_env_metrics.append(env_metrics)
                                 # Get data_source for this environment (should match batch order)
                                 if idx < len(batch_data_sources):
@@ -237,26 +241,37 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                     if data_source not in data_source_metrics:
                         data_source_metrics[data_source] = []
                     data_source_metrics[data_source].append(metrics)
-                
-                # Aggregate metrics per data_source
-                for data_source, metrics_list in data_source_metrics.items():
-                    # Collect all metric keys for this data_source
+
+                def _aggregate_numeric_metrics(metrics_list, prefix):
+                    """Aggregate numeric metrics, filtering -1 placeholders and string values."""
                     all_keys = set()
                     for metrics in metrics_list:
                         all_keys.update(metrics.keys())
-                    
-                    # Aggregate each metric (filter out -1 values as they indicate missing episodes)
                     for key in all_keys:
+                        if key.startswith("_"):
+                            continue  # Skip internal keys (_task_type, etc.)
                         values = []
                         for metrics in metrics_list:
                             if key in metrics:
                                 value = metrics[key]
-                                # Filter out -1 values (missing episodes)
                                 if isinstance(value, (int, float)) and value >= 0:
                                     values.append(float(value))
                         if values:
-                            # Log with data_source prefix
-                            metric_dict[f"val/{data_source}/{key}"] = np.mean(values)
+                            metric_dict[f"{prefix}/{key}"] = np.mean(values)
+
+                # Aggregate metrics per data_source (overall + per task_type)
+                for data_source, metrics_list in data_source_metrics.items():
+                    # Overall aggregation for this data_source
+                    _aggregate_numeric_metrics(metrics_list, f"val/{data_source}")
+
+                    # Sub-group by task_type if present
+                    task_type_groups = {}
+                    for metrics in metrics_list:
+                        tt = metrics.get("_task_type")
+                        if tt is not None:
+                            task_type_groups.setdefault(tt, []).append(metrics)
+                    for task_type, tt_metrics_list in task_type_groups.items():
+                        _aggregate_numeric_metrics(tt_metrics_list, f"val/{data_source}/{task_type}")
 
         # Disable validation mode
         self._is_validation_mode = False

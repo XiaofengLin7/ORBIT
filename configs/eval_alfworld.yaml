@@ -1,0 +1,45 @@
+# Dummy train_tasks required by prepare_multi_task_gem_data (eval-only: total_epochs=0)
+train_tasks:
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    total_step_cap: 9
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 32
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+val_tasks:
+  - env_id: "alfworld"
+    max_turns_per_episode: 10
+    total_step_cap: 30   # 3 episodes x 10 turns
+    test_size: 134        # valid_unseen game count
+    inner_env_class: 'envs.alfworld_env_adapter.ALFWorldEnvAdapter'
+    eval_split: "eval_out_of_distribution"
+    config_path: "configs/config_alfworld_tw.yaml"
+
+  # - env_id: "maze"
+  #   max_turns_per_episode: 9
+  #   shortest_path_max_length: 8
+  #   shortest_path_min_length: 7
+  #   total_step_cap: 27
+  #   test_size: 256
+  #   inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+  #   shapes:  [[6,6],[7,6],[7,7],[6,7]]
+
+  # - env_id: "game:Mastermind-v0-random"
+  #   max_turns_per_episode: 3
+  #   total_step_cap: 9
+  #   code_length: 3
+  #   num_numbers: 6
+  #   duplicate_numbers: False
+  #   test_size: 256
+  #   inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+  # - env_id: "grid"
+  #   max_turns_per_episode: 9
+  #   total_step_cap: 27
+  #   test_size: 256
+  #   inner_env_class: 'envs.grid_env_adapter.GridEnvAdapter'
+  #   n: 4
+  #   m: 4

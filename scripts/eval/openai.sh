@@ -2,8 +2,8 @@
 set -x
 
 # OpenAI Model Evaluation Script
-# Usage: bash scripts/run_eval_openai.sh
-# Override parameters with environment variables or append args: bash scripts/run_eval_openai.sh --temperature 0.5
+# Usage: bash scripts/eval/openai.sh
+# Override parameters with environment variables or append args: bash scripts/eval/openai.sh --temperature 0.5
 
 # Model configuration
 MODEL=${MODEL:-gpt-5.2}
@@ -41,7 +41,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT=${OUTPUT:-${OUTPUT_DIR}/eval_${MODEL_SAFE}_${CONFIG_NAME}_${TIMESTAMP}.json}
 
 # Run evaluation
-python scripts/eval_openai.py \
+python scripts/eval/openai.py \
     --config "$CONFIG" \
     --model "$MODEL" \
     --base-url "$BASE_URL" \

@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Type
 from rllm.agents.agent import Action  # type: ignore
 from rllm.environments.base.base_env import BaseEnv  # type: ignore
 
-from prompts.prompt import reflection_prompt
+from prompts.prompt import reflection_prompt_2 as reflection_prompt
 
 class MultiEpisodeEnv(BaseEnv):
     """Wrapper environment that runs multiple episodes of an inner environment.
@@ -78,6 +78,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._episode_step: int = 0
         self._episode_successes: List[bool] = []
         self._episode_lengths: List[int] = []
+        self._episode_rewards: List[float] = []
         # Maze-only: track unique visited positions across the full trajectory.
         # This is intentionally scoped to Maze to keep this wrapper simple.
         self._maze_visited_positions: Optional[Set[Tuple[int, int]]] = None
@@ -85,6 +86,8 @@ class MultiEpisodeEnv(BaseEnv):
         self._seed: Optional[int] = None
         # Store the initial task from dataset (extracted in from_dict)
         self._initial_task: Optional[dict] = None
+        # Task type (e.g. ALFWorld task category), captured from inner env info
+        self._task_type: Optional[str] = None
 
         # Reflection state
         self._waiting_for_reflection: bool = False
@@ -127,6 +130,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._episode_step = 0
         self._episode_successes = []
         self._episode_lengths = []
+        self._episode_rewards = []
         self._maze_visited_positions = set() if self._is_maze_inner_env() else None
         # Use provided task, or fall back to initial task from dataset
         self._task = task if task is not None else self._initial_task
@@ -137,6 +141,9 @@ class MultiEpisodeEnv(BaseEnv):
         # Reset inner environment
         observation, info = self._reset_inner_env()
         self._maybe_track_maze_state()
+        # Capture task_type from inner env if provided (e.g. ALFWorld task category)
+        if isinstance(info, dict) and "task_type" in info:
+            self._task_type = info["task_type"]
 
         # Format observation with episode header
         observation = self._format_observation(observation, self._episode_index)
@@ -214,8 +221,14 @@ class MultiEpisodeEnv(BaseEnv):
         # Handle episode completion
         if inner_done:
             # Record the just-finished episode.
+            # Use raw_reward from info when available (e.g. WebShop stores the
+            # continuous 0-1 score there while env_reward is binarized for
+            # success determination).
             self._episode_successes.append(success)
             self._episode_lengths.append(self._episode_step)
+            self._episode_rewards.append(
+                float(info.get("raw_reward", env_reward))
+            )
 
             if not outer_done:
                 # If reflection is enabled, we prompt for reflection instead of immediate reset
@@ -261,6 +274,7 @@ class MultiEpisodeEnv(BaseEnv):
             # Current episode didn't complete, count it as attempted but not successful
             self._episode_successes.append(False)
             self._episode_lengths.append(self._episode_step)
+            self._episode_rewards.append(0.0)
 
         # Augment info with multi-episode metadata
         augmented_info = self._augment_info(
@@ -365,9 +379,12 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode/total_steps": self.total_step_cap,
                 "episode/truncated": 1.0,
             }
+            if self._has_continuous_rewards() and self._episode_rewards:
+                metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
+                metrics["episode/max_reward"] = max(self._episode_rewards)
             if self._maze_visited_positions is not None:
                 metrics["maze/unique_visited_states"] = float(len(self._maze_visited_positions))
-            
+
             for idx in range(1, minimum_episodes + 1):
                 if idx <= len(self._episode_successes):
                     metrics[f"episode_{idx}/success_rate"] = 1.0 if self._episode_successes[idx - 1] else 0.0
@@ -377,7 +394,12 @@ class MultiEpisodeEnv(BaseEnv):
                     metrics[f"episode_{idx}/steps"] = self._episode_lengths[idx - 1]
                 else:
                     metrics[f"episode_{idx}/steps"] = max_turns
-            
+                if self._has_continuous_rewards():
+                    if idx <= len(self._episode_rewards):
+                        metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+                    else:
+                        metrics[f"episode_{idx}/reward"] = 0.0
+
             return metrics
         
         # Normal completion: use recorded episode data
@@ -391,6 +413,9 @@ class MultiEpisodeEnv(BaseEnv):
             "episode/total_steps": self._total_steps,
             "episode/truncated": 0.0,
         }
+        if self._has_continuous_rewards() and self._episode_rewards:
+            metrics["episode/avg_reward"] = sum(self._episode_rewards) / len(self._episode_rewards)
+            metrics["episode/max_reward"] = max(self._episode_rewards)
         if self._maze_visited_positions is not None:
             metrics["maze/unique_visited_states"] = float(len(self._maze_visited_positions))
 
@@ -405,6 +430,13 @@ class MultiEpisodeEnv(BaseEnv):
                 metrics[f"episode_{idx}/steps"] = self._episode_lengths[idx - 1]
             else:
                 metrics[f"episode_{idx}/steps"] = -1  # Will be filtered
+
+        if self._has_continuous_rewards():
+            for idx in range(1, minimum_episodes + 1):
+                if idx <= len(self._episode_rewards):
+                    metrics[f"episode_{idx}/reward"] = self._episode_rewards[idx - 1]
+                else:
+                    metrics[f"episode_{idx}/reward"] = -1.0  # Will be filtered
 
         return metrics
 
@@ -427,6 +459,7 @@ class MultiEpisodeEnv(BaseEnv):
         info: Dict[str, Any] = {
             "multi_episode": True,
             "episode_successes": list(self._episode_successes),
+            "episode_rewards": list(self._episode_rewards),
             "success_count": sum(self._episode_successes),
             "num_episodes": len(self._episode_successes),
             "total_steps": self._total_steps,
@@ -436,6 +469,19 @@ class MultiEpisodeEnv(BaseEnv):
         if self._maze_visited_positions is not None:
             info["unique_visited_states"] = len(self._maze_visited_positions)
         return info
+
+    def _has_continuous_rewards(self) -> bool:
+        """Return True iff the inner env uses continuous (non-binary) rewards.
+
+        Currently only WebShop has continuous 0-1 partial match scores.
+        Other envs use binary rewards so avg_reward would just duplicate
+        success_rate — we skip emitting reward metrics for them.
+        """
+        try:
+            from envs.webshop_env_adapter import WebShopEnvAdapter
+        except Exception:
+            return False
+        return isinstance(self.inner_env, WebShopEnvAdapter)
 
     def _is_maze_inner_env(self) -> bool:
         """Return True iff the wrapped env is `MazeEnvAdapter`."""
@@ -455,6 +501,11 @@ class MultiEpisodeEnv(BaseEnv):
         except Exception:
             # Tracking must never break the main env loop.
             return
+
+    @property
+    def task_type(self) -> Optional[str]:
+        """Task type captured from inner env (e.g. ALFWorld task category)."""
+        return self._task_type
 
     @property
     def is_correct(self) -> bool:

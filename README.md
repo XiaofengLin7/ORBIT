@@ -155,10 +155,10 @@ Run OpenAI evaluation via the helper script:
 
 ```bash
 # Default: single-episode
-bash scripts/run_eval_openai.sh
+bash scripts/eval/openai.sh
 
 # Multi-episode
-ENV_MODE=multi bash scripts/run_eval_openai.sh
+ENV_MODE=multi bash scripts/eval/openai.sh
 ```
 
 Key parameters (via env vars or CLI overrides):
@@ -173,7 +173,7 @@ Key parameters (via env vars or CLI overrides):
 
 ## Outputs and metrics
 
-Evaluation outputs are written into `results/` by default and chat completions are also logged (see `--log-chat-completions` in `scripts/run_eval_openai.sh`).
+Evaluation outputs are written into `results/` by default and chat completions are also logged (see `--log-chat-completions` in `scripts/eval/openai.sh`).
 
 Logged metrics:
 - `episode/success_rate`: 1.0 if episode succeeded, 0.0 otherwise

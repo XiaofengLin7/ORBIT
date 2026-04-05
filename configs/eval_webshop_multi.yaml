@@ -1,0 +1,23 @@
+# Shared config for WebShop benchmark: ReAct, Reflexion, ORBIT
+# All methods use 3 episodes x 15 turns. Differences (model, reflection) via Hydra overrides.
+
+# Dummy train_tasks required by prepare_multi_task_gem_data (eval-only: total_epochs=0)
+train_tasks:
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    total_step_cap: 9
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 32
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+val_tasks:
+  - env_id: "webshop"
+    max_turns_per_episode: 10       # WebShop default
+    total_step_cap: 30              # 3 episodes x 10 turns
+    test_size: 100                  # subset; deterministic seeding ensures same tasks each run
+    inner_env_class: 'envs.webshop_env_adapter.WebShopEnvAdapter'
+    split: "test"
+    observation_mode: "text"
+    enable_purchase_feedback: true # Show required vs. selected options on purchase
