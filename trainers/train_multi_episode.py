@@ -37,6 +37,7 @@ def run_ppo_agent(
     agent_args: dict | None = None,
     val_env_class: type | None = None,
     val_env_args: dict | None = None,
+    summarization_config: dict | None = None,
 ) -> None:
     """Run PPO agent training with custom multi-episode trainer.
 
@@ -50,6 +51,8 @@ def run_ppo_agent(
             this class instead of env_class during validation.
         val_env_args: Optional validation environment arguments. If provided,
             these override env_args during validation.
+        summarization_config: Optional summarization config dict.  When provided
+            (and ``enable`` is truthy), uses SummarizingAgentExecutionEngine.
     """
     if not ray.is_initialized():
         if config is not None and hasattr(config, "ray_init"):
@@ -77,6 +80,7 @@ def run_ppo_agent(
             agent_args=agent_args,
             val_env_class=val_env_class,
             val_env_args=val_env_args,
+            summarization_config=summarization_config,
         )
     )
 
@@ -105,6 +109,7 @@ class MultiEpisodeTaskRunner:
         agent_run_func: Any | None = None,
         val_env_class: type | None = None,
         val_env_args: dict | None = None,
+        summarization_config: dict | None = None,
     ) -> None:
         """Execute the main PPO training workflow with multi-episode support."""
         from pprint import pprint
@@ -258,6 +263,7 @@ class MultiEpisodeTaskRunner:
                 agent_args=agent_args,
                 val_env_class=val_env_class,
                 val_env_args=val_env_args,
+                summarization_config=summarization_config,
             )
 
         trainer.init_workers()

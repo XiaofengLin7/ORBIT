@@ -24,6 +24,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from agents.gem_text_agent import GEMTextAgent  # noqa: E402
 from agents.gem_text_agent_noncumulative import GEMTextAgentNonCumulative  # noqa: E402
+from agents.context_summarizer import (  # noqa: E402
+    GEMTextAgentWithSummarization,
+    GEMTextAgentNonCumulativeWithSummarization,
+)
 from data.prepare_gem_data import (  # noqa: E402
     prepare_gem_data,
     prepare_multi_task_gem_data,
@@ -36,6 +40,8 @@ AGENT_CLASSES = {
     "math_agent": GEMTextAgent,
     "gem_text_agent": GEMTextAgent,
     "gem_text_agent_noncumulative": GEMTextAgentNonCumulative,
+    "gem_text_agent_summarizing": GEMTextAgentWithSummarization,
+    "gem_text_agent_noncumulative_summarizing": GEMTextAgentNonCumulativeWithSummarization,
 }
 
 
@@ -113,12 +119,31 @@ def main(cfg) -> None:  # type: ignore
     agent_name = cfg.rllm.agent.get("name", "math_agent")
     agent_class = AGENT_CLASSES.get(agent_name, GEMTextAgent)
 
+    # Extract summarization config (if present) and merge into agent_args.
+    summarization_config = OmegaConf.to_container(
+        cfg.rllm.agent.get("summarization", {}), resolve=True
+    ) or {}
+    if summarization_config.get("enable"):
+        for key in (
+            "summarization_threshold_tokens",
+            "summary_max_tokens",
+            "preserve_recent_turns",
+            "max_summarizations",
+        ):
+            # Map config keys → agent kwargs (config uses shorter names).
+            cfg_key = key.replace("summarization_", "")
+            if cfg_key in summarization_config:
+                agent_args[key] = summarization_config[cfg_key]
+            elif key in summarization_config:
+                agent_args[key] = summarization_config[key]
+
     # Use our custom training function that uses MultiEpisodeAgentPPOTrainer
     run_ppo_agent(
         cfg,
         env_class=MultiEpisodeEnv,
         agent_class=agent_class,
         agent_args=agent_args,
+        summarization_config=summarization_config if summarization_config.get("enable") else None,
     )
 
 

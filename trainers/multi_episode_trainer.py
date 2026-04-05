@@ -60,6 +60,7 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         self,
         val_env_class: type | None = None,
         val_env_args: dict | None = None,
+        summarization_config: dict | None = None,
         **kwargs,
     ):
         """Initialize the trainer with optional validation environment class.
@@ -69,12 +70,23 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 uses this class instead of env_class during validation.
             val_env_args: Optional validation environment arguments. If provided,
                 these override env_args during validation.
+            summarization_config: Optional summarization configuration dict.
+                When provided, uses SummarizingAgentExecutionEngine.
             **kwargs: Arguments passed to parent AgentPPOTrainer.
         """
         super().__init__(**kwargs)
         self.val_env_class = val_env_class
         self.val_env_args = val_env_args
+        self.summarization_config = summarization_config
         self._is_validation_mode = False
+
+    def _get_engine_class(self):
+        """Return the execution engine class to use."""
+        if self.summarization_config and self.summarization_config.get("enable"):
+            from trainers.summarizing_engine import SummarizingAgentExecutionEngine
+
+            return SummarizingAgentExecutionEngine
+        return MultiEpisodeAsyncAgentExecutionEngine
 
     def init_workers(self):
         """Initialize workers with custom execution engine."""
@@ -90,8 +102,9 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         )
         print(f"n_parallel_agents: {n_parallel_agents}")
 
+        engine_cls = self._get_engine_class()
         # Use our custom execution engine instead
-        self.agent_execution_engine = MultiEpisodeAsyncAgentExecutionEngine(
+        self.agent_execution_engine = engine_cls(
             rollout_engine=self.async_rollout_manager,
             config=self.config,
             engine_name="verl",

@@ -36,11 +36,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agents.gem_text_agent import GEMTextAgent  # noqa: E402
+from agents.context_summarizer import GEMTextAgentWithSummarization  # noqa: E402
 from envs.multi_episode_env import MultiEpisodeEnv  # noqa: E402
 from envs.single_episode_env import SingleEpisodeEnv  # noqa: E402
 from trainers.multi_episode_trainer import (  # noqa: E402
     MultiEpisodeAsyncAgentExecutionEngine,
 )
+from trainers.summarizing_engine import SummarizingAgentExecutionEngine  # noqa: E402
 
 from rllm.parser import ChatTemplateParser
 
@@ -51,6 +53,10 @@ class EvalEngine(MultiEpisodeAsyncAgentExecutionEngine):
     Extends MultiEpisodeAsyncAgentExecutionEngine to use Token mode by default,
     which returns dicts with metrics from env.get_metrics().
     """
+
+    # Note: SummarizingEvalEngine (below) inherits from both EvalEngine and
+    # SummarizingAgentExecutionEngine, giving it execute_tasks from here and
+    # the summarization-aware run_agent_trajectory_async from there.
 
     async def execute_tasks(self, tasks: list[dict]) -> list[dict]:
         """Execute tasks using Token mode to get metrics in results.
@@ -110,6 +116,14 @@ class EvalEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
         self.executor.shutdown(wait=False, cancel_futures=True)
         return ordered_results
+
+
+class SummarizingEvalEngine(EvalEngine, SummarizingAgentExecutionEngine):
+    """EvalEngine with mid-trajectory context summarization.
+
+    Uses execute_tasks from EvalEngine (Token mode, metrics extraction) and
+    run_agent_trajectory_async from SummarizingAgentExecutionEngine (summarization hook).
+    """
 
 
 # Configure logging
@@ -234,6 +248,13 @@ def parse_args() -> argparse.Namespace:
         "--debug",
         action="store_true",
         help="Enable debug logging.",
+    )
+    parser.add_argument(
+        "--summarization-threshold",
+        type=int,
+        default=None,
+        help="Token threshold for mid-trajectory context summarization. "
+        "When set, the agent summarizes its context when it exceeds this many tokens.",
     )
 
     args = parser.parse_args()
@@ -393,6 +414,7 @@ def create_engine(
     env_args: Dict[str, Any],
     agent_args: Dict[str, Any],
     env_class: type,
+    agent_class: type = GEMTextAgent,
 ) -> EvalEngine:
     """Create the execution engine for evaluation.
 
@@ -431,8 +453,9 @@ def create_engine(
             "disable_thinking": False,
         }
     })
-    engine = EvalEngine(
-        agent_class=GEMTextAgent,
+    engine_cls = SummarizingEvalEngine if args.summarization_threshold else EvalEngine
+    engine = engine_cls(
+        agent_class=agent_class,
         env_class=env_class,
         config=config,
         agent_args=agent_args,
@@ -888,8 +911,14 @@ async def main() -> None:
         "max_steps": max_steps,
     }
 
+    # Select agent class (with or without summarization)
+    agent_cls: type = GEMTextAgent
+    if args.summarization_threshold:
+        agent_args["summarization_threshold_tokens"] = args.summarization_threshold
+        agent_cls = GEMTextAgentWithSummarization
+
     # Create engine
-    engine = create_engine(args, max_steps, env_args, agent_args, env_class)
+    engine = create_engine(args, max_steps, env_args, agent_args, env_class, agent_class=agent_cls)
 
     # Run evaluation
     results = await run_evaluation(tasks, engine, config)
