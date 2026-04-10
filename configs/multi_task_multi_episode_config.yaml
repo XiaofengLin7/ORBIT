@@ -58,7 +58,7 @@ val_tasks:
     total_step_cap: 27
     test_size: 256
     inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
-    shapes:  [[6,6],[7,6],[7,7],[6,7]]  
+    shapes:  [[6,6],[7,6],[7,7],[6,7]]
 
   - env_id: "game:Mastermind-v0-random"
     max_turns_per_episode: 3
@@ -69,13 +69,13 @@ val_tasks:
     test_size: 256
     inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
 
-  - env_id: "grid"
-    max_turns_per_episode: 9
-    total_step_cap: 27
-    test_size: 256
-    inner_env_class: 'envs.grid_env_adapter.GridEnvAdapter'
-    n: 4
-    m: 4
+  # - env_id: "grid"
+  #   max_turns_per_episode: 9
+  #   total_step_cap: 27
+  #   test_size: 256
+  #   inner_env_class: 'envs.grid_env_adapter.GridEnvAdapter'
+  #   n: 4
+  #   m: 4
 
   # # You can also validate on tasks you trained on
   # - env_id: "game:Minesweeper-v0-only-reveal"

@@ -14,3 +14,7 @@ AGENTS.md
 .codex/
 idea.pdf
 CLAUDE.md
+logs/
+graphify-out/
+.mcp.json
+.claude/

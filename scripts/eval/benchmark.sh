@@ -21,7 +21,7 @@ set -x
 # ============================================================
 
 source /share/pkg.7/miniconda/23.1.0/install/etc/profile.d/conda.sh
-conda activate icx
+conda activate ${CONDA_ENV:-icx}
 
 export ALFWORLD_DATA=/projectnb/replearn/xfl/alfworld_data
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -55,6 +55,9 @@ COMMON=(
     +rllm.agent.trajectory_timeout=600
     +rllm.agent.retry_limit=1
 )
+
+# Append any extra overrides passed as positional args
+COMMON+=("$@")
 
 STEP=0
 TOTAL=6
