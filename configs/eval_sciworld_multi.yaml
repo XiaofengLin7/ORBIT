@@ -1,0 +1,72 @@
+do# SciWorld benchmark: challenging tasks solvable in ≤15 steps with full info
+# 3 episodes x 15 turns = 45 total steps per task
+# Total: 239 test variations across 6 tasks
+
+# Dummy train_tasks required by prepare_multi_task_gem_data (eval-only: total_epochs=0)
+train_tasks:
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    total_step_cap: 9
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 32
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+val_tasks:
+  # --- Classification: Hard (navigate + identify, 225 test vars) ---
+  # find-animal: must distinguish animals from plants/non-living (essential 11-15 steps)
+  - env_id: "sciworld:find-animal"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 75
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "find-animal"
+    split: "test"
+
+  # find-living-thing: must identify living things among many objects (essential 11-15 steps)
+  - env_id: "sciworld:find-living-thing"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 75
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "find-living-thing"
+    split: "test"
+
+  # find-plant: navigate rooms, identify plants (essential 7-13 steps)
+  - env_id: "sciworld:find-plant"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 75
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "find-plant"
+    split: "test"
+
+  # --- Electricity: Build circuits (10 test vars) ---
+  # power-component: wire a complete circuit (essential 5-11 steps)
+  - env_id: "sciworld:power-component"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 5
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "power-component"
+    split: "test"
+
+  # renewable-vs-nonrenewable: identify energy sources + build circuit (essential 6-25, most ≤15)
+  - env_id: "sciworld:power-component-renewable-vs-nonrenewable-energy"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 5
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "power-component-renewable-vs-nonrenewable-energy"
+    split: "test"
+
+  # --- Biology: Life stages (4 test vars) ---
+  # identify-life-stages-2: identify animal life stages — biology reasoning (essential 6-10 steps)
+  - env_id: "sciworld:identify-life-stages-2"
+    max_turns_per_episode: 15
+    total_step_cap: 45
+    test_size: 4
+    inner_env_class: 'envs.sciworld_env_adapter.SciWorldEnvAdapter'
+    task_name: "identify-life-stages-2"
+    split: "test"

@@ -8,6 +8,7 @@ from envs.maze_env_adapter import MazeEnvAdapter
 from envs.rps_env_adapter import RockPaperScissorsEnvAdapter
 from envs.grid_env_adapter import GridEnvAdapter
 from envs.webshop_env_adapter import WebShopEnvAdapter
+from envs.sciworld_env_adapter import SciWorldEnvAdapter
 # Auto-register the only-reveal Minesweeper environment
 import envs.register_custom_minesweeper  # noqa: F401
 
@@ -20,5 +21,6 @@ __all__ = [
     "RockPaperScissorsEnvAdapter",
     "GridEnvAdapter",
     "WebShopEnvAdapter",
+    "SciWorldEnvAdapter",
 ]
 

@@ -121,6 +121,12 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         # Enable validation mode for init_envs_and_agents
         self._is_validation_mode = True
 
+        # Clear any previous chat completions for this step before appending batches
+        save_dir = os.path.join(self.config.trainer.default_local_dir, "chat_completions")
+        completions_file = os.path.join(save_dir, f"{self.global_steps}.jsonl")
+        if os.path.exists(completions_file):
+            os.remove(completions_file)
+
         rewards_lst = []
         data_source_lst = []
         uid_lst = []
@@ -272,6 +278,11 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                             task_type_groups.setdefault(tt, []).append(metrics)
                     for task_type, tt_metrics_list in task_type_groups.items():
                         _aggregate_numeric_metrics(tt_metrics_list, f"val/{data_source}/{task_type}")
+
+                # Aggregate across ALL data_sources for overall per-episode metrics
+                all_metrics_flat = [m for ms in data_source_metrics.values() for m in ms]
+                if all_metrics_flat:
+                    _aggregate_numeric_metrics(all_metrics_flat, "val/all")
 
         # Disable validation mode
         self._is_validation_mode = False

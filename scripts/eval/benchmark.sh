@@ -8,6 +8,7 @@ set -x
 #   1a/1b. GEM val tasks (maze, mastermind, grid)
 #   2a/2b. ALFWorld (eval_out_of_distribution)
 #   3a/3b. WebShop (test split, 100 tasks)
+#   4a/4b. SciWorld (6 tasks, 239 test variations)
 #
 # Usage:
 #   MODEL_PATH=/path/to/checkpoint bash scripts/eval/benchmark.sh
@@ -18,6 +19,8 @@ set -x
 #   SKIP_GEM         — set to 1 to skip GEM val tasks
 #   SKIP_ALFWORLD    — set to 1 to skip ALFWorld
 #   SKIP_WEBSHOP     — set to 1 to skip WebShop
+#   SKIP_SCIWORLD    — set to 1 to skip SciWorld
+#   SKIP_REFLECTION  — set to 1 to skip all reflection runs (e.g. for ORBIT/MTSE)
 # ============================================================
 
 source /share/pkg.7/miniconda/23.1.0/install/etc/profile.d/conda.sh
@@ -43,11 +46,13 @@ MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 SKIP_GEM=${SKIP_GEM:-0}
 SKIP_ALFWORLD=${SKIP_ALFWORLD:-0}
 SKIP_WEBSHOP=${SKIP_WEBSHOP:-0}
+SKIP_SCIWORLD=${SKIP_SCIWORLD:-0}
+SKIP_REFLECTION=${SKIP_REFLECTION:-0}
 
 # Common overrides shared across all benchmarks
 COMMON=(
     trainer.total_epochs=0
-    trainer.n_gpus_per_node=2
+    trainer.n_gpus_per_node=4
     actor_rollout_ref.rollout.val_kwargs.n=4
     data.max_response_length=$((MAX_CTX - 1024))
     actor_rollout_ref.rollout.max_model_len=$MAX_CTX
@@ -60,7 +65,17 @@ COMMON=(
 COMMON+=("$@")
 
 STEP=0
-TOTAL=6
+
+# Count total steps dynamically
+TOTAL=0
+for SKIP_VAR in SKIP_GEM SKIP_ALFWORLD SKIP_WEBSHOP SKIP_SCIWORLD; do
+    if [ "${!SKIP_VAR}" != "1" ]; then
+        TOTAL=$((TOTAL + 1))
+        if [ "$SKIP_REFLECTION" != "1" ]; then
+            TOTAL=$((TOTAL + 1))
+        fi
+    fi
+done
 
 # ======================== 1. GEM Val Tasks ========================
 if [ "$SKIP_GEM" != "1" ]; then
@@ -77,20 +92,21 @@ if [ "$SKIP_GEM" != "1" ]; then
         trainer.experiment_name="gem-${MODEL_NAME}-${EXPERIMENT_TAG}-no-reflection"
     echo "GEM (no reflection) completed with exit code: $?"
 
-    STEP=$((STEP + 1))
-    echo "=========================================="
-    echo "[$STEP/$TOTAL] GEM val tasks — with reflection"
-    echo "=========================================="
-    TASKS_CONFIG=configs/multi_task_multi_episode_config.yaml MODEL_PATH="$MODEL_PATH" \
-    bash scripts/train_multi_task_multi_episode.sh \
-        "${COMMON[@]}" \
-        data.val_batch_size=128 \
-        trainer.project_name=gem-benchmark \
-        +rllm.env.env_args.enable_reflection=True \
-        trainer.experiment_name="gem-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
-    echo "GEM (reflection) completed with exit code: $?"
+    if [ "$SKIP_REFLECTION" != "1" ]; then
+        STEP=$((STEP + 1))
+        echo "=========================================="
+        echo "[$STEP/$TOTAL] GEM val tasks — with reflection"
+        echo "=========================================="
+        TASKS_CONFIG=configs/multi_task_multi_episode_config.yaml MODEL_PATH="$MODEL_PATH" \
+        bash scripts/train_multi_task_multi_episode.sh \
+            "${COMMON[@]}" \
+            data.val_batch_size=128 \
+            trainer.project_name=gem-benchmark \
+            +rllm.env.env_args.enable_reflection=True \
+            trainer.experiment_name="gem-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
+        echo "GEM (reflection) completed with exit code: $?"
+    fi
 else
-    STEP=$((STEP + 2))
     echo "[GEM] — SKIPPED"
 fi
 
@@ -109,20 +125,21 @@ if [ "$SKIP_ALFWORLD" != "1" ]; then
         trainer.experiment_name="alfworld-${MODEL_NAME}-${EXPERIMENT_TAG}-no-reflection"
     echo "ALFWorld (no reflection) completed with exit code: $?"
 
-    STEP=$((STEP + 1))
-    echo "=========================================="
-    echo "[$STEP/$TOTAL] ALFWorld — with reflection"
-    echo "=========================================="
-    TASKS_CONFIG=configs/eval_alfworld_multi.yaml MODEL_PATH="$MODEL_PATH" \
-    bash scripts/train_multi_task_multi_episode.sh \
-        "${COMMON[@]}" \
-        data.val_batch_size=16 \
-        trainer.project_name=alfworld-benchmark \
-        +rllm.env.env_args.enable_reflection=True \
-        trainer.experiment_name="alfworld-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
-    echo "ALFWorld (reflection) completed with exit code: $?"
+    if [ "$SKIP_REFLECTION" != "1" ]; then
+        STEP=$((STEP + 1))
+        echo "=========================================="
+        echo "[$STEP/$TOTAL] ALFWorld — with reflection"
+        echo "=========================================="
+        TASKS_CONFIG=configs/eval_alfworld_multi.yaml MODEL_PATH="$MODEL_PATH" \
+        bash scripts/train_multi_task_multi_episode.sh \
+            "${COMMON[@]}" \
+            data.val_batch_size=16 \
+            trainer.project_name=alfworld-benchmark \
+            +rllm.env.env_args.enable_reflection=True \
+            trainer.experiment_name="alfworld-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
+        echo "ALFWorld (reflection) completed with exit code: $?"
+    fi
 else
-    STEP=$((STEP + 2))
     echo "[ALFWorld] — SKIPPED"
 fi
 
@@ -150,21 +167,55 @@ if [ "$SKIP_WEBSHOP" != "1" ]; then
         trainer.experiment_name="webshop-${MODEL_NAME}-${EXPERIMENT_TAG}-no-reflection"
     echo "WebShop (no reflection) completed with exit code: $?"
 
+    if [ "$SKIP_REFLECTION" != "1" ]; then
+        STEP=$((STEP + 1))
+        echo "=========================================="
+        echo "[$STEP/$TOTAL] WebShop — with reflection"
+        echo "=========================================="
+        TASKS_CONFIG=configs/eval_webshop_multi.yaml MODEL_PATH="$MODEL_PATH" \
+        bash scripts/train_multi_task_multi_episode.sh \
+            "${COMMON[@]}" \
+            data.val_batch_size=16 \
+            trainer.project_name=webshop-benchmark \
+            +rllm.env.env_args.enable_reflection=True \
+            trainer.experiment_name="webshop-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
+        echo "WebShop (reflection) completed with exit code: $?"
+    fi
+else
+    echo "[WebShop] — SKIPPED"
+fi
+
+# ======================== 4. SciWorld ========================
+if [ "$SKIP_SCIWORLD" != "1" ]; then
     STEP=$((STEP + 1))
     echo "=========================================="
-    echo "[$STEP/$TOTAL] WebShop — with reflection"
+    echo "[$STEP/$TOTAL] SciWorld — no reflection"
     echo "=========================================="
-    TASKS_CONFIG=configs/eval_webshop_multi.yaml MODEL_PATH="$MODEL_PATH" \
+    TASKS_CONFIG=configs/eval_sciworld_multi.yaml MODEL_PATH="$MODEL_PATH" \
     bash scripts/train_multi_task_multi_episode.sh \
         "${COMMON[@]}" \
-        data.val_batch_size=16 \
-        trainer.project_name=webshop-benchmark \
-        +rllm.env.env_args.enable_reflection=True \
-        trainer.experiment_name="webshop-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
-    echo "WebShop (reflection) completed with exit code: $?"
+        data.val_batch_size=128 \
+        trainer.project_name=sciworld-benchmark \
+        +rllm.env.env_args.enable_reflection=False \
+        trainer.experiment_name="sciworld-${MODEL_NAME}-${EXPERIMENT_TAG}-no-reflection"
+    echo "SciWorld (no reflection) completed with exit code: $?"
+
+    if [ "$SKIP_REFLECTION" != "1" ]; then
+        STEP=$((STEP + 1))
+        echo "=========================================="
+        echo "[$STEP/$TOTAL] SciWorld — with reflection"
+        echo "=========================================="
+        TASKS_CONFIG=configs/eval_sciworld_multi.yaml MODEL_PATH="$MODEL_PATH" \
+        bash scripts/train_multi_task_multi_episode.sh \
+            "${COMMON[@]}" \
+            data.val_batch_size=128 \
+            trainer.project_name=sciworld-benchmark \
+            +rllm.env.env_args.enable_reflection=True \
+            trainer.experiment_name="sciworld-${MODEL_NAME}-${EXPERIMENT_TAG}-reflection"
+        echo "SciWorld (reflection) completed with exit code: $?"
+    fi
 else
-    STEP=$((STEP + 2))
-    echo "[WebShop] — SKIPPED"
+    echo "[SciWorld] — SKIPPED"
 fi
 
 echo "=========================================="
