@@ -16,7 +16,8 @@ val_tasks:
   - env_id: "webshop"
     max_turns_per_episode: 10       # WebShop default
     total_step_cap: 30              # 3 episodes x 10 turns
-    test_size: 100                  # subset; deterministic seeding ensures same tasks each run
+    test_size: 100                  # first `test_size` goals of the split (sequential seeds)
+    sequential_seeds: true          # seeds = [0..test_size-1] → goal indices 0..test_size-1
     inner_env_class: 'envs.webshop_env_adapter.WebShopEnvAdapter'
     split: "test"
     observation_mode: "text"

@@ -361,20 +361,26 @@ def load_eval_tasks(
 
         test_size = task_cfg.get("test_size", 64)
 
-        # Generate a deterministic seed for this specific task configuration
-        # This ensures identical task configs always generate the same seeds
-        task_specific_seed = _get_task_specific_seed(task_cfg, seed)
-        task_rng = np.random.default_rng(task_specific_seed)
-        seeds = task_rng.integers(0, 1_000_000, size=test_size).tolist()
+        # Sequential-seed mode: seeds = [0, 1, ..., size-1]. Useful for envs
+        # like WebShop where the adapter maps seed -> goal index via
+        # `seed % num_goals`, so this selects the first `size` tasks of the split.
+        if task_cfg.get("sequential_seeds", False):
+            seeds = list(range(test_size))
+        else:
+            # Generate a deterministic seed for this specific task configuration
+            # This ensures identical task configs always generate the same seeds
+            task_specific_seed = _get_task_specific_seed(task_cfg, seed)
+            task_rng = np.random.default_rng(task_specific_seed)
+            seeds = task_rng.integers(0, 1_000_000, size=test_size).tolist()
 
         for task_seed in seeds:
             # Create n_rollouts copies of each task
             for rollout_idx in range(n_rollouts):
                 task_dict: Dict[str, Any] = {}
 
-                # Copy all parameters from task_cfg except size parameters
+                # Copy all parameters from task_cfg except size / seeding-mode parameters
                 for key, value in task_cfg.items():
-                    if key not in ["train_size", "test_size"]:
+                    if key not in ["train_size", "test_size", "sequential_seeds"]:
                         task_dict[key] = value
 
                 # Add generated fields

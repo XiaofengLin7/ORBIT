@@ -195,15 +195,22 @@ def prepare_multi_task_gem_data(
                 raise ValueError(f"env_id is required in task config: {task_cfg}")
             env_id = task_cfg["env_id"]
 
-            # Generate a deterministic seed for this specific task configuration
-            task_specific_seed = get_task_specific_seed(task_cfg, seed)
-            if is_train:
-                task_specific_seed = task_specific_seed * 2
-            
-            # Create a task-specific RNG to ensure deterministic seed generation
-            # This ensures identical task configs always generate the same seeds
-            task_rng = np.random.default_rng(task_specific_seed)
-            seeds = task_rng.integers(0, 1_000_000, size=size).tolist()
+            # Sequential-seed mode: seeds = [0, 1, ..., size-1]. Useful for
+            # envs like WebShop where the adapter maps seed -> goal index via
+            # `seed % num_goals`, so this selects the first `size` tasks of
+            # the split deterministically.
+            if task_cfg.get("sequential_seeds", False):
+                seeds = list(range(size))
+            else:
+                # Generate a deterministic seed for this specific task configuration
+                task_specific_seed = get_task_specific_seed(task_cfg, seed)
+                if is_train:
+                    task_specific_seed = task_specific_seed * 2
+
+                # Create a task-specific RNG to ensure deterministic seed generation
+                # This ensures identical task configs always generate the same seeds
+                task_rng = np.random.default_rng(task_specific_seed)
+                seeds = task_rng.integers(0, 1_000_000, size=size).tolist()
 
             def task_fn(idx: int, task_seed: int) -> dict:
                 """Create a task dictionary with all task-specific configuration.
@@ -212,9 +219,9 @@ def prepare_multi_task_gem_data(
                 """
                 task_dict: Dict[str, Any] = {}
                 
-                # Copy all parameters from task_cfg except size parameters
+                # Copy all parameters from task_cfg except size / seeding-mode parameters
                 for key, value in task_cfg.items():
-                    if key not in ["train_size", "test_size"]:
+                    if key not in ["train_size", "test_size", "sequential_seeds"]:
                         task_dict[key] = value
                 
                 # Add generated/required fields
