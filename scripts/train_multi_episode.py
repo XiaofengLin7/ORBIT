@@ -120,14 +120,17 @@ def main(cfg) -> None:  # type: ignore
     agent_class = AGENT_CLASSES.get(agent_name, GEMTextAgent)
 
     # Extract summarization config (if present) and merge into agent_args.
-    summarization_config = OmegaConf.to_container(
-        cfg.rllm.agent.get("summarization", {}), resolve=True
-    ) or {}
+    # Guard against `.get("summarization", {})` returning a plain dict when the
+    # key is absent — OmegaConf.to_container requires a DictConfig/ListConfig.
+    summarization_cfg = cfg.rllm.agent.get("summarization")
+    if summarization_cfg is not None:
+        summarization_config = OmegaConf.to_container(summarization_cfg, resolve=True) or {}
+    else:
+        summarization_config = {}
     if summarization_config.get("enable"):
         for key in (
             "summarization_threshold_tokens",
             "summary_max_tokens",
-            "preserve_recent_turns",
             "max_summarizations",
         ):
             # Map config keys → agent kwargs (config uses shorter names).

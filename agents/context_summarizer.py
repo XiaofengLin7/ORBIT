@@ -42,7 +42,6 @@ class ContextSummarizerMixin:
 
     * ``summarization_threshold_tokens`` (int, default 4096)
     * ``summary_max_tokens`` (int, default 512)
-    * ``preserve_recent_turns`` (int, default 2)
     * ``max_summarizations`` (int, default 5)
     """
 
@@ -53,12 +52,9 @@ class ContextSummarizerMixin:
     def __init__(self, **kwargs: Any):
         # Pop summarization-specific kwargs before forwarding.
         self.summarization_threshold_tokens: int = kwargs.pop(
-            "summarization_threshold_tokens", 4096
+            "summarization_threshold_tokens", 16384
         )
-        self.summary_max_tokens: int = kwargs.pop("summary_max_tokens", 512)
-        self.preserve_recent_turns: int = kwargs.pop(
-            "preserve_recent_turns", 2
-        )
+        self.summary_max_tokens: int = kwargs.pop("summary_max_tokens", 8192)
         self.max_summarizations: int = kwargs.pop("max_summarizations", 5)
 
         # Internal state — reset in reset().
@@ -94,7 +90,7 @@ class ContextSummarizerMixin:
         return len(tokens) >= self.summarization_threshold_tokens
 
     def build_summarization_prompt(self) -> list[dict[str, str]]:
-        """Return message list = current history + summarization instruction."""
+        """Return message list = full history + summarization instruction."""
         messages = list(self._messages)  # type: ignore[attr-defined]
         messages.append({"role": "user", "content": CONTEXT_SUMMARY_PROMPT})
         return messages
@@ -105,11 +101,10 @@ class ContextSummarizerMixin:
         Layout after apply::
 
             [system_prompt,
-             {"role": "user",   "content": "<context_summary>…</context_summary>\\n\\n[Continuing task]"},
-             ...last N preserved user/assistant turns...]
+             {"role": "user",   "content": "<context_summary>…</context_summary>\\n\\n[Continuing task]"}]
         """
         messages: list[dict[str, str]] = self._messages  # type: ignore[attr-defined]
-        pre_token_count = len(messages)
+        pre_message_count = len(messages)
 
         # Extract summary body from tags; fall back to raw text.
         match = _SUMMARY_TAG_RE.search(summary_text)
@@ -119,29 +114,7 @@ class ContextSummarizerMixin:
         system_msgs = [m for m in messages if m["role"] == "system"]
         system_msg = system_msgs[0] if system_msgs else None
 
-        # Preserve the last N user/assistant turn pairs.
-        preserved: list[dict[str, str]] = []
-        if self.preserve_recent_turns > 0:
-            # Walk backwards collecting pairs.
-            non_system = [m for m in messages if m["role"] != "system"]
-            pairs_needed = self.preserve_recent_turns
-            i = len(non_system) - 1
-            while i >= 0 and pairs_needed > 0:
-                if non_system[i]["role"] == "user" and i + 1 < len(non_system):
-                    preserved = non_system[i:i + 2] + preserved
-                    pairs_needed -= 1
-                    i -= 2
-                elif non_system[i]["role"] == "assistant" and i - 1 >= 0 and non_system[i - 1]["role"] == "user":
-                    preserved = non_system[i - 1:i + 1] + preserved
-                    pairs_needed -= 1
-                    i -= 2
-                else:
-                    # Odd message (e.g., trailing user with no assistant yet).
-                    preserved = [non_system[i]] + preserved
-                    pairs_needed -= 1
-                    i -= 1
-
-        # Assemble new message list.
+        # Assemble new message list: system + summary only.
         new_messages: list[dict[str, str]] = []
         if system_msg is not None:
             new_messages.append(system_msg)
@@ -154,7 +127,6 @@ class ContextSummarizerMixin:
                 ),
             }
         )
-        new_messages.extend(preserved)
 
         self._messages[:] = new_messages  # type: ignore[attr-defined]
 
@@ -162,7 +134,7 @@ class ContextSummarizerMixin:
         self._summarization_events.append(
             {
                 "summarization_index": self._summarization_count,
-                "pre_message_count": pre_token_count,
+                "pre_message_count": pre_message_count,
                 "post_message_count": len(new_messages),
             }
         )

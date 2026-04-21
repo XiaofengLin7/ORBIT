@@ -25,7 +25,6 @@ def _make_agent(cls=GEMTextAgentWithSummarization, threshold=100, **kwargs):
         system_prompt=SYSTEM_PROMPT,
         summarization_threshold_tokens=threshold,
         summary_max_tokens=64,
-        preserve_recent_turns=2,
         max_summarizations=3,
     )
     defaults.update(kwargs)
@@ -74,7 +73,6 @@ class TestInitAndReset:
         agent = _make_agent(threshold=500)
         assert agent.summarization_threshold_tokens == 500
         assert agent.summary_max_tokens == 64
-        assert agent.preserve_recent_turns == 2
         assert agent.max_summarizations == 3
         assert agent._summarization_count == 0
 
@@ -96,9 +94,8 @@ class TestInitAndReset:
     def test_default_kwargs(self):
         """Verify defaults when no summarization kwargs are passed."""
         agent = GEMTextAgentWithSummarization(system_prompt=SYSTEM_PROMPT)
-        assert agent.summarization_threshold_tokens == 4096
-        assert agent.summary_max_tokens == 512
-        assert agent.preserve_recent_turns == 2
+        assert agent.summarization_threshold_tokens == 16384
+        assert agent.summary_max_tokens == 8192
         assert agent.max_summarizations == 5
 
 
@@ -145,7 +142,7 @@ class TestBuildSummarizationPrompt:
         # Last message should be the summarization instruction.
         assert prompt[-1]["role"] == "user"
         assert "context_summary" in prompt[-1]["content"]
-        # All prior messages preserved.
+        # All prior messages preserved + 1 instruction.
         assert len(prompt) == len(agent._messages) + 1
 
     def test_does_not_mutate_agent_messages(self):
@@ -154,6 +151,17 @@ class TestBuildSummarizationPrompt:
         original_len = len(agent._messages)
         _ = agent.build_summarization_prompt()
         assert len(agent._messages) == original_len
+
+    def test_includes_full_history(self):
+        """Summarization prompt should include all messages (no trimming)."""
+        agent = _make_agent()
+        _simulate_steps(agent, 4)
+        prompt = agent.build_summarization_prompt()
+        # Should have all agent messages + 1 instruction.
+        assert len(prompt) == len(agent._messages) + 1
+        # First message is system, last is instruction.
+        assert prompt[0]["role"] == "system"
+        assert prompt[-1]["role"] == "user"
 
 
 # ---------------------------------------------------------------------------
@@ -169,26 +177,22 @@ class TestApplySummary:
         summary_text = "<context_summary>This is a summary of previous actions.</context_summary>"
         agent.apply_summary(summary_text)
 
-        # Should be shorter than before.
-        assert len(agent._messages) < original_len
+        # Should have only system + summary (no preserved turns).
+        assert len(agent._messages) == 2
         # First message is still the system prompt.
         assert agent._messages[0]["role"] == "system"
         # Second message contains the summary.
         assert "<context_summary>" in agent._messages[1]["content"]
         assert "This is a summary of previous actions." in agent._messages[1]["content"]
 
-    def test_preserves_recent_turns(self):
-        agent = _make_agent(preserve_recent_turns=2)
+    def test_no_preserved_turns(self):
+        """After summarization, only system + summary remain."""
+        agent = _make_agent()
         _simulate_steps(agent, 5)
-
-        # Remember the last few messages before summarization.
-        pre_messages = list(agent._messages)
-
         agent.apply_summary("<context_summary>Summary here.</context_summary>")
-
-        # Should have: system + summary_user + up to 2 preserved pairs.
-        # 2 preserved pairs = 4 messages (user+assistant each).
-        assert len(agent._messages) <= 1 + 1 + 4
+        assert len(agent._messages) == 2
+        assert agent._messages[0]["role"] == "system"
+        assert agent._messages[1]["role"] == "user"
 
     def test_fallback_when_no_tags(self):
         agent = _make_agent()
@@ -196,6 +200,7 @@ class TestApplySummary:
         agent.apply_summary("Plain text summary without tags")
         # Should still apply — uses the full text as summary body.
         assert "Plain text summary without tags" in agent._messages[1]["content"]
+        assert len(agent._messages) == 2
 
     def test_increments_counter(self):
         agent = _make_agent()
@@ -216,14 +221,27 @@ class TestApplySummary:
         assert len(events) == 1
         assert events[0]["summarization_index"] == 1
         assert events[0]["pre_message_count"] > 0
-        assert events[0]["post_message_count"] > 0
+        assert events[0]["post_message_count"] == 2
 
-    def test_zero_preserve_turns(self):
-        agent = _make_agent(preserve_recent_turns=0)
-        _simulate_steps(agent, 5)
-        agent.apply_summary("<context_summary>Compact.</context_summary>")
-        # Should have only: system + summary_user.
-        assert len(agent._messages) == 2
+    def test_continuing_task_marker(self):
+        """Summary message should end with [Continuing task]."""
+        agent = _make_agent()
+        _simulate_steps(agent, 3)
+        agent.apply_summary("<context_summary>test</context_summary>")
+        assert "[Continuing task]" in agent._messages[1]["content"]
+
+    def test_summary_without_system_prompt(self):
+        """Handle edge case where there's no system message."""
+        agent = _make_agent()
+        # Remove system message.
+        agent._messages = [
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "act1"},
+            {"role": "user", "content": "obs2"},
+        ]
+        agent.apply_summary("<context_summary>summary</context_summary>")
+        assert len(agent._messages) == 1  # only summary, no system
+        assert "<context_summary>" in agent._messages[0]["content"]
 
 
 # ---------------------------------------------------------------------------

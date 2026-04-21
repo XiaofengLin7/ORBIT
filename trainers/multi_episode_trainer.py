@@ -293,6 +293,13 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
 
     def _transform_agent_trajectories(self, trajectories: list[dict]):
         """Override to group traj metrics by data_source."""
+        # Strip segments key — segment flattening would change batch size,
+        # which is incompatible with verl's PPO pipeline (batch.union requires
+        # matching sizes).  The first segment is already used as the base
+        # trajectory in summarizing_engine.py.
+        for traj in trajectories:
+            traj.pop("segments", None)
+
         # Call parent method to get the base transformation
         final_gen_batch_output, metrics = super()._transform_agent_trajectories(trajectories)
 

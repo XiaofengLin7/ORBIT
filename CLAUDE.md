@@ -88,14 +88,15 @@ Implemented across three new files:
 - **Stepwise mode** (`stepwise_advantage.enable=True`, recommended): Transparent — each step is independent, post-summary steps just have shorter prompts.
 - **Cumulative mode** (`stepwise_advantage.enable=False`): Pre-summary segment only is assembled for training. Full trajectory reward (including post-summary success) is used.
 - Summary generation tokens are excluded from training data (utility call).
+- No recent turns are preserved after summarization (avoids off-policy context). The summarization prompt captures current episode progress.
+- Post-summarization token accumulation is built incrementally (system tokens cached + summary tokenized once) to avoid re-tokenization mismatches.
 
 **Config (Hydra overrides):**
 ```bash
 rllm.agent.name=gem_text_agent_summarizing  # or gem_text_agent_noncumulative_summarizing
 +rllm.agent.summarization.enable=true
-+rllm.agent.summarization.threshold_tokens=4096
-+rllm.agent.summarization.summary_max_tokens=512
-+rllm.agent.summarization.preserve_recent_turns=2
++rllm.agent.summarization.threshold_tokens=16384
++rllm.agent.summarization.summary_max_tokens=8192
 +rllm.agent.summarization.max_summarizations=5
 ```
 

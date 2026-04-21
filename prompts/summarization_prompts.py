@@ -6,11 +6,11 @@ You are summarizing the interaction history of an agent solving a task across mu
 Produce a concise summary that preserves:
 1. The task description and rules
 2. Key information discovered across episodes (confirmed facts, ruled-out possibilities)
-3. The current episode state and any pending decisions
+3. Current episode progress: which episode you are in, all observations in this episode, what actions have been taken, and what you were about to do next
 4. Strategy insights that should inform future actions
 
 Do NOT include:
-- Verbatim copies of previous observations or actions
+- Verbatim copies of previous observations or actions from earlier episodes
 - Step-by-step reasoning traces
 - Redundant information
 

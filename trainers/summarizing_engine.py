@@ -2,17 +2,14 @@
 
 Overrides the monolithic ``run_agent_trajectory_async`` loop from rLLM's
 ``AgentExecutionEngine`` to insert a summarization check after every
-``agent.update_from_env()`` call.  When the agent's context exceeds a
+``agent.update_from_model()`` call.  When the agent's context exceeds a
 configured token threshold, the engine generates a summary via the same
 model and replaces the agent's message history with the compressed form.
 
-For **Token** (cumulative) mode the ``assemble_steps`` override assembles
-only the pre-summary steps — the full trajectory reward (including any
-post-summary success) is still used.
-
-For **Step** (stepwise-advantage) mode, summarization is transparent:
-each step is an independent (prompt, response) pair, and post-summary
-steps simply have a shorter prompt containing the summary.
+The trajectory is split into **segments** at summarization boundaries.
+Each segment is an independent training sample assembled via the parent's
+``assemble_steps``.  The summarization output itself is trained on
+(mask=1).  All segments share the same trajectory reward.
 """
 
 from __future__ import annotations
@@ -43,11 +40,15 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     When the agent provides a ``should_summarize`` method (i.e. it uses
     :class:`~agents.context_summarizer.ContextSummarizerMixin`), the engine
     will trigger summarization when the token threshold is exceeded.
+
+    The summarization check fires **after the model responds** (before
+    ``env.step``).  The summarization prompt is appended to the accumulated
+    token sequence like an environment message, and the summary completion
+    is trained on (mask=1).
     """
 
     # ------------------------------------------------------------------
-    # The full step loop — copied from AgentExecutionEngine with the
-    # summarization hook inserted after ``agent.update_from_env()``.
+    # The full step loop
     # ------------------------------------------------------------------
 
     async def run_agent_trajectory_async(
@@ -71,12 +72,21 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
         episode_steps: list[dict] = []
         summarization_boundaries: list[int] = []
+        segment_chat_histories: list[list[dict]] = []
 
         # verl-style token accumulation
         accumulated_prompt_ids: list[int] | None = None
 
         # Detect whether agent supports summarization.
         agent_can_summarize = hasattr(agent, "should_summarize")
+
+        # Cache generation prompt tokens (used for incremental token
+        # construction across summarization boundaries).
+        gen_prompt_tokens = list(
+            self.tokenizer.encode(
+                self.chat_parser.generation_prompt, add_special_tokens=False
+            )
+        )
 
         # Reset environment
         loop = asyncio.get_event_loop()
@@ -103,6 +113,20 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 f"Trajectory {idx}: initial prompt length {prompt_token_len} "
                 f"already exceeded max_prompt_length {self.max_prompt_length}, retrying"
             )
+
+        # Cache system prompt tokens for post-summarization reconstruction.
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        if system_msgs:
+            initial_system_tokens, _ = convert_messages_to_tokens_and_masks(
+                system_msgs,
+                tokenizer=self.tokenizer,
+                parser=self.chat_parser,
+                contains_first_msg=True,
+                contains_generation_msg=False,
+            )
+            initial_system_tokens = list(initial_system_tokens)
+        else:
+            initial_system_tokens = []
 
         for step_idx in range(self.max_steps):
             prompt_messages = agent.chat_completions.copy()
@@ -156,6 +180,63 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             action: Action = agent.update_from_model(response)
             action = action.action
 
+            # ---- SUMMARIZATION CHECK (after model response, before env step) ----
+            if agent_can_summarize and agent.should_summarize(
+                self.tokenizer, self.chat_parser
+            ):
+                # Guard: check if there's enough response budget for
+                # summarization (instruction + completion tokens).
+                summ_budget_needed = agent.summary_max_tokens
+                if (
+                    not self.enforce_max_prompt_length
+                    and response_token_len + summ_budget_needed
+                    >= self.max_response_length
+                ):
+                    # Not enough response budget — treat as truncation.
+                    termination_reason = "SUMMARIZATION_BUDGET_EXCEEDED"
+                    colorful_print(
+                        f"Trajectory {idx}: summarization skipped — "
+                        f"response budget exhausted "
+                        f"({response_token_len}/{self.max_response_length}).\n",
+                        "red",
+                    )
+                    break
+
+                start_time = time.time()
+                summ_result = await self._do_summarization(
+                    agent,
+                    application_id,
+                    episode_steps,
+                    summarization_boundaries,
+                    segment_chat_histories=segment_chat_histories,
+                    generation_kwargs=kwargs,
+                    accumulated_prompt_ids=accumulated_prompt_ids,
+                    initial_system_tokens=initial_system_tokens,
+                    gen_prompt_tokens=gen_prompt_tokens,
+                    mode=mode,
+                )
+                delta_time = time.time() - start_time
+                llm_time += delta_time
+                total_time += delta_time
+
+                if summ_result is None:
+                    # Summarization failed (prompt exceeded max_model_len
+                    # or other error) — treat as truncation.
+                    termination_reason = "SUMMARIZATION_FAILED"
+                    colorful_print(
+                        f"Trajectory {idx}: summarization failed.\n",
+                        "red",
+                    )
+                    break
+
+                accumulated_prompt_ids, summ_response_len = summ_result
+                # Reset response budget for the new segment — each segment
+                # is an independent training sample with its own budget.
+                response_token_len = 0
+                summarization_just_applied = True
+            else:
+                summarization_just_applied = False
+
             # Step environment
             start_time = time.time()
             try:
@@ -202,9 +283,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 chat_completions_messages
             )
 
-            assert assistant_message is not None or mode != "Token", (
-                "Assistant messages is none when accumulating token trajectories."
-            )
+            # After summarization, messages are [sys, summary, obs] — no
+            # assistant message exists.  The assistant response was part of
+            # the previous segment and is already recorded.
+            if not summarization_just_applied:
+                assert assistant_message is not None or mode != "Token", (
+                    "Assistant messages is none when accumulating token trajectories."
+                )
             assert env_messages is not None or mode != "Token", (
                 "Environment messages is none when accumulating token trajectories."
             )
@@ -281,20 +366,6 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             ):
                 accumulated_prompt_ids.extend(env_msg_tokens)
 
-            # ---- SUMMARIZATION CHECK (new) ----
-            if agent_can_summarize and agent.should_summarize(
-                self.tokenizer, self.chat_parser
-            ):
-                await self._do_summarization(
-                    agent,
-                    application_id,
-                    episode_steps,
-                    summarization_boundaries,
-                    kwargs,
-                )
-                # Invalidate accumulated token sequence — force re-tokenize.
-                accumulated_prompt_ids = None
-
             if step_idx == self.max_steps - 1:
                 termination_reason = "MAX_STEPS"
 
@@ -302,7 +373,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
         masked_out = False
         if self.overlong_filter:
-            if termination_reason in ("TRUNCATION", "MAX_STEPS", "TIMEOUT"):
+            if termination_reason in (
+                "TRUNCATION",
+                "MAX_STEPS",
+                "TIMEOUT",
+                "SUMMARIZATION_BUDGET_EXCEEDED",
+                "SUMMARIZATION_FAILED",
+            ):
                 response_masks = [0] * len(response_masks)
                 masked_out = True
 
@@ -331,43 +408,53 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 )
 
         trajectory: Trajectory = agent.trajectory
-        if termination_reason in ("TRUNCATION", "PROMPT_TRUNCATION"):
+        truncation_reasons = (
+            "TRUNCATION",
+            "PROMPT_TRUNCATION",
+            "SUMMARIZATION_BUDGET_EXCEEDED",
+            "SUMMARIZATION_FAILED",
+        )
+        if termination_reason in truncation_reasons:
             for step in trajectory.steps:
                 step.reward = 0.0
         compute_trajectory_reward(trajectory)
         compute_mc_return(trajectory, gamma=self.gamma)
-        if termination_reason in ("TRUNCATION", "PROMPT_TRUNCATION"):
+        if termination_reason in truncation_reasons:
             colorful_print(
-                f"Trajectory {idx} is truncated. Trajectory reward is "
-                f"{trajectory.reward}. \n",
+                f"Trajectory {idx} is truncated ({termination_reason}). "
+                f"Trajectory reward is {trajectory.reward}. \n",
                 "red",
             )
 
         # ---- Return by mode ----
 
+        # Snapshot final segment's chat history.
+        segment_chat_histories.append(agent.chat_completions)
+
         if mode == "Text":
             result = trajectory
         elif mode == "Token":
-            prompt_tokens, response_tokens, response_masks, is_valid = (
-                self.assemble_steps_with_summarization(
-                    episode_steps, summarization_boundaries
-                )
+            segments = self.assemble_segments(
+                episode_steps,
+                summarization_boundaries,
+                trajectory_reward=trajectory.reward,
             )
+
+            # First segment as base for backward compatibility.
             result = {
-                "prompt_tokens": prompt_tokens,
-                "response_tokens": response_tokens,
-                "response_masks": response_masks,
-                "trajectory_reward": trajectory.reward,
+                **segments[0],
                 "idx": env.idx,
-                "chat_completions": agent.chat_completions,
+                "chat_completions": segment_chat_histories,
+                "segments": segments if len(segments) > 1 else None,
                 "metrics": {
                     "steps": len(trajectory.steps),
                     "reward_time": reward_time,
                     "env_time": env_time,
                     "llm_time": llm_time,
                     "total_time": total_time,
-                    "token_mismatch": 0.0 if is_valid else 1.0,
+                    "token_mismatch": 0.0,
                     "summarization_count": len(summarization_boundaries),
+                    "segment_count": len(segments),
                 },
             }
         elif mode == "Conversation":
@@ -409,9 +496,26 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         application_id: str,
         episode_steps: list[dict],
         summarization_boundaries: list[int],
+        segment_chat_histories: list[list[dict]],
         generation_kwargs: dict,
-    ) -> None:
-        """Generate a summary and apply it to the agent."""
+        accumulated_prompt_ids: list[int] | None,
+        initial_system_tokens: list[int],
+        gen_prompt_tokens: list[int],
+        mode: str,
+    ) -> tuple[list[int] | None, int] | None:
+        """Generate a summary, apply it, and return updated accumulated_prompt_ids.
+
+        The summarization instruction is appended to ``accumulated_prompt_ids``
+        like an environment message (mask=0).  The summary completion is
+        recorded as a regular step (mask=1, trained on).
+
+        Returns:
+            Tuple of (new_accumulated_prompt_ids, response_token_len_delta),
+            or ``None`` if summarization failed (e.g. prompt exceeded
+            max_model_len).
+        """
+        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
+
         summary_prompt = agent.build_summarization_prompt()
 
         # Use a separate kwargs dict so we don't pollute the caller's.
@@ -422,81 +526,185 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         }
         summ_kwargs["max_tokens"] = agent.summary_max_tokens
 
-        summary_output = await self.get_model_response(
-            summary_prompt, application_id, **summ_kwargs
+        # Tokenize the summarization instruction as a user message
+        # (same pattern as env_msg_tokens: user msg + generation prompt).
+        summ_instruction_tokens, _ = convert_messages_to_tokens_and_masks(
+            [{"role": "user", "content": CONTEXT_SUMMARY_PROMPT}],
+            tokenizer=self.tokenizer,
+            parser=self.chat_parser,
+            contains_first_msg=False,
+            contains_generation_msg=True,
         )
+        summ_instruction_len = len(summ_instruction_tokens)
 
-        # Record summarization step for training data assembly.
-        summ_prompt_str = self.chat_parser.parse(
-            summary_prompt, add_generation_prompt=True, is_first_msg=True
-        )
-        summ_prompt_ids = list(
-            self.tokenizer.encode(summ_prompt_str, add_special_tokens=False)
-        )
-        summ_completion_ids = list(
-            self.tokenizer.encode(summary_output.text, add_special_tokens=False)
-        )
+        # Build summarization prompt tokens incrementally.
+        # After update_from_model, accumulated = [...history + gen_prompt + act_i].
+        # Append summ_instruction (user msg + gen_prompt) like env_msg_tokens.
+        if accumulated_prompt_ids is not None and mode == "Token":
+            accumulated_prompt_ids = list(accumulated_prompt_ids)
+            accumulated_prompt_ids.extend(summ_instruction_tokens)
 
+            # Guard: check if the summarization prompt exceeds max_model_len.
+            # If so, there's no room for the model to generate a summary.
+            if hasattr(self, "max_model_len") and self.max_model_len:
+                headroom = self.max_model_len - len(accumulated_prompt_ids)
+                if headroom <= 0:
+                    colorful_print(
+                        f"Summarization prompt ({len(accumulated_prompt_ids)} tokens) "
+                        f"exceeds max_model_len ({self.max_model_len}). "
+                        "Skipping summarization.\n",
+                        "red",
+                    )
+                    return None
+                # Clamp summary_max_tokens to available headroom.
+                if headroom < agent.summary_max_tokens:
+                    colorful_print(
+                        f"Summarization headroom limited to {headroom} tokens "
+                        f"(requested {agent.summary_max_tokens}).\n",
+                        "yellow",
+                    )
+                    summ_kwargs["max_tokens"] = headroom
+
+            summ_kwargs["accumulated_prompt_ids"] = accumulated_prompt_ids
+
+        try:
+            summary_output = await self.get_model_response(
+                summary_prompt, application_id, **summ_kwargs
+            )
+        except Exception as e:
+            colorful_print(
+                f"Summarization generation failed: {e}\n",
+                "red",
+            )
+            return None
+
+        summ_completion_len = len(summary_output.completion_ids)
+
+        if summ_completion_len == 0:
+            colorful_print(
+                "Summarization produced empty output. Skipping.\n",
+                "red",
+            )
+            return None
+
+        # Record summarization step in episode_steps.
+        # The summarization step is TRAINABLE: its completion_ids (the summary)
+        # get mask=1 via assemble_steps, and the summ_instruction gap gets mask=0.
         episode_steps.append(
             {
-                "prompt": summ_prompt_str,
+                "prompt": self.chat_parser.parse(
+                    summary_prompt, add_generation_prompt=True, is_first_msg=True
+                ),
                 "response": summary_output.text,
-                "prompt_ids": summ_prompt_ids,
-                "completion_ids": summ_completion_ids,
+                "prompt_ids": list(summary_output.prompt_ids),
+                "completion_ids": list(summary_output.completion_ids),
                 "logprobs": getattr(summary_output, "logprobs", []),
                 "is_summarization": True,
             }
         )
         summarization_boundaries.append(len(episode_steps) - 1)
 
+        # Snapshot this segment's full conversation before it's replaced.
+        segment_chat_histories.append(agent.chat_completions)
+
         agent.apply_summary(summary_output.text)
 
         colorful_print(
             f"Summarization #{len(summarization_boundaries)} applied "
-            f"(step {len(episode_steps) - 1}). "
+            f"(step {len(episode_steps) - 1}, "
+            f"summary_tokens={summ_completion_len}). "
             f"Messages: {agent.get_summarization_metadata()}\n",
             "cyan",
         )
+
+        # Build post-summary accumulated tokens incrementally.
+        new_accumulated: list[int] | None = None
+        if mode == "Token":
+            summary_user_msg = agent.chat_completions[1]  # <context_summary> msg
+            summary_msg_tokens, _ = convert_messages_to_tokens_and_masks(
+                [summary_user_msg],
+                tokenizer=self.tokenizer,
+                parser=self.chat_parser,
+                contains_first_msg=False,
+                contains_generation_msg=True,
+            )
+            new_accumulated = initial_system_tokens + list(summary_msg_tokens)
+
+        # Total response tokens added by summarization:
+        # summ_instruction (mask=0) + summ_completion (mask=1)
+        response_len_delta = summ_instruction_len + summ_completion_len
+
+        return new_accumulated, response_len_delta
 
     # ------------------------------------------------------------------
     # Training data assembly
     # ------------------------------------------------------------------
 
-    def assemble_steps_with_summarization(
+    def assemble_segments(
         self,
         steps: list[dict],
         summarization_boundaries: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-        """Assemble training data, stopping at the first summarization boundary.
+        trajectory_reward: float,
+    ) -> list[dict]:
+        """Assemble training data as one or more segments.
 
-        In cumulative (Token) mode, the post-summary segment has a different
-        prompt that breaks the accumulated-token invariant. We therefore
-        assemble only the pre-summary task steps. The full trajectory reward
-        (including any post-summary success) is still attributed to these
-        tokens.
+        Each segment is assembled via the parent's ``assemble_steps``.
+        Summarization boundaries define the split points: the summarization
+        step is the LAST step of its segment, and the next segment starts
+        at the step after the boundary.
 
-        If no summarization occurred, falls through to the parent's
-        ``assemble_steps``.
+        All segments share the same ``trajectory_reward``.
+
+        Returns:
+            List of segment dicts, each with ``prompt_tokens``,
+            ``response_tokens``, ``response_masks``, ``trajectory_reward``.
         """
         if not summarization_boundaries:
-            return self.assemble_steps(steps)
+            # No summarization — single segment.
+            prompt, resp, mask, is_valid = self.assemble_steps(steps)
+            return [
+                {
+                    "prompt_tokens": prompt,
+                    "response_tokens": resp,
+                    "response_masks": mask,
+                    "trajectory_reward": trajectory_reward,
+                    "token_mismatch": 0.0 if is_valid else 1.0,
+                }
+            ]
 
-        # Assemble only pre-summary task steps (exclude the summarization step itself).
-        first_boundary = summarization_boundaries[0]
-        pre_summary_steps = [
-            s for s in steps[:first_boundary] if not s.get("is_summarization")
-        ]
+        # Split into segments: [0..b0], [b0+1..b1], [b1+1..end]
+        split_points = [0] + [b + 1 for b in summarization_boundaries] + [len(steps)]
 
-        if not pre_summary_steps:
-            # Edge case: summarization fired before any task step completed.
+        segments: list[dict] = []
+        for i in range(len(split_points) - 1):
+            seg_steps = steps[split_points[i] : split_points[i + 1]]
+            if not seg_steps:
+                continue
+
+            prompt, resp, mask, is_valid = self.assemble_steps(seg_steps)
+            segments.append(
+                {
+                    "prompt_tokens": prompt,
+                    "response_tokens": resp,
+                    "response_masks": mask,
+                    "trajectory_reward": trajectory_reward,
+                    "token_mismatch": 0.0 if is_valid else 1.0,
+                }
+            )
+
+        if not segments:
+            # Edge case: all steps filtered out.
             prompt_tokens = torch.tensor(
                 steps[0]["prompt_ids"], dtype=torch.long
             )
-            return (
-                prompt_tokens,
-                torch.tensor([], dtype=torch.long),
-                torch.tensor([], dtype=torch.long),
-                True,
-            )
+            segments = [
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "response_tokens": torch.tensor([], dtype=torch.long),
+                    "response_masks": torch.tensor([], dtype=torch.long),
+                    "trajectory_reward": trajectory_reward,
+                    "token_mismatch": 0.0,
+                }
+            ]
 
-        return self.assemble_steps(pre_summary_steps)
+        return segments
