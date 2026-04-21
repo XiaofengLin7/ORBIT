@@ -27,7 +27,7 @@ Evaluates any OpenAI-compatible model (GPT, or a locally-served model via vLLM/S
 ```bash
 # Single-episode (1 episode per task)
 python scripts/eval/openai.py \
-    --config configs/eval_alfworld.yaml \
+    --config configs/eval_alfworld_multi.yaml \
     --model gpt-4o-mini \
     --env-mode single \
     --n-parallel 32 \
@@ -75,8 +75,7 @@ Edit the script to configure `BASE_MODEL`, `ORBIT_MODEL`, and which baselines to
 
 ### Task configs
 
-- `configs/eval_alfworld.yaml` — Single-task ALFWorld config (134 valid_unseen games, 10 turns/episode)
-- `configs/eval_alfworld_multi.yaml` — Same, with additional commented-out task types (maze, mastermind, grid)
+- `configs/eval_alfworld_multi.yaml` — ALFWorld eval config (134 valid_unseen games, 10 turns/episode)
 - `configs/config_alfworld_tw.yaml` — TextWorld environment config (points to `$ALFWORLD_DATA` paths)
 
 ### Custom vendor path
