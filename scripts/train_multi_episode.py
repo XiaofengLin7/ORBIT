@@ -11,9 +11,26 @@ Supports both single-task and multi-task training:
 
 from __future__ import annotations
 
+import os
+import resource
 import sys
 from pathlib import Path
 from typing import Optional
+
+# Raise the FD limit before anything else (Ray, vLLM, WebShop envs all open many files).
+# Doing this in Python ensures the Ray driver and any forked workers inherit the bump,
+# even when the bash-level ulimit didn't propagate.
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _target = min(1048576, _hard) if _hard != resource.RLIM_INFINITY else 1048576
+    if _soft < _target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
+    print(f"[train_multi_episode] RLIMIT_NOFILE: {resource.getrlimit(resource.RLIMIT_NOFILE)}", flush=True)
+except (ValueError, OSError) as _e:
+    print(f"[train_multi_episode] could not raise RLIMIT_NOFILE: {_e}", flush=True)
+
+# Ensure Ray worker processes inherit the bump via its worker startup env var.
+os.environ.setdefault("RAY_worker_rlimit_nofile", "1048576")
 
 import hydra
 from omegaconf import OmegaConf

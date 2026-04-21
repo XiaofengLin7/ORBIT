@@ -120,6 +120,18 @@ class MultiEpisodeTaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         print(f"MultiEpisodeTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+
+        # Pre-warm NLTK word corpora to avoid LazyCorpusLoader race condition
+        # when Wordle/Hangman envs are created concurrently in init_envs_and_agents.
+        try:
+            import nltk
+            nltk.download("words", quiet=True)
+            from nltk.corpus import words as _nltk_words
+            _ = _nltk_words.words("en-basic")
+            _ = _nltk_words.words("en")
+        except Exception as _e:
+            print(f"[warn] NLTK warmup failed: {_e}")
+
         OmegaConf.register_new_resolver("mul", lambda x, y: int(x) * int(y))
         OmegaConf.resolve(config)
         pprint(OmegaConf.to_container(config))

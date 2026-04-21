@@ -13,3 +13,7 @@ AGENTS.md
 .cache/
 .codex/
 idea.pdf
+.claude/
+logs/
+graphify-out/
+.mcp.json
