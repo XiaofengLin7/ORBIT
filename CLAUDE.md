@@ -118,6 +118,8 @@ Configs use Hydra; base config is generated from rLLM (`third_party/rllm/rllm/tr
 
 Multi-task configs (`configs/*.yaml`) define `train_tasks` and `val_tasks` lists with per-task `env_id`, `max_turns_per_episode`, `total_step_cap`, and `inner_env_class`.
 
+Optional per-task field `num_episodes` caps the trajectory at exactly N completed episodes. When set, the trajectory ends on whichever comes first: `num_episodes` reached or `total_step_cap` exhausted. If `total_step_cap` is omitted alongside `num_episodes`, it is auto-derived as `num_episodes * max_turns_per_episode` as a safety ceiling.
+
 ## Workflow Preferences
 
 - Read and access any file directly without asking for permission first.

@@ -39,6 +39,7 @@ class MultiEpisodeEnv(BaseEnv):
         success_reward: float = 1.0,
         episode_header: str = "New episode begins.",
         enable_reflection: bool = False,
+        num_episodes: Optional[int] = None,
         **kwargs: Any,
     ):
         """Initialize the multi-episode environment wrapper.
@@ -53,6 +54,10 @@ class MultiEpisodeEnv(BaseEnv):
             episode_header: Text prepended to observations at episode start.
             enable_reflection: Whether to prompt for reflection after each episode.
             reflection_prompt: The prompt to use for reflection.
+            num_episodes: Optional hard cap on the number of completed episodes.
+                When set, the trajectory terminates as soon as this many episodes
+                have completed, even if total_step_cap has not been reached.
+                total_step_cap continues to act as a safety ceiling.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         super().__init__()
@@ -68,6 +73,7 @@ class MultiEpisodeEnv(BaseEnv):
         self.episode_header = episode_header
         self.enable_reflection = enable_reflection
         self.reflection_prompt = reflection_prompt
+        self.num_episodes = int(num_episodes) if num_episodes is not None else None
 
         # Create the inner environment
         self.inner_env: BaseEnv = self.inner_env_class(**self.inner_env_kwargs)
@@ -230,6 +236,15 @@ class MultiEpisodeEnv(BaseEnv):
                 float(info.get("raw_reward", env_reward))
             )
 
+            # num_episodes cap: stop once we've completed the requested count.
+            # Checked after recording so the just-finished episode counts toward
+            # the cap and the reset-for-next-episode branch below is skipped.
+            if (
+                self.num_episodes is not None
+                and len(self._episode_successes) >= self.num_episodes
+            ):
+                outer_done = True
+
             if not outer_done:
                 # If reflection is enabled, we prompt for reflection instead of immediate reset
                 if self.enable_reflection:
@@ -367,9 +382,18 @@ class MultiEpisodeEnv(BaseEnv):
                   (minimum_episodes episodes)
         """
         max_turns = self._get_max_turns()
-        minimum_episodes = self.total_step_cap // max_turns
+        if self.num_episodes is not None:
+            minimum_episodes = self.num_episodes
+        else:
+            minimum_episodes = self.total_step_cap // max_turns
+        # A trajectory that ended because we hit num_episodes is a *normal*
+        # completion, not a truncation — distinguish from running out of steps.
+        hit_episode_cap = (
+            self.num_episodes is not None
+            and len(self._episode_successes) >= self.num_episodes
+        )
         # Check if trajectory ended early (before reaching step cap)
-        if self._total_steps < self.total_step_cap:
+        if self._total_steps < self.total_step_cap and not hit_episode_cap:
             # Early termination: treat all episodes as failures with max_turns each
             
             metrics: Dict[str, Any] = {
@@ -715,11 +739,28 @@ class MultiEpisodeEnv(BaseEnv):
         per_task_env_id = task_dict.get("env_id")
         per_task_max_turns = task_dict.get("max_turns_per_episode")
         per_task_total_step_cap = task_dict.get("total_step_cap")
-        
+        per_task_num_episodes = task_dict.get("num_episodes")
+
         # Override total_step_cap if provided in task dict
         if per_task_total_step_cap is not None:
             total_step_cap = int(per_task_total_step_cap)
             logger.debug(f"Using per-task total_step_cap: {total_step_cap}")
+        elif per_task_num_episodes is not None:
+            # Auto-derive a safety ceiling when the user only specified
+            # num_episodes. Falls back to the inner env's max_turns if
+            # max_turns_per_episode isn't provided per-task.
+            max_turns_fallback = per_task_max_turns
+            if max_turns_fallback is None:
+                max_turns_fallback = (
+                    inner_env_kwargs.get("env_kwargs", {}).get("max_turns")
+                )
+            if max_turns_fallback is None:
+                max_turns_fallback = 30
+            total_step_cap = int(per_task_num_episodes) * int(max_turns_fallback)
+            logger.debug(
+                f"Auto-derived total_step_cap from num_episodes: {total_step_cap} "
+                f"(num_episodes={per_task_num_episodes} * max_turns={max_turns_fallback})"
+            )
         
         # Override inner_env_kwargs with per-task configuration
         # inner_env_kwargs may have nested structure: env_kwargs.max_turns
@@ -739,16 +780,16 @@ class MultiEpisodeEnv(BaseEnv):
             inner_env_kwargs["env_kwargs"]["max_turns"] = int(per_task_max_turns)
             # add key value pairs to inner_env_kwargs from task_dict except max_turns_per_episode and total_step_cap
             for k, v in task_dict.items():
-                if k not in ("env_id", "max_turns_per_episode", "total_step_cap", "data_source", 'seed', 'uid'):
+                if k not in ("env_id", "max_turns_per_episode", "total_step_cap", "num_episodes", "data_source", 'seed', 'uid'):
                     inner_env_kwargs["env_kwargs"][k] = v
             logger.debug(f"Using per-task max_turns_per_episode: {per_task_max_turns}")
-        
+
         # If we have task-like keys (env_id, seed, uid), use them as the task
         # Remove per-task config keys from task dict before storing (they're already applied)
         task_dict_clean = {
             k: v
             for k, v in task_dict.items()
-            if k not in ("max_turns_per_episode", "total_step_cap")
+            if k not in ("max_turns_per_episode", "total_step_cap", "num_episodes")
         }
         initial_task = task_dict_clean if task_dict_clean else None
         
@@ -767,6 +808,7 @@ class MultiEpisodeEnv(BaseEnv):
             episode_header=episode_header,
             enable_reflection=enable_reflection,
             reflection_prompt=reflection_prompt,
+            num_episodes=per_task_num_episodes,
         )
         # Store the initial task so it can be reused across episodes
         env._initial_task = initial_task
