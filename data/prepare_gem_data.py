@@ -227,8 +227,15 @@ def prepare_multi_task_gem_data(
                 # Add generated/required fields
                 task_dict["seed"] = int(task_seed)
                 task_dict["uid"] = f"{env_id}-{task_seed}"
-                task_dict["data_source"] = env_id  # For metric grouping
-                
+                # data_source is used for metric aggregation. Include
+                # num_episodes when set so distinct-horizon variants of the
+                # same env are reported as separate buckets.
+                num_ep = task_dict.get("num_episodes")
+                if num_ep is not None:
+                    task_dict["data_source"] = f"{env_id}-ep{int(num_ep)}"
+                else:
+                    task_dict["data_source"] = env_id
+
                 return task_dict
 
             result.extend([task_fn(i, s) for i, s in enumerate(seeds)])
