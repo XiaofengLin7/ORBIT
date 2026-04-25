@@ -19,8 +19,9 @@ from rllm.agents.utils import convert_messages_to_tokens_and_masks
 from agents.gem_text_agent import GEMTextAgent
 from agents.gem_text_agent_noncumulative import GEMTextAgentNonCumulative
 from prompts.summarization_prompts import (
-    CONTEXT_SUMMARY_PROMPT,
+    EPISODIC_SUMMARY_PROMPT,
     REFLECTIVE_SUMMARY_PROMPT,
+    TOKEN_SUMMARY_PROMPT,
 )
 
 _SUMMARY_TAG_RE = re.compile(
@@ -127,14 +128,22 @@ class ContextSummarizerMixin:
     ) -> list[dict[str, str]]:
         """Return message list = full history + summarization instruction.
 
-        ``trigger`` is recorded for metadata purposes but does not by itself
-        change the template. ``use_reflective_prompt=True`` selects
-        ``REFLECTIVE_SUMMARY_PROMPT`` (reflection-style, suitable for
-        episode-end fires when env-level reflection is enabled).
+        Template selection:
+        * ``use_reflective_prompt=True`` → ``REFLECTIVE_SUMMARY_PROMPT``
+          (reflection + compression, used at episode end when the env
+          has reflection enabled).
+        * ``trigger="episode_end"`` and reflection disabled →
+          ``EPISODIC_SUMMARY_PROMPT`` (compression-only at episode end).
+        * Otherwise (token trigger, mid-episode) →
+          ``TOKEN_SUMMARY_PROMPT``.
         """
-        del trigger  # currently informational only; prompt is chosen by use_reflective_prompt
         messages = list(self._messages)  # type: ignore[attr-defined]
-        instruction = REFLECTIVE_SUMMARY_PROMPT if use_reflective_prompt else CONTEXT_SUMMARY_PROMPT
+        if use_reflective_prompt:
+            instruction = REFLECTIVE_SUMMARY_PROMPT
+        elif trigger == "episode_end":
+            instruction = EPISODIC_SUMMARY_PROMPT
+        else:
+            instruction = TOKEN_SUMMARY_PROMPT
         messages.append({"role": "user", "content": instruction})
         return messages
 

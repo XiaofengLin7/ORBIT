@@ -356,23 +356,23 @@ class TestSummarizationMode:
 # ---------------------------------------------------------------------------
 
 class TestTriggerAwarePrompt:
-    def test_default_uses_context_summary_prompt(self):
-        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
+    def test_token_trigger_uses_token_summary_prompt(self):
+        from prompts.summarization_prompts import TOKEN_SUMMARY_PROMPT
 
         agent = _make_agent()
         _simulate_steps(agent, 2)
         prompt = agent.build_summarization_prompt(trigger="token")
-        assert prompt[-1]["content"] == CONTEXT_SUMMARY_PROMPT
+        assert prompt[-1]["content"] == TOKEN_SUMMARY_PROMPT
 
-    def test_episode_end_non_reflective_uses_context_summary(self):
-        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
+    def test_episode_end_non_reflective_uses_episodic_summary(self):
+        from prompts.summarization_prompts import EPISODIC_SUMMARY_PROMPT
 
         agent = _make_agent()
         _simulate_steps(agent, 2)
         prompt = agent.build_summarization_prompt(
             trigger="episode_end", use_reflective_prompt=False
         )
-        assert prompt[-1]["content"] == CONTEXT_SUMMARY_PROMPT
+        assert prompt[-1]["content"] == EPISODIC_SUMMARY_PROMPT
 
     def test_reflective_prompt_selected_when_requested(self):
         from prompts.summarization_prompts import REFLECTIVE_SUMMARY_PROMPT

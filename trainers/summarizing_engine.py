@@ -30,8 +30,9 @@ from rllm.environments.env_utils import compute_mc_return, compute_trajectory_re
 from rllm.utils import colorful_print
 
 from prompts.summarization_prompts import (
-    CONTEXT_SUMMARY_PROMPT,
+    EPISODIC_SUMMARY_PROMPT,
     REFLECTIVE_SUMMARY_PROMPT,
+    TOKEN_SUMMARY_PROMPT,
 )
 from trainers.multi_episode_trainer import MultiEpisodeAsyncAgentExecutionEngine
 
@@ -106,7 +107,8 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             return list(toks)
 
         cached_instruction_tokens = {
-            "context": _tokenize_instruction(CONTEXT_SUMMARY_PROMPT),
+            "token": _tokenize_instruction(TOKEN_SUMMARY_PROMPT),
+            "episodic": _tokenize_instruction(EPISODIC_SUMMARY_PROMPT),
             "reflective": _tokenize_instruction(REFLECTIVE_SUMMARY_PROMPT),
         }
 
@@ -350,9 +352,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     summ_trigger == "episode_end"
                     and getattr(env, "enable_reflection", False)
                 )
-                instr_tokens = cached_instruction_tokens[
-                    "reflective" if use_reflective else "context"
-                ]
+                if use_reflective:
+                    instr_kind = "reflective"
+                elif summ_trigger == "episode_end":
+                    instr_kind = "episodic"
+                else:
+                    instr_kind = "token"
+                instr_tokens = cached_instruction_tokens[instr_kind]
                 summ_budget_needed = agent.summary_max_tokens + len(instr_tokens)
                 budget_exhausted = (
                     not self.enforce_max_prompt_length
@@ -641,9 +647,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         # pattern as env_msg_tokens: user msg + generation prompt). When the
         # caller passed a pre-tokenized variant, reuse it directly.
         if summ_instruction_tokens is None:
-            instruction_text = (
-                REFLECTIVE_SUMMARY_PROMPT if use_reflective_prompt else CONTEXT_SUMMARY_PROMPT
-            )
+            if use_reflective_prompt:
+                instruction_text = REFLECTIVE_SUMMARY_PROMPT
+            elif trigger == "episode_end":
+                instruction_text = EPISODIC_SUMMARY_PROMPT
+            else:
+                instruction_text = TOKEN_SUMMARY_PROMPT
             summ_instruction_tokens, _ = convert_messages_to_tokens_and_masks(
                 [{"role": "user", "content": instruction_text}],
                 tokenizer=self.tokenizer,

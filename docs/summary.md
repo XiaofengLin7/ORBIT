@@ -51,9 +51,9 @@ Trigger predicate (`should_summarize`): fires when **all** of
 - the full chat history (system + every user + every assistant turn) rendered through the chat template tokenizes to ≥ `summarization_threshold_tokens` — this is the agent's entire accumulated context, not just the final prompt
 
 Behavior when it fires:
-1. **Budget check** — if `response_token_len + summary_max_tokens + summ_instruction_len >= max_response_length`, hard fail. `summ_instruction_len` is the tokenized length of the summarization prompt (`CONTEXT_SUMMARY_PROMPT` for the token path), pre-computed once at trajectory start.
+1. **Budget check** — if `response_token_len + summary_max_tokens + summ_instruction_len >= max_response_length`, hard fail. `summ_instruction_len` is the tokenized length of the summarization prompt (`TOKEN_SUMMARY_PROMPT` for the token path), pre-computed once at trajectory start.
 2. Call `_do_summarization(trigger="token", use_reflective_prompt=False)`.
-3. Prompt = `CONTEXT_SUMMARY_PROMPT` appended to the current history.
+3. Prompt = `TOKEN_SUMMARY_PROMPT` appended to the current history.
 4. Post-summary layout via `apply_summary`: `[system, summary_user_msg]`. The summary is expected to carry forward whatever the agent needs to know about the current episode; the next env observation is appended automatically by the next iteration's `update_from_env`.
 5. Reset `response_token_len = 0`.
 
@@ -117,11 +117,11 @@ Trigger predicate (`should_summarize_on_episode_end`): fires when **all** of
 The engine additionally requires `done is False` (don't summarize on the trajectory-terminating step).
 
 Behavior when it fires:
-1. **Budget check** — `response_token_len + summary_max_tokens + summ_instruction_len >= max_response_length` ⇒ **soft skip** (yellow log, continue trajectory). `summ_instruction_len` uses the pre-tokenized length of the instruction that *would* be sent — `REFLECTIVE_SUMMARY_PROMPT` when `env.enable_reflection=True`, else `CONTEXT_SUMMARY_PROMPT`.
+1. **Budget check** — `response_token_len + summary_max_tokens + summ_instruction_len >= max_response_length` ⇒ **soft skip** (yellow log, continue trajectory). `summ_instruction_len` uses the pre-tokenized length of the instruction that *would* be sent — `REFLECTIVE_SUMMARY_PROMPT` when `env.enable_reflection=True`, else `EPISODIC_SUMMARY_PROMPT`.
 2. Call `_do_summarization(trigger="episode_end", use_reflective_prompt=<env.enable_reflection>)`.
 3. Prompt selection:
    - `env.enable_reflection=True` → `REFLECTIVE_SUMMARY_PROMPT`.
-   - otherwise → `CONTEXT_SUMMARY_PROMPT`.
+   - otherwise → `EPISODIC_SUMMARY_PROMPT`.
 4. Post-summary layout via `apply_summary`: `[system, summary_user_msg]` (2 messages).
 5. Engine calls `env.start_new_episode()` → resets inner env, bumps `episode_index`, returns new episode's initial obs.
 6. Engine calls `agent.update_from_env(new_obs, …)` → history becomes `[system, summary, new_episode_obs]`.
@@ -165,7 +165,7 @@ Consequences:
 | Trigger | Accumulated chat-history tokens ≥ `threshold_tokens` (full `_messages` rendered through the chat template) | `info["episode_done"]=True` |
 | Fires within an episode? | Yes, mid-episode | No, only at boundaries |
 | Post-summary history | `[sys, summary]` — next env obs lands on the following iteration's `update_from_env` | `[sys, summary, new_episode_obs]` (via `env.start_new_episode`) |
-| Prompt | `CONTEXT_SUMMARY_PROMPT` | `REFLECTIVE_SUMMARY_PROMPT` if `env.enable_reflection` else `CONTEXT_SUMMARY_PROMPT` |
+| Prompt | `TOKEN_SUMMARY_PROMPT` | `REFLECTIVE_SUMMARY_PROMPT` if `env.enable_reflection` else `EPISODIC_SUMMARY_PROMPT` |
 | Budget exhausted | Hard fail → `SUMMARIZATION_BUDGET_EXCEEDED` (red, truncation) | Soft skip (yellow) |
 | Context-window overflow | Hard fail → `SUMMARIZATION_FAILED` (red, truncation) | Soft skip (yellow) |
 | Env-side change | None | `MultiEpisodeEnv.step` split + `start_new_episode()` advance |
@@ -247,7 +247,7 @@ Success rate = fraction of trajectories whose final env message matches a succes
 
 ## 9. Design implications
 
-1. **Best mode is task-dependent.** For exploration-heavy tasks (maze), episodic is clearly preferable. For deductive tasks (mastermind), the "no step-by-step reasoning" instruction in `CONTEXT_SUMMARY_PROMPT` strips state the solver actually needs — either token mode or a less aggressive episodic prompt works better.
+1. **Best mode is task-dependent.** For exploration-heavy tasks (maze), episodic is clearly preferable. For deductive tasks (mastermind), the "no step-by-step reasoning" instruction in `EPISODIC_SUMMARY_PROMPT` (and its token-path counterpart) strips state the solver actually needs — either token mode or a less aggressive episodic prompt works better.
 2. **Mid-episode summarization with reasoning models is unreliable.** Qwen3's `<think>` bleed is a model-behavior issue, not an engine bug. A cleaner fix would be to disable thinking for summarization calls (`disable_thinking=True` on the summary LLM call only), or to use a lighter non-reasoning variant for summaries.
 3. **Length bounds are advisory.** `summary_max_tokens=4096` doesn't prevent 30 k-char outputs, because character count ≠ token count for repetitive reasoning traces and because the cap measures completion tokens, not the blended `<think>` + `<context_summary>` block.
 4. **Base + token is currently degenerate.** At the 16 k threshold and 31 k response length, the safe zone is only ~7 k tokens wide; any one long step crosses both thresholds. Either lower the threshold (`SUMMARIZATION_THRESHOLD=8192`) or accept that episodic is the only working mode for base.

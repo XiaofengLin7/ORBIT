@@ -1,6 +1,24 @@
-"""Prompt templates for mid-trajectory context summarization."""
+"""Prompt templates for mid-trajectory context summarization.
 
-CONTEXT_SUMMARY_PROMPT = """\
+Three variants, picked by the engine + agent based on (trigger,
+env.enable_reflection):
+
+* ``TOKEN_SUMMARY_PROMPT`` — token trigger, fires mid-episode. The
+  episode is still in progress; the prompt asks the agent to compress
+  prior context and preserve current-episode progress so the agent can
+  continue.
+* ``EPISODIC_SUMMARY_PROMPT`` — episodic trigger, env.enable_reflection
+  is False. An episode has just ended; compression-only, no reflection
+  language.
+* ``REFLECTIVE_SUMMARY_PROMPT`` — episodic trigger, env.enable_reflection
+  is True. Episode end + reflection in a single ask.
+
+All three must instruct the model to wrap its output in
+``<context_summary>...</context_summary>`` tags so
+``agents.context_summarizer._SUMMARY_TAG_RE`` can extract it.
+"""
+
+TOKEN_SUMMARY_PROMPT = """\
 You are summarizing the interaction history of an agent solving a task across multiple episodes.
 
 Produce a concise summary that preserves:
@@ -17,10 +35,25 @@ Do NOT include:
 Write your summary inside <context_summary>...</context_summary> tags."""
 
 
-# Prompt used for episodic summarization when env.enable_reflection=True.
-# The user may customize this freely; the only hard requirement is that the
-# model's summary body must be wrapped in <context_summary>...</context_summary>
-# tags so agents.context_summarizer._SUMMARY_TAG_RE can extract it.
+EPISODIC_SUMMARY_PROMPT = """\
+You have just completed one episode of interaction with the environment.
+
+Produce a compact memory the agent can carry into the next episode.
+
+Cover:
+1. The task description and rules.
+2. Confirmed facts about the environment, task, or hidden state — including the outcome of the episode that just ended.
+3. Ruled-out states, actions, or hypotheses based on observed feedback.
+4. A concrete plan or belief to seed the next episode.
+
+Do NOT include:
+- Verbatim copies of past observations or actions.
+- Step-by-step reasoning traces.
+- Redundant information.
+
+Write your summary inside <context_summary>...</context_summary> tags."""
+
+
 REFLECTIVE_SUMMARY_PROMPT = """\
 You have just completed one episode of interaction with the environment.
 
