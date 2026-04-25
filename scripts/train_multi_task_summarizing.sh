@@ -18,7 +18,7 @@ set -x
 #
 # Env-var overrides:
 #   TASKS_CONFIG               yaml with train_tasks/val_tasks
-#                              (default: configs/multi_task_multi_episode_config.yaml)
+#                              (default: configs/multi_task_summarization_config.yaml)
 #   MODEL_PATH                 HF id or local path (default: Qwen/Qwen3-4B,
 #                              i.e. inherits the underlying script's default)
 #   MODE                       summarization mode: token | episodic | both
@@ -34,7 +34,7 @@ set -x
 # Run from the repo root with the appropriate conda environment already
 # activated.
 
-TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_multi_episode_config.yaml}
+TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_summarization_config.yaml}
 
 if [ ! -f "$TASKS_CONFIG" ]; then
     echo "Error: tasks config not found: $TASKS_CONFIG" >&2
