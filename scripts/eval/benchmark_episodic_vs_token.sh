@@ -28,7 +28,6 @@ set -x
 #   EXPERIMENT_TAG            — suffix for W&B experiment names
 #   MAX_CTX                   — max context length (default: 32768)
 #   SUMMARY_MAX_TOKENS        — summary completion budget (default: 8192)
-#   MAX_SUMMARIZATIONS        — cap per trajectory (default: 5)
 #   SUMMARIZATION_THRESHOLD   — token threshold for mode=token (default: 16384)
 #   SKIP_BASE                 — set to 1 to skip the base-model runs
 #   SKIP_ORBIT                — set to 1 to skip the ORBIT-model runs
@@ -59,7 +58,6 @@ EXPERIMENT_TAG=${EXPERIMENT_TAG:-episodic-vs-token}
 
 SUMMARIZATION_THRESHOLD=${SUMMARIZATION_THRESHOLD:-8192}
 SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-4096}
-MAX_SUMMARIZATIONS=${MAX_SUMMARIZATIONS:-5}
 
 if [ ! -f "$EVAL_CONFIG" ]; then
     echo "Error: eval config not found: $EVAL_CONFIG" >&2
@@ -90,7 +88,6 @@ summ_overrides() {
         +rllm.agent.summarization.mode="$mode"
         +rllm.agent.summarization.threshold_tokens=$SUMMARIZATION_THRESHOLD
         +rllm.agent.summarization.summary_max_tokens=$SUMMARY_MAX_TOKENS
-        +rllm.agent.summarization.max_summarizations=$MAX_SUMMARIZATIONS
     )
     printf '%s\n' "${out[@]}"
 }

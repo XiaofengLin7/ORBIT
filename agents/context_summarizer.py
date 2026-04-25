@@ -45,7 +45,6 @@ class ContextSummarizerMixin:
 
     * ``summarization_threshold_tokens`` (int, default 16384)
     * ``summary_max_tokens`` (int, default 8192)
-    * ``max_summarizations`` (int, default 5)
     * ``mode`` (str, default ``"token"``) — one of ``"token" | "episodic" | "both"``.
       Controls which trigger predicates return True. ``"token"`` preserves the
       original threshold-based behavior. ``"episodic"`` fires only on episode
@@ -64,7 +63,6 @@ class ContextSummarizerMixin:
             "summarization_threshold_tokens", 16384
         )
         self.summary_max_tokens: int = kwargs.pop("summary_max_tokens", 8192)
-        self.max_summarizations: int = kwargs.pop("max_summarizations", 5)
         self.summarization_mode: str = kwargs.pop("mode", "token")
         if self.summarization_mode not in self._VALID_MODES:
             raise ValueError(
@@ -95,8 +93,6 @@ class ContextSummarizerMixin:
         """
         if self.summarization_mode not in ("token", "both"):
             return False
-        if self._summarization_count >= self.max_summarizations:
-            return False
         messages = self._messages  # type: ignore[attr-defined]
         # Need at least system + 1 user + 1 assistant to summarize.
         if len(messages) < 3:
@@ -118,8 +114,6 @@ class ContextSummarizerMixin:
         ``info["episode_done"]`` to detect the episode boundary.
         """
         if self.summarization_mode not in ("episodic", "both"):
-            return False
-        if self._summarization_count >= self.max_summarizations:
             return False
         messages = self._messages  # type: ignore[attr-defined]
         if len(messages) < 3:

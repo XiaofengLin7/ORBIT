@@ -25,7 +25,6 @@ def _make_agent(cls=GEMTextAgentWithSummarization, threshold=100, **kwargs):
         system_prompt=SYSTEM_PROMPT,
         summarization_threshold_tokens=threshold,
         summary_max_tokens=64,
-        max_summarizations=3,
     )
     defaults.update(kwargs)
     return cls(**defaults)
@@ -73,7 +72,6 @@ class TestInitAndReset:
         agent = _make_agent(threshold=500)
         assert agent.summarization_threshold_tokens == 500
         assert agent.summary_max_tokens == 64
-        assert agent.max_summarizations == 3
         assert agent._summarization_count == 0
 
     def test_init_pops_kwargs_before_super(self):
@@ -96,7 +94,6 @@ class TestInitAndReset:
         agent = GEMTextAgentWithSummarization(system_prompt=SYSTEM_PROMPT)
         assert agent.summarization_threshold_tokens == 16384
         assert agent.summary_max_tokens == 8192
-        assert agent.max_summarizations == 5
 
 
 # ---------------------------------------------------------------------------
@@ -120,12 +117,6 @@ class TestShouldSummarize:
         agent = _make_agent(threshold=1)
         # Only system prompt + 1 user message (no assistant yet).
         agent.update_from_env(observation="hello", reward=0.0, done=False, info={})
-        tokenizer, parser = _make_tokenizer_and_parser()
-        assert agent.should_summarize(tokenizer, parser) is False
-
-    def test_returns_false_when_max_summarizations_reached(self):
-        agent = _make_agent(threshold=10, max_summarizations=0)
-        _simulate_steps(agent, 5)
         tokenizer, parser = _make_tokenizer_and_parser()
         assert agent.should_summarize(tokenizer, parser) is False
 
@@ -357,11 +348,6 @@ class TestSummarizationMode:
     def test_episode_end_requires_enough_messages(self):
         agent = _make_agent(mode="episodic")
         # Only system prompt — not enough.
-        assert agent.should_summarize_on_episode_end({"episode_done": True}) is False
-
-    def test_episode_end_respects_max_summarizations(self):
-        agent = _make_agent(mode="episodic", max_summarizations=0)
-        _simulate_steps(agent, 3)
         assert agent.should_summarize_on_episode_end({"episode_done": True}) is False
 
 

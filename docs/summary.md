@@ -47,7 +47,6 @@ continue trajectory   (next env obs gets appended on the NEXT iteration's update
 
 Trigger predicate (`should_summarize`): fires when **all** of
 - `summarization_mode in {"token", "both"}`
-- `_summarization_count < max_summarizations`
 - `len(_messages) >= 3`
 - the full chat history (system + every user + every assistant turn) rendered through the chat template tokenizes to ≥ `summarization_threshold_tokens` — this is the agent's entire accumulated context, not just the final prompt
 
@@ -112,7 +111,6 @@ The trainer auto-sets `env_args.reflection_via_summarization=True` when mode ∈
 
 Trigger predicate (`should_summarize_on_episode_end`): fires when **all** of
 - `summarization_mode in {"episodic", "both"}`
-- `_summarization_count < max_summarizations`
 - `len(_messages) >= 3`
 - `info["episode_done"] is True`
 
@@ -156,7 +154,7 @@ elif agent.should_summarize(tokenizer, chat_parser):
 Consequences:
 - On an episode-boundary step that also crossed the token threshold, the **episodic** path wins (soft-fail semantics).
 - On a mid-episode step that crossed the threshold, the **token** path fires (hard-fail semantics).
-- `max_summarizations` caps the two triggers together.
+- There is no global cap on the number of summarizations per trajectory — both triggers fire as often as their predicates say.
 
 ---
 

@@ -27,7 +27,6 @@ set -x
 #                              (default: 16384)
 #   SUMMARY_MAX_TOKENS         summary completion budget
 #                              (default: 4096)
-#   MAX_SUMMARIZATIONS         per-trajectory cap (default: 5)
 #
 # Any additional Hydra overrides given as positional args are forwarded.
 # =============================================================================
@@ -46,7 +45,6 @@ fi
 MODE=${MODE:-episodic}
 SUMMARIZATION_THRESHOLD=${SUMMARIZATION_THRESHOLD:-16384}
 SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-4096}
-MAX_SUMMARIZATIONS=${MAX_SUMMARIZATIONS:-5}
 
 case "$MODE" in
     token|episodic|both) ;;
@@ -62,7 +60,6 @@ SUMM=(
     +rllm.agent.summarization.mode="$MODE"
     +rllm.agent.summarization.threshold_tokens=$SUMMARIZATION_THRESHOLD
     +rllm.agent.summarization.summary_max_tokens=$SUMMARY_MAX_TOKENS
-    +rllm.agent.summarization.max_summarizations=$MAX_SUMMARIZATIONS
 )
 
 echo "=========================================="
@@ -71,7 +68,6 @@ echo "  TASKS_CONFIG = $TASKS_CONFIG"
 echo "  MODE         = $MODE"
 echo "  threshold    = $SUMMARIZATION_THRESHOLD"
 echo "  summary_max  = $SUMMARY_MAX_TOKENS"
-echo "  max_summ     = $MAX_SUMMARIZATIONS"
 echo "=========================================="
 
 TASKS_CONFIG="$TASKS_CONFIG" \

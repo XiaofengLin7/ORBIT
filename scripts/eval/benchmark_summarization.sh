@@ -20,7 +20,6 @@ set -x
 #   EXPERIMENT_TAG             — suffix for experiment names (default: "benchmark-summ")
 #   SUMMARIZATION_THRESHOLD    — token threshold to trigger summarization (default: 16384)
 #   SUMMARY_MAX_TOKENS         — max tokens for the generated summary (default: 8192)
-#   MAX_SUMMARIZATIONS         — cap on summarizations per trajectory (default: 5)
 #   SKIP_GEM                   — set to 1 to skip GEM val tasks
 #   SKIP_ALFWORLD              — set to 1 to skip ALFWorld
 #   SKIP_WEBSHOP               — set to 1 to skip WebShop
@@ -49,7 +48,6 @@ MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 # Summarization parameters
 SUMMARIZATION_THRESHOLD=${SUMMARIZATION_THRESHOLD:-16384}
 SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-8192}
-MAX_SUMMARIZATIONS=${MAX_SUMMARIZATIONS:-5}
 
 SKIP_GEM=${SKIP_GEM:-0}
 SKIP_ALFWORLD=${SKIP_ALFWORLD:-0}
@@ -73,7 +71,6 @@ SUMM=(
     +rllm.agent.summarization.enable=true
     +rllm.agent.summarization.threshold_tokens=$SUMMARIZATION_THRESHOLD
     +rllm.agent.summarization.summary_max_tokens=$SUMMARY_MAX_TOKENS
-    +rllm.agent.summarization.max_summarizations=$MAX_SUMMARIZATIONS
 )
 
 STEP=0

@@ -97,7 +97,6 @@ rllm.agent.name=gem_text_agent_summarizing  # or gem_text_agent_noncumulative_su
 +rllm.agent.summarization.enable=true
 +rllm.agent.summarization.threshold_tokens=16384
 +rllm.agent.summarization.summary_max_tokens=8192
-+rllm.agent.summarization.max_summarizations=5
 ```
 
 **Eval:**

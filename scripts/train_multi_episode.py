@@ -142,7 +142,6 @@ def main(cfg) -> None:  # type: ignore
         for key in (
             "summarization_threshold_tokens",
             "summary_max_tokens",
-            "max_summarizations",
         ):
             # Map config keys → agent kwargs (config uses shorter names).
             cfg_key = key.replace("summarization_", "")
