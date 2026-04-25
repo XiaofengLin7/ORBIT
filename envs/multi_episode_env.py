@@ -707,6 +707,20 @@ class MultiEpisodeEnv(BaseEnv):
             Augmented info dictionary.
         """
         info = dict(base_info or {})
+        # When the task config didn't set an explicit num_episodes (i.e. the
+        # trajectory is bounded only by total_step_cap), advertise a sensible
+        # estimated count to consumers — derived as the worst-case full-length
+        # episode count that fits inside total_step_cap. This is informational
+        # only; it does not become a hard trajectory cap.
+        displayed_num_episodes = self.num_episodes
+        if displayed_num_episodes is None:
+            try:
+                inner_max_turns = self._get_max_turns()
+                if inner_max_turns and inner_max_turns > 0:
+                    displayed_num_episodes = max(1, self.total_step_cap // int(inner_max_turns))
+            except Exception:
+                pass
+
         info.update(
             {
                 "episode_index": episode_index,
@@ -716,7 +730,7 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode_done": episode_done,
                 "multi_episode": True,
                 "step_cap": self.total_step_cap,
-                "num_episodes": self.num_episodes,
+                "num_episodes": displayed_num_episodes,
                 "episode_successes": list(self._episode_successes),
                 "episode_lengths": list(self._episode_lengths),
             }
