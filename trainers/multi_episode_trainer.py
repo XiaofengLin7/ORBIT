@@ -79,6 +79,12 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         self.val_env_args = val_env_args
         self.summarization_config = summarization_config
         self._is_validation_mode = False
+        # Accumulates per-trajectory engine metrics (e.g. summarization_count,
+        # segment_count) across all val batches. Populated by
+        # _transform_agent_trajectories when in validation mode and consumed
+        # by _validate_agent at the end to emit val/{data_source}/<k>/<stat>
+        # and val/all/<k>/<stat> metrics.
+        self._val_traj_metrics_buffer: list[tuple[str, dict]] = []
 
     def _get_engine_class(self):
         """Return the execution engine class to use."""
@@ -133,6 +139,9 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         """
         # Enable validation mode for init_envs_and_agents
         self._is_validation_mode = True
+        # Reset the per-trajectory engine-metric buffer; it is populated
+        # during _transform_agent_trajectories calls made below.
+        self._val_traj_metrics_buffer = []
 
         rewards_lst = []
         data_source_lst = []
@@ -286,6 +295,42 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                     for task_type, tt_metrics_list in task_type_groups.items():
                         _aggregate_numeric_metrics(tt_metrics_list, f"val/{data_source}/{task_type}")
 
+        # Per-trajectory engine metrics (summarization_count, segment_count, …)
+        # buffered during _transform_agent_trajectories when _is_validation_mode
+        # was True. We surface them here so the val dashboard shows, per task
+        # variant AND overall, how many summarizations each rollout fired.
+        if self._val_traj_metrics_buffer:
+            TRAJ_METRIC_KEYS = ("summarization_count", "segment_count")
+
+            by_source: dict[str, list[dict]] = {}
+            for ds, m in self._val_traj_metrics_buffer:
+                by_source.setdefault(ds, []).append(m)
+
+            overall_by_key: dict[str, list[float]] = {}
+            for ds, metrics_list in by_source.items():
+                for key in TRAJ_METRIC_KEYS:
+                    values = [
+                        float(m[key])
+                        for m in metrics_list
+                        if key in m and isinstance(m[key], (int, float))
+                    ]
+                    if not values:
+                        continue
+                    arr = np.array(values)
+                    metric_dict[f"val/{ds}/{key}/mean"] = float(arr.mean())
+                    metric_dict[f"val/{ds}/{key}/sum"] = float(arr.sum())
+                    metric_dict[f"val/{ds}/{key}/min"] = float(arr.min())
+                    metric_dict[f"val/{ds}/{key}/max"] = float(arr.max())
+                    overall_by_key.setdefault(key, []).extend(values)
+
+            for key, values in overall_by_key.items():
+                arr = np.array(values)
+                metric_dict[f"val/all/{key}/mean"] = float(arr.mean())
+                metric_dict[f"val/all/{key}/sum"] = float(arr.sum())
+                metric_dict[f"val/all/{key}/min"] = float(arr.min())
+                metric_dict[f"val/all/{key}/max"] = float(arr.max())
+                metric_dict[f"val/all/{key}/count_trajectories"] = len(values)
+
         # Disable validation mode
         self._is_validation_mode = False
 
@@ -317,13 +362,20 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                     data_source = batch_data_sources[traj_idx]
                 else:
                     data_source = "unknown"
-                
+
                 if data_source not in traj_metrics_by_source:
                     traj_metrics_by_source[data_source] = []
-                
+
                 traj_metrics = traj.get("metrics", {})
                 if traj_metrics:
                     traj_metrics_by_source[data_source].append(traj_metrics)
+                    # During validation, accumulate raw per-trajectory metrics
+                    # so _validate_agent can aggregate them across all val
+                    # batches under val/{data_source}/<k>/<stat>.
+                    if self._is_validation_mode:
+                        self._val_traj_metrics_buffer.append(
+                            (str(data_source), dict(traj_metrics))
+                        )
             
             # Aggregate metrics per data_source
             for data_source, metrics_list in traj_metrics_by_source.items():
