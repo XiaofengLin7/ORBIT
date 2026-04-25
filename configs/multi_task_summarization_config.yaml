@@ -1,0 +1,242 @@
+# Multi-Task GEM Training Configuration — summarization-focused.
+#
+# Differences from multi_task_multi_episode_config.yaml:
+#   * Mastermind ↔ Wordle swapped: Mastermind is now a TRAIN task (it benefits
+#     most from cross-episode summarization), Wordle is now a VAL task.
+#   * Each task is expanded into multiple num_episodes variants so the agent
+#     experiences a range of horizons during training/eval. The trainer's
+#     data_source aggregation suffixes "-ep{N}", so per-horizon metrics show
+#     up separately in W&B (e.g. game:Mastermind-v0-random-ep2/...).
+#
+# Train horizons: {2, 3, 4, 5}     → 5 tasks × 4 = 20 task entries (train_size=128 each)
+# Val   horizons: {2, 3, 4, 5, 10}  → 2 tasks × 5 = 10 task entries (test_size=128 each)
+#
+# total_step_cap is set as num_episodes * max_turns_per_episode so each
+# trajectory has just enough budget to play out the requested episode count.
+
+train_tasks:
+  # ---- rockpaperscissors (max_turns=5) ------------------------------------
+  - env_id: "rockpaperscissors"
+    max_turns_per_episode: 5
+    num_episodes: 2
+    total_step_cap: 10
+    train_size: 128
+    inner_env_class: 'envs.rps_env_adapter.RockPaperScissorsEnvAdapter'
+    min_dom: 0.4
+  - env_id: "rockpaperscissors"
+    max_turns_per_episode: 5
+    num_episodes: 3
+    total_step_cap: 15
+    train_size: 128
+    inner_env_class: 'envs.rps_env_adapter.RockPaperScissorsEnvAdapter'
+    min_dom: 0.4
+  - env_id: "rockpaperscissors"
+    max_turns_per_episode: 5
+    num_episodes: 4
+    total_step_cap: 20
+    train_size: 128
+    inner_env_class: 'envs.rps_env_adapter.RockPaperScissorsEnvAdapter'
+    min_dom: 0.4
+  - env_id: "rockpaperscissors"
+    max_turns_per_episode: 5
+    num_episodes: 5
+    total_step_cap: 25
+    train_size: 128
+    inner_env_class: 'envs.rps_env_adapter.RockPaperScissorsEnvAdapter'
+    min_dom: 0.4
+
+  # ---- Minesweeper (max_turns=8) ------------------------------------------
+  - env_id: "game:Minesweeper-v0-only-reveal"
+    max_turns_per_episode: 8
+    num_episodes: 2
+    total_step_cap: 16
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Minesweeper-v0-only-reveal"
+    max_turns_per_episode: 8
+    num_episodes: 3
+    total_step_cap: 24
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Minesweeper-v0-only-reveal"
+    max_turns_per_episode: 8
+    num_episodes: 4
+    total_step_cap: 32
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Minesweeper-v0-only-reveal"
+    max_turns_per_episode: 8
+    num_episodes: 5
+    total_step_cap: 40
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+  # ---- Hangman (max_turns=10) ---------------------------------------------
+  - env_id: "game:Hangman-v0-easy"
+    max_turns_per_episode: 10
+    num_episodes: 2
+    total_step_cap: 20
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Hangman-v0-easy"
+    max_turns_per_episode: 10
+    num_episodes: 3
+    total_step_cap: 30
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Hangman-v0-easy"
+    max_turns_per_episode: 10
+    num_episodes: 4
+    total_step_cap: 40
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Hangman-v0-easy"
+    max_turns_per_episode: 10
+    num_episodes: 5
+    total_step_cap: 50
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+  # ---- Mastermind (max_turns=3) — moved from val ---------------------------
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    num_episodes: 2
+    total_step_cap: 6
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    num_episodes: 3
+    total_step_cap: 9
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    num_episodes: 4
+    total_step_cap: 12
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Mastermind-v0-random"
+    max_turns_per_episode: 3
+    num_episodes: 5
+    total_step_cap: 15
+    code_length: 3
+    num_numbers: 6
+    duplicate_numbers: False
+    train_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+
+  # ---- Blackjack (max_turns=4) --------------------------------------------
+  - env_id: "game:Blackjack-v0"
+    max_turns_per_episode: 4
+    num_episodes: 2
+    total_step_cap: 8
+    train_size: 128
+    inner_env_class: 'envs.blackjack_env_adapter.BlackjackEnvAdapter'
+  - env_id: "game:Blackjack-v0"
+    max_turns_per_episode: 4
+    num_episodes: 3
+    total_step_cap: 12
+    train_size: 128
+    inner_env_class: 'envs.blackjack_env_adapter.BlackjackEnvAdapter'
+  - env_id: "game:Blackjack-v0"
+    max_turns_per_episode: 4
+    num_episodes: 4
+    total_step_cap: 16
+    train_size: 128
+    inner_env_class: 'envs.blackjack_env_adapter.BlackjackEnvAdapter'
+  - env_id: "game:Blackjack-v0"
+    max_turns_per_episode: 4
+    num_episodes: 5
+    total_step_cap: 20
+    train_size: 128
+    inner_env_class: 'envs.blackjack_env_adapter.BlackjackEnvAdapter'
+
+val_tasks:
+  # ---- Maze (max_turns=9) -------------------------------------------------
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 2
+    total_step_cap: 18
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
+    test_size: 128
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 3
+    total_step_cap: 27
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
+    test_size: 128
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 4
+    total_step_cap: 36
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
+    test_size: 128
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 5
+    total_step_cap: 45
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
+    test_size: 128
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 10
+    total_step_cap: 90
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
+    test_size: 128
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
+
+  # ---- Wordle (max_turns=10) — moved from train --------------------------
+  - env_id: "game:Wordle-v0-hard"
+    max_turns_per_episode: 10
+    num_episodes: 2
+    total_step_cap: 20
+    test_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Wordle-v0-hard"
+    max_turns_per_episode: 10
+    num_episodes: 3
+    total_step_cap: 30
+    test_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Wordle-v0-hard"
+    max_turns_per_episode: 10
+    num_episodes: 4
+    total_step_cap: 40
+    test_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Wordle-v0-hard"
+    max_turns_per_episode: 10
+    num_episodes: 5
+    total_step_cap: 50
+    test_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
+  - env_id: "game:Wordle-v0-hard"
+    max_turns_per_episode: 10
+    num_episodes: 10
+    total_step_cap: 100
+    test_size: 128
+    inner_env_class: 'envs.gem_env_adapter.GEMEnvAdapter'
