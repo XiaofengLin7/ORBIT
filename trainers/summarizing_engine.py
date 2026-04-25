@@ -29,6 +29,10 @@ from rllm.agents.utils import (
 from rllm.environments.env_utils import compute_mc_return, compute_trajectory_reward
 from rllm.utils import colorful_print
 
+from prompts.summarization_prompts import (
+    CONTEXT_SUMMARY_PROMPT,
+    REFLECTIVE_SUMMARY_PROMPT,
+)
 from trainers.multi_episode_trainer import MultiEpisodeAsyncAgentExecutionEngine
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,24 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 self.chat_parser.generation_prompt, add_special_tokens=False
             )
         )
+
+        # Pre-tokenize the two possible summarization instructions once per
+        # trajectory, so the post-env budget check can include the instruction
+        # length and `_do_summarization` doesn't have to re-tokenize each fire.
+        def _tokenize_instruction(text: str) -> list[int]:
+            toks, _ = convert_messages_to_tokens_and_masks(
+                [{"role": "user", "content": text}],
+                tokenizer=self.tokenizer,
+                parser=self.chat_parser,
+                contains_first_msg=False,
+                contains_generation_msg=True,
+            )
+            return list(toks)
+
+        cached_instruction_tokens = {
+            "context": _tokenize_instruction(CONTEXT_SUMMARY_PROMPT),
+            "reflective": _tokenize_instruction(REFLECTIVE_SUMMARY_PROMPT),
+        }
 
         # Reset environment
         loop = asyncio.get_event_loop()
@@ -180,63 +202,6 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             action: Action = agent.update_from_model(response)
             action = action.action
 
-            # ---- SUMMARIZATION CHECK (after model response, before env step) ----
-            if agent_can_summarize and agent.should_summarize(
-                self.tokenizer, self.chat_parser
-            ):
-                # Guard: check if there's enough response budget for
-                # summarization (instruction + completion tokens).
-                summ_budget_needed = agent.summary_max_tokens
-                if (
-                    not self.enforce_max_prompt_length
-                    and response_token_len + summ_budget_needed
-                    >= self.max_response_length
-                ):
-                    # Not enough response budget — treat as truncation.
-                    termination_reason = "SUMMARIZATION_BUDGET_EXCEEDED"
-                    colorful_print(
-                        f"Trajectory {idx}: summarization skipped — "
-                        f"response budget exhausted "
-                        f"({response_token_len}/{self.max_response_length}).\n",
-                        "red",
-                    )
-                    break
-
-                start_time = time.time()
-                summ_result = await self._do_summarization(
-                    agent,
-                    application_id,
-                    episode_steps,
-                    summarization_boundaries,
-                    segment_chat_histories=segment_chat_histories,
-                    generation_kwargs=kwargs,
-                    accumulated_prompt_ids=accumulated_prompt_ids,
-                    initial_system_tokens=initial_system_tokens,
-                    gen_prompt_tokens=gen_prompt_tokens,
-                    mode=mode,
-                )
-                delta_time = time.time() - start_time
-                llm_time += delta_time
-                total_time += delta_time
-
-                if summ_result is None:
-                    # Summarization failed (prompt exceeded max_model_len
-                    # or other error) — treat as truncation.
-                    termination_reason = "SUMMARIZATION_FAILED"
-                    colorful_print(
-                        f"Trajectory {idx}: summarization failed.\n",
-                        "red",
-                    )
-                    break
-
-                accumulated_prompt_ids, summ_response_len = summ_result
-                # Reset response budget for the new segment — each segment
-                # is an independent training sample with its own budget.
-                response_token_len = 0
-                summarization_just_applied = True
-            else:
-                summarization_just_applied = False
-
             # Step environment
             start_time = time.time()
             try:
@@ -283,13 +248,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 chat_completions_messages
             )
 
-            # After summarization, messages are [sys, summary, obs] — no
-            # assistant message exists.  The assistant response was part of
-            # the previous segment and is already recorded.
-            if not summarization_just_applied:
-                assert assistant_message is not None or mode != "Token", (
-                    "Assistant messages is none when accumulating token trajectories."
-                )
+            # Summarization now fires after update_from_env (below), so the
+            # agent history always ends with the step's env observation by
+            # the time we tokenize here — assistant_message is always present.
+            assert assistant_message is not None or mode != "Token", (
+                "Assistant messages is none when accumulating token trajectories."
+            )
             assert env_messages is not None or mode != "Token", (
                 "Environment messages is none when accumulating token trajectories."
             )
@@ -365,6 +329,138 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 and env_msg_tokens
             ):
                 accumulated_prompt_ids.extend(env_msg_tokens)
+
+            # ---- SUMMARIZATION CHECK (post-env: unified token + episodic) ----
+            # The agent has fully observed the env's response to its action by
+            # this point. Episodic trigger takes priority; token is the fallback.
+            summ_trigger: str | None = None
+            if agent_can_summarize:
+                if (
+                    hasattr(agent, "should_summarize_on_episode_end")
+                    and agent.should_summarize_on_episode_end(info)
+                ):
+                    summ_trigger = "episode_end"
+                elif agent.should_summarize(self.tokenizer, self.chat_parser):
+                    summ_trigger = "token"
+
+            if summ_trigger is not None:
+                # Select the instruction variant the next call would actually
+                # use, so the budget check counts its tokens too.
+                use_reflective = (
+                    summ_trigger == "episode_end"
+                    and getattr(env, "enable_reflection", False)
+                )
+                instr_tokens = cached_instruction_tokens[
+                    "reflective" if use_reflective else "context"
+                ]
+                summ_budget_needed = agent.summary_max_tokens + len(instr_tokens)
+                budget_exhausted = (
+                    not self.enforce_max_prompt_length
+                    and response_token_len + summ_budget_needed
+                    >= self.max_response_length
+                )
+                if budget_exhausted:
+                    if summ_trigger == "token":
+                        termination_reason = "SUMMARIZATION_BUDGET_EXCEEDED"
+                        colorful_print(
+                            f"Trajectory {idx}: summarization skipped — "
+                            f"response budget exhausted "
+                            f"({response_token_len}+{summ_budget_needed}"
+                            f">={self.max_response_length}).\n",
+                            "red",
+                        )
+                        break
+                    else:
+                        colorful_print(
+                            f"Trajectory {idx}: episodic summarization skipped — "
+                            f"response budget exhausted "
+                            f"({response_token_len}+{summ_budget_needed}"
+                            f">={self.max_response_length}).\n",
+                            "yellow",
+                        )
+                else:
+                    start_time = time.time()
+                    summ_result = await self._do_summarization(
+                        agent,
+                        application_id,
+                        episode_steps,
+                        summarization_boundaries,
+                        segment_chat_histories=segment_chat_histories,
+                        generation_kwargs=kwargs,
+                        accumulated_prompt_ids=accumulated_prompt_ids,
+                        initial_system_tokens=initial_system_tokens,
+                        gen_prompt_tokens=gen_prompt_tokens,
+                        mode=mode,
+                        trigger=summ_trigger,
+                        use_reflective_prompt=use_reflective,
+                        summ_instruction_tokens=instr_tokens,
+                    )
+                    delta_time = time.time() - start_time
+                    llm_time += delta_time
+                    total_time += delta_time
+
+                    if summ_result is None:
+                        if summ_trigger == "token":
+                            termination_reason = "SUMMARIZATION_FAILED"
+                            colorful_print(
+                                f"Trajectory {idx}: summarization failed.\n",
+                                "red",
+                            )
+                            break
+                        else:
+                            # Episodic path: soft-skip on context-window
+                            # violation. Continue trajectory as usual.
+                            colorful_print(
+                                f"Trajectory {idx}: episodic summarization skipped "
+                                f"(context window would be exceeded).\n",
+                                "yellow",
+                            )
+                    else:
+                        accumulated_prompt_ids, _ = summ_result
+                        # Each segment is an independent training sample with
+                        # its own response budget.
+                        response_token_len = 0
+
+                        # Episodic: advance env to the new episode and inject
+                        # its initial observation into agent history + token
+                        # accumulation. This is how we keep the post-summary
+                        # layout `[sys, summary, new_episode_obs]` without a
+                        # wasted LLM call.
+                        if (
+                            summ_trigger == "episode_end"
+                            and getattr(env, "_pending_episode_start", False)
+                        ):
+                            new_obs, new_info = await loop.run_in_executor(
+                                self.executor, env.start_new_episode
+                            )
+                            new_info["max_steps"] = self.max_steps
+                            new_info["cur_tokens"] = response_token_len
+                            agent.update_from_env(
+                                observation=new_obs,
+                                reward=0.0,
+                                done=False,
+                                info=new_info,
+                            )
+                            new_env_msgs = [
+                                {"role": "user", "content": str(new_obs)}
+                            ]
+                            new_env_tokens, new_env_masks = (
+                                convert_messages_to_tokens_and_masks(
+                                    new_env_msgs,
+                                    tokenizer=self.tokenizer,
+                                    parser=self.chat_parser,
+                                    contains_first_msg=False,
+                                    contains_generation_msg=True,
+                                )
+                            )
+                            response_tokens.extend(new_env_tokens)
+                            response_masks.extend(new_env_masks)
+                            if (
+                                mode == "Token"
+                                and accumulated_prompt_ids is not None
+                                and new_env_tokens
+                            ):
+                                accumulated_prompt_ids.extend(new_env_tokens)
 
             if step_idx == self.max_steps - 1:
                 termination_reason = "MAX_STEPS"
@@ -502,6 +598,9 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         initial_system_tokens: list[int],
         gen_prompt_tokens: list[int],
         mode: str,
+        trigger: str = "token",
+        use_reflective_prompt: bool = False,
+        summ_instruction_tokens: list[int] | None = None,
     ) -> tuple[list[int] | None, int] | None:
         """Generate a summary, apply it, and return updated accumulated_prompt_ids.
 
@@ -509,14 +608,26 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         like an environment message (mask=0).  The summary completion is
         recorded as a regular step (mask=1, trained on).
 
+        Args:
+            trigger: Which condition triggered this summarization —
+                ``"token"`` or ``"episode_end"``. Recorded as metadata.
+            use_reflective_prompt: Select the reflective-style instruction
+                (``REFLECTIVE_SUMMARY_PROMPT``) instead of the default
+                compression prompt. Used for episode-end triggers when the
+                env has ``enable_reflection=True``.
+            summ_instruction_tokens: Optional pre-tokenized instruction
+                tokens (the chat-template rendering of the summarization
+                prompt as a user message). When provided, avoids a
+                re-tokenization call. Must match ``use_reflective_prompt``.
+
         Returns:
             Tuple of (new_accumulated_prompt_ids, response_token_len_delta),
             or ``None`` if summarization failed (e.g. prompt exceeded
             max_model_len).
         """
-        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
-
-        summary_prompt = agent.build_summarization_prompt()
+        summary_prompt = agent.build_summarization_prompt(
+            trigger=trigger, use_reflective_prompt=use_reflective_prompt
+        )
 
         # Use a separate kwargs dict so we don't pollute the caller's.
         summ_kwargs = {
@@ -526,15 +637,20 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         }
         summ_kwargs["max_tokens"] = agent.summary_max_tokens
 
-        # Tokenize the summarization instruction as a user message
-        # (same pattern as env_msg_tokens: user msg + generation prompt).
-        summ_instruction_tokens, _ = convert_messages_to_tokens_and_masks(
-            [{"role": "user", "content": CONTEXT_SUMMARY_PROMPT}],
-            tokenizer=self.tokenizer,
-            parser=self.chat_parser,
-            contains_first_msg=False,
-            contains_generation_msg=True,
-        )
+        # Tokenize the summarization instruction as a user message (same
+        # pattern as env_msg_tokens: user msg + generation prompt). When the
+        # caller passed a pre-tokenized variant, reuse it directly.
+        if summ_instruction_tokens is None:
+            instruction_text = (
+                REFLECTIVE_SUMMARY_PROMPT if use_reflective_prompt else CONTEXT_SUMMARY_PROMPT
+            )
+            summ_instruction_tokens, _ = convert_messages_to_tokens_and_masks(
+                [{"role": "user", "content": instruction_text}],
+                tokenizer=self.tokenizer,
+                parser=self.chat_parser,
+                contains_first_msg=False,
+                contains_generation_msg=True,
+            )
         summ_instruction_len = len(summ_instruction_tokens)
 
         # Build summarization prompt tokens incrementally.
@@ -600,6 +716,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 "completion_ids": list(summary_output.completion_ids),
                 "logprobs": getattr(summary_output, "logprobs", []),
                 "is_summarization": True,
+                "trigger": trigger,
             }
         )
         summarization_boundaries.append(len(episode_steps) - 1)
@@ -607,20 +724,21 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         # Snapshot this segment's full conversation before it's replaced.
         segment_chat_histories.append(agent.chat_completions)
 
-        agent.apply_summary(summary_output.text)
+        agent.apply_summary(summary_output.text, trigger=trigger)
 
         colorful_print(
             f"Summarization #{len(summarization_boundaries)} applied "
-            f"(step {len(episode_steps) - 1}, "
+            f"(trigger={trigger}, step {len(episode_steps) - 1}, "
             f"summary_tokens={summ_completion_len}). "
             f"Messages: {agent.get_summarization_metadata()}\n",
             "cyan",
         )
 
         # Build post-summary accumulated tokens incrementally.
+        # After apply_summary: chat_completions = [sys, summary_user_msg].
         new_accumulated: list[int] | None = None
         if mode == "Token":
-            summary_user_msg = agent.chat_completions[1]  # <context_summary> msg
+            summary_user_msg = agent.chat_completions[1]
             summary_msg_tokens, _ = convert_messages_to_tokens_and_masks(
                 [summary_user_msg],
                 tokenizer=self.tokenizer,

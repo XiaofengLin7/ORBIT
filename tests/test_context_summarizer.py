@@ -303,3 +303,150 @@ class TestComposedClasses:
             tokenizer, parser = _make_tokenizer_and_parser()
             # With threshold=10, should_summarize should be True after 3 steps.
             assert agent.should_summarize(tokenizer, parser) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: summarization modes (token | episodic | both)
+# ---------------------------------------------------------------------------
+
+class TestSummarizationMode:
+    def test_default_mode_is_token(self):
+        agent = _make_agent()
+        assert agent.summarization_mode == "token"
+
+    def test_mode_set_via_kwarg(self):
+        agent = _make_agent(mode="episodic")
+        assert agent.summarization_mode == "episodic"
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError):
+            _make_agent(mode="not-a-mode")
+
+    def test_episodic_mode_disables_token_path(self):
+        """With mode='episodic', should_summarize (token path) must return False
+        even when the prompt exceeds the token threshold."""
+        agent = _make_agent(threshold=10, mode="episodic")
+        _simulate_steps(agent, 3)
+        tokenizer, parser = _make_tokenizer_and_parser()
+        assert agent.should_summarize(tokenizer, parser) is False
+
+    def test_token_mode_disables_episode_end_path(self):
+        agent = _make_agent(mode="token")
+        _simulate_steps(agent, 3)
+        assert agent.should_summarize_on_episode_end({"episode_done": True}) is False
+
+    def test_episode_end_trigger_under_episodic_and_both(self):
+        for mode in ("episodic", "both"):
+            agent = _make_agent(mode=mode)
+            _simulate_steps(agent, 3)
+            assert (
+                agent.should_summarize_on_episode_end({"episode_done": True}) is True
+            ), f"mode={mode}"
+            # No episode_done → still False
+            assert (
+                agent.should_summarize_on_episode_end({"episode_done": False}) is False
+            )
+
+    def test_both_mode_enables_both_paths(self):
+        agent = _make_agent(threshold=10, mode="both")
+        _simulate_steps(agent, 3)
+        tokenizer, parser = _make_tokenizer_and_parser()
+        assert agent.should_summarize(tokenizer, parser) is True
+        assert agent.should_summarize_on_episode_end({"episode_done": True}) is True
+
+    def test_episode_end_requires_enough_messages(self):
+        agent = _make_agent(mode="episodic")
+        # Only system prompt — not enough.
+        assert agent.should_summarize_on_episode_end({"episode_done": True}) is False
+
+    def test_episode_end_respects_max_summarizations(self):
+        agent = _make_agent(mode="episodic", max_summarizations=0)
+        _simulate_steps(agent, 3)
+        assert agent.should_summarize_on_episode_end({"episode_done": True}) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: build_summarization_prompt with trigger / reflective switch
+# ---------------------------------------------------------------------------
+
+class TestTriggerAwarePrompt:
+    def test_default_uses_context_summary_prompt(self):
+        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
+
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        prompt = agent.build_summarization_prompt(trigger="token")
+        assert prompt[-1]["content"] == CONTEXT_SUMMARY_PROMPT
+
+    def test_episode_end_non_reflective_uses_context_summary(self):
+        from prompts.summarization_prompts import CONTEXT_SUMMARY_PROMPT
+
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        prompt = agent.build_summarization_prompt(
+            trigger="episode_end", use_reflective_prompt=False
+        )
+        assert prompt[-1]["content"] == CONTEXT_SUMMARY_PROMPT
+
+    def test_reflective_prompt_selected_when_requested(self):
+        from prompts.summarization_prompts import REFLECTIVE_SUMMARY_PROMPT
+
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        prompt = agent.build_summarization_prompt(
+            trigger="episode_end", use_reflective_prompt=True
+        )
+        assert prompt[-1]["content"] == REFLECTIVE_SUMMARY_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Tests: apply_summary post-layout (always [sys, summary])
+# ---------------------------------------------------------------------------
+
+class TestApplySummaryLayout:
+    def test_layout_after_trailing_user_msg(self):
+        """Regardless of whether history ends with user or assistant,
+        apply_summary collapses to exactly [system, summary_user_msg]."""
+        agent = _make_agent()
+        _simulate_steps(agent, 3)
+        # End the history on a user message (simulate post-update_from_env state).
+        agent.update_from_env(
+            observation="latest env obs",
+            reward=0.0,
+            done=False,
+            info={},
+        )
+        assert agent._messages[-1]["role"] == "user"
+
+        agent.apply_summary("<context_summary>stuff</context_summary>")
+
+        assert len(agent._messages) == 2
+        assert agent._messages[0]["role"] == "system"
+        assert "<context_summary>" in agent._messages[1]["content"]
+
+    def test_layout_after_trailing_assistant_msg(self):
+        agent = _make_agent()
+        _simulate_steps(agent, 3)
+        # _simulate_steps ends with update_from_model, so last msg is assistant.
+        assert agent._messages[-1]["role"] == "assistant"
+        agent.apply_summary("<context_summary>stuff</context_summary>")
+        assert len(agent._messages) == 2
+
+    def test_trigger_metadata_token(self):
+        agent = _make_agent()
+        _simulate_steps(agent, 3)
+        agent.update_from_env(observation="obs", reward=0.0, done=False, info={})
+        agent.apply_summary(
+            "<context_summary>s</context_summary>", trigger="token"
+        )
+        event = agent._summarization_events[-1]
+        assert event["trigger"] == "token"
+
+    def test_trigger_metadata_episode_end(self):
+        agent = _make_agent()
+        _simulate_steps(agent, 3)
+        agent.apply_summary(
+            "<context_summary>s</context_summary>", trigger="episode_end"
+        )
+        event = agent._summarization_events[-1]
+        assert event["trigger"] == "episode_end"

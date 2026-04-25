@@ -40,6 +40,7 @@ class MultiEpisodeEnv(BaseEnv):
         episode_header: str = "New episode begins.",
         enable_reflection: bool = False,
         num_episodes: Optional[int] = None,
+        reflection_via_summarization: bool = False,
         **kwargs: Any,
     ):
         """Initialize the multi-episode environment wrapper.
@@ -58,6 +59,15 @@ class MultiEpisodeEnv(BaseEnv):
                 When set, the trajectory terminates as soon as this many episodes
                 have completed, even if total_step_cap has not been reached.
                 total_step_cap continues to act as a safety ceiling.
+            reflection_via_summarization: When True, the env's own reflection
+                flow is suppressed (no reflection prompt appended to the
+                terminal observation, no combining with the next episode's
+                initial observation). At episode boundaries ``step()`` returns
+                only the terminal observation and sets
+                ``self._pending_episode_start=True``; the caller (execution
+                engine) is responsible for calling :meth:`start_new_episode`
+                to advance to the next episode. Typically auto-set by the
+                trainer when episodic summarization is enabled.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         super().__init__()
@@ -74,6 +84,7 @@ class MultiEpisodeEnv(BaseEnv):
         self.enable_reflection = enable_reflection
         self.reflection_prompt = reflection_prompt
         self.num_episodes = int(num_episodes) if num_episodes is not None else None
+        self.reflection_via_summarization = bool(reflection_via_summarization)
 
         # Create the inner environment
         self.inner_env: BaseEnv = self.inner_env_class(**self.inner_env_kwargs)
@@ -97,6 +108,10 @@ class MultiEpisodeEnv(BaseEnv):
 
         # Reflection state
         self._waiting_for_reflection: bool = False
+        # Episodic-summarization boundary state: when
+        # reflection_via_summarization=True and an episode just ended,
+        # start_new_episode() is expected to be called before the next step().
+        self._pending_episode_start: bool = False
 
     @staticmethod
     def _resolve_class(class_path: str) -> Type[BaseEnv]:
@@ -143,6 +158,7 @@ class MultiEpisodeEnv(BaseEnv):
         self._seed = seed if seed is not None else self._seed
 
         self._waiting_for_reflection = False
+        self._pending_episode_start = False
 
         # Reset inner environment
         observation, info = self._reset_inner_env()
@@ -246,14 +262,18 @@ class MultiEpisodeEnv(BaseEnv):
                 outer_done = True
 
             if not outer_done:
-                # If reflection is enabled, we prompt for reflection instead of immediate reset
-                if self.enable_reflection:
+                if self.reflection_via_summarization:
+                    # Summarization (in the engine) handles the episode boundary.
+                    # Return only the terminal observation; the engine will call
+                    # start_new_episode() after summarizing to advance the env.
+                    self._pending_episode_start = True
+                elif self.enable_reflection:
                     self._waiting_for_reflection = True
-                    
+
                     # Append reflection prompt to terminal observation
                     if isinstance(observation, str):
                         observation = f"{observation}\n\n{self.reflection_prompt}"
-                    
+
                     # We return the terminal observation + prompt, with episode_done=True
                     # The inner env is NOT reset yet.
                 else:
@@ -305,6 +325,38 @@ class MultiEpisodeEnv(BaseEnv):
         )
 
         return observation, shaped_reward, outer_done, augmented_info
+
+    def start_new_episode(self) -> Tuple[Any, dict]:
+        """Advance to the next episode without consuming an action.
+
+        Called by the execution engine after episodic summarization fires
+        (``reflection_via_summarization=True`` mode). Resets the inner
+        environment, bumps ``episode_index``, resets ``episode_step``, and
+        returns the new episode's initial observation plus augmented info
+        with ``episode_start=True``.
+        """
+        if not self._pending_episode_start:
+            raise RuntimeError(
+                "start_new_episode() called without a pending episode boundary. "
+                "This should only be called after step() returned "
+                "episode_done=True under reflection_via_summarization=True."
+            )
+        next_obs, reset_info = self._reset_inner_env()
+        self._maybe_track_maze_state()
+        self._episode_index += 1
+        self._episode_step = 0
+        next_obs = self._format_observation(next_obs, self._episode_index)
+        self._pending_episode_start = False
+
+        augmented_info = self._augment_info(
+            base_info=reset_info,
+            episode_index=self._episode_index,
+            episode_step=0,
+            total_step=self._total_steps,
+            episode_start=True,
+            episode_done=False,
+        )
+        return next_obs, augmented_info
 
     def close(self) -> None:
         """Close the inner environment.
@@ -664,6 +716,7 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode_done": episode_done,
                 "multi_episode": True,
                 "step_cap": self.total_step_cap,
+                "num_episodes": self.num_episodes,
                 "episode_successes": list(self._episode_successes),
                 "episode_lengths": list(self._episode_lengths),
             }
@@ -716,6 +769,7 @@ class MultiEpisodeEnv(BaseEnv):
         episode_header = info.get("episode_header", "New episode begins.")
         enable_reflection = info.get("enable_reflection", False)
         reflection_prompt = info.get("reflection_prompt", "")
+        reflection_via_summarization = info.get("reflection_via_summarization", False)
 
         if inner_env_class is None:
             raise ValueError("inner_env_class must be provided in env_args")
@@ -731,6 +785,7 @@ class MultiEpisodeEnv(BaseEnv):
             "episode_header",
             "enable_reflection",
             "reflection_prompt",
+            "reflection_via_summarization",
         }
         task_dict = {k: v for k, v in info.items() if k not in config_keys and v is not None}
         
@@ -809,6 +864,7 @@ class MultiEpisodeEnv(BaseEnv):
             enable_reflection=enable_reflection,
             reflection_prompt=reflection_prompt,
             num_episodes=per_task_num_episodes,
+            reflection_via_summarization=reflection_via_summarization,
         )
         # Store the initial task so it can be reused across episodes
         env._initial_task = initial_task

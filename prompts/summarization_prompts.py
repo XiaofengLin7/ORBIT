@@ -15,3 +15,23 @@ Do NOT include:
 - Redundant information
 
 Write your summary inside <context_summary>...</context_summary> tags."""
+
+
+# Prompt used for episodic summarization when env.enable_reflection=True.
+# The user may customize this freely; the only hard requirement is that the
+# model's summary body must be wrapped in <context_summary>...</context_summary>
+# tags so agents.context_summarizer._SUMMARY_TAG_RE can extract it.
+REFLECTIVE_SUMMARY_PROMPT = """\
+You have just completed one episode of interaction with the environment.
+
+Reflect on this episode and distill a compressed memory to carry into the next episode.
+
+Cover:
+1. Episode outcome (success/failure) and what was decisive about it.
+2. What worked, what failed, and what you would do differently.
+3. Confirmed facts about the environment, task, or hidden state.
+4. Ruled-out hypotheses or dead-end strategies.
+5. A concrete plan or belief to seed the next episode.
+
+Do NOT restate verbatim observations or step-by-step reasoning.
+Write your response inside <context_summary>...</context_summary> tags."""

@@ -12,25 +12,9 @@ Supports both single-task and multi-task training:
 from __future__ import annotations
 
 import os
-import resource
 import sys
 from pathlib import Path
 from typing import Optional
-
-# Raise the FD limit before anything else (Ray, vLLM, WebShop envs all open many files).
-# Doing this in Python ensures the Ray driver and any forked workers inherit the bump,
-# even when the bash-level ulimit didn't propagate.
-try:
-    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    _target = min(1048576, _hard) if _hard != resource.RLIM_INFINITY else 1048576
-    if _soft < _target:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (_target, _hard))
-    print(f"[train_multi_episode] RLIMIT_NOFILE: {resource.getrlimit(resource.RLIMIT_NOFILE)}", flush=True)
-except (ValueError, OSError) as _e:
-    print(f"[train_multi_episode] could not raise RLIMIT_NOFILE: {_e}", flush=True)
-
-# Ensure Ray worker processes inherit the bump via its worker startup env var.
-os.environ.setdefault("RAY_worker_rlimit_nofile", "1048576")
 
 import hydra
 from omegaconf import OmegaConf
@@ -63,12 +47,22 @@ AGENT_CLASSES = {
 
 
 def _default_multi_episode_prompt() -> str:
-    """System prompt that reminds the policy about multi-episode control."""
+    """System prompt that reminds the policy about multi-episode control.
+
+    The literal ``{num_episodes}`` placeholder is substituted by
+    :class:`agents.gem_text_agent.GEMTextAgent` on the first
+    ``update_from_env`` using ``info["num_episodes"]`` exposed by
+    :class:`envs.multi_episode_env.MultiEpisodeEnv`. For tasks that do not
+    set ``num_episodes``, the placeholder remains literal — callers who want
+    a placeholder-free prompt should override ``rllm.agent.agent_args.system_prompt``.
+    """
     return (
-        "You are solving the same task across multiple episodes with a fixed total step budget. "
+        "You are solving the same task across {num_episodes} episodes with a fixed total step budget. "
         "Each episode resets the environment but keeps the task identical. "
-        "Leverage information gathered from earlier episodes to succeed faster. "
-        "Think briefly and respond with actions inside \\boxed{} each turn. Overlong responses will be penalized."
+        "You will interact with the environment for exactly {num_episodes} episodes - "
+        "use earlier episodes to gather information so later episodes succeed faster. "
+        "Think briefly and respond with actions inside \\boxed{} each turn. "
+        "Overlong responses will be penalized."
     )
 
 
@@ -156,6 +150,30 @@ def main(cfg) -> None:  # type: ignore
                 agent_args[key] = summarization_config[cfg_key]
             elif key in summarization_config:
                 agent_args[key] = summarization_config[key]
+
+        # Forward the summarization mode (token | episodic | both) to the agent.
+        if "mode" in summarization_config:
+            agent_args["mode"] = summarization_config["mode"]
+
+        # When episodic summarization is enabled, tell the env to defer
+        # new-episode advancement to the engine's summarization hook (the
+        # engine calls env.start_new_episode() after summarizing). Don't
+        # override an explicit user setting.
+        mode = summarization_config.get("mode", "token")
+        if mode in ("episodic", "both"):
+            env_args_node = cfg.rllm.env.get("env_args")
+            current_env_args = (
+                OmegaConf.to_container(env_args_node, resolve=True) or {}
+                if env_args_node is not None
+                else {}
+            )
+            if "reflection_via_summarization" not in current_env_args:
+                OmegaConf.update(
+                    cfg,
+                    "rllm.env.env_args.reflection_via_summarization",
+                    True,
+                    force_add=True,
+                )
 
     # Use our custom training function that uses MultiEpisodeAgentPPOTrainer
     run_ppo_agent(

@@ -222,3 +222,143 @@ def test_frozenlake_reset_inner_env_reuses_same_task() -> None:
         assert first_snapshot == second_snapshot
     finally:
         env.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: reflection_via_summarization flag (engine-driven episode boundary)
+# ---------------------------------------------------------------------------
+
+
+def _make_split_env(
+    total_step_cap: int = 10,
+    episode_length: int = 2,
+    enable_reflection: bool = False,
+) -> MultiEpisodeEnv:
+    return MultiEpisodeEnv(
+        inner_env_class=_ScriptedInnerEnv,
+        inner_env_kwargs={"episode_length": episode_length, "max_turns": episode_length},
+        total_step_cap=total_step_cap,
+        success_reward=1.0,
+        episode_header="New episode begins.",
+        enable_reflection=enable_reflection,
+        reflection_via_summarization=True,
+    )
+
+
+def test_reflection_via_summarization_splits_boundary() -> None:
+    """Step at episode-end returns only the terminal observation, marks pending,
+    and does NOT bump episode_index, reset inner env, or combine observations."""
+    env = _make_split_env()
+    try:
+        env.reset()
+        assert env._episode_index == 0
+        assert env._pending_episode_start is False
+
+        # Step 1 (not yet at episode boundary).
+        obs1, reward1, done1, info1 = env.step("noop")
+        assert done1 is False
+        assert info1["episode_done"] is False
+        assert env._pending_episode_start is False
+
+        # Step 2 ends the episode (episode_length=2).
+        obs2, reward2, done2, info2 = env.step("noop")
+        assert done2 is False, "outer trajectory should not be done yet"
+        assert info2["episode_done"] is True
+        # The terminal observation should be the inner env's terminal obs alone.
+        assert obs2 == "obs-2", "terminal observation should NOT be combined"
+        assert "New episode begins" not in obs2
+        # Env state is mid-boundary: waiting for start_new_episode() call.
+        assert env._pending_episode_start is True
+        assert env._episode_index == 0  # NOT yet bumped
+    finally:
+        env.close()
+
+
+def test_reflection_via_summarization_suppresses_reflection_prompt() -> None:
+    """Even with enable_reflection=True, the reflection prompt must NOT be
+    appended when reflection_via_summarization=True."""
+    env = _make_split_env(enable_reflection=True)
+    try:
+        env.reset()
+        env.step("noop")
+        _, _, _, info = env.step("noop")
+        assert info["episode_done"] is True
+        # Reflection path should NOT have fired.
+        assert env._waiting_for_reflection is False
+        assert env._pending_episode_start is True
+    finally:
+        env.close()
+
+
+def test_start_new_episode_advances_env() -> None:
+    """start_new_episode() resets inner env, bumps index, and returns fresh obs."""
+    env = _make_split_env()
+    try:
+        env.reset()
+        env.step("noop")
+        env.step("noop")  # ends episode 0
+        assert env._pending_episode_start is True
+
+        new_obs, new_info = env.start_new_episode()
+        assert env._pending_episode_start is False
+        assert env._episode_index == 1
+        assert env._episode_step == 0
+        assert new_info["episode_start"] is True
+        assert new_info["episode_done"] is False
+        # The inner env's reset returned "obs-0", which gets formatted with the
+        # new episode header.
+        assert "obs-0" in new_obs
+        assert "New episode begins" in new_obs
+    finally:
+        env.close()
+
+
+def test_start_new_episode_raises_without_pending_boundary() -> None:
+    env = _make_split_env()
+    try:
+        env.reset()
+        with pytest.raises(RuntimeError):
+            env.start_new_episode()
+    finally:
+        env.close()
+
+
+def test_reflection_via_summarization_false_preserves_combining() -> None:
+    """Default behavior (flag=False) still combines terminal + new-episode obs."""
+    env = MultiEpisodeEnv(
+        inner_env_class=_ScriptedInnerEnv,
+        inner_env_kwargs={"episode_length": 2, "max_turns": 2},
+        total_step_cap=10,
+        success_reward=1.0,
+        episode_header="New episode begins.",
+        enable_reflection=False,
+        reflection_via_summarization=False,
+    )
+    try:
+        env.reset()
+        env.step("noop")
+        obs2, _, done2, info2 = env.step("noop")
+        assert done2 is False
+        assert info2["episode_done"] is True
+        # Non-reflection path combines: terminal obs + next-episode header/obs.
+        assert "New episode begins" in obs2
+        assert env._pending_episode_start is False
+        assert env._episode_index == 1  # bumped in the combining path
+    finally:
+        env.close()
+
+
+def test_from_dict_threads_reflection_via_summarization() -> None:
+    env = MultiEpisodeEnv.from_dict(
+        {
+            "inner_env_class": _ScriptedInnerEnv,
+            "inner_env_kwargs": {"episode_length": 2, "max_turns": 2},
+            "reflection_via_summarization": True,
+            "num_episodes": 3,
+            "max_turns_per_episode": 2,
+        }
+    )
+    try:
+        assert env.reflection_via_summarization is True
+    finally:
+        env.close()
