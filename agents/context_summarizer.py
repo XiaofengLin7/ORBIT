@@ -46,10 +46,10 @@ class ContextSummarizerMixin:
 
     * ``summarization_threshold_tokens`` (int, default 16384)
     * ``summary_max_tokens`` (int, default 8192)
-    * ``mode`` (str, default ``"token"``) — one of ``"token" | "episodic" | "both"``.
-      Controls which trigger predicates return True. ``"token"`` preserves the
-      original threshold-based behavior. ``"episodic"`` fires only on episode
-      boundaries. ``"both"`` enables both triggers.
+    * ``mode`` (str, default ``"episodic"``) — one of ``"token" | "episodic" | "both"``.
+      Controls which trigger predicates return True. ``"episodic"`` fires only
+      on episode boundaries (the default). ``"token"`` preserves the original
+      threshold-based behavior. ``"both"`` enables both triggers.
     """
 
     # ------------------------------------------------------------------
@@ -64,7 +64,7 @@ class ContextSummarizerMixin:
             "summarization_threshold_tokens", 16384
         )
         self.summary_max_tokens: int = kwargs.pop("summary_max_tokens", 8192)
-        self.summarization_mode: str = kwargs.pop("mode", "token")
+        self.summarization_mode: str = kwargs.pop("mode", "episodic")
         if self.summarization_mode not in self._VALID_MODES:
             raise ValueError(
                 f"summarization mode must be one of {self._VALID_MODES}, "
@@ -86,11 +86,25 @@ class ContextSummarizerMixin:
     # Public API consumed by the engine
     # ------------------------------------------------------------------
 
-    def should_summarize(self, tokenizer: Any, chat_parser: Any) -> bool:
+    def should_summarize(
+        self,
+        tokenizer: Any = None,
+        chat_parser: Any = None,
+        *,
+        current_token_count: int | None = None,
+    ) -> bool:
         """Return True when the token-threshold trigger should fire.
 
         Gated on ``summarization_mode`` — returns False unless mode includes
         the token trigger (``"token"`` or ``"both"``).
+
+        ``current_token_count``: optional pre-computed total token count for
+        the conversation history. Always pass this from the engine when
+        available — the engine already tracks running token counts
+        incrementally, so re-tokenizing the full history here is O(N²) per
+        trajectory and CPU-thrashes the rollout. Falls back to a one-shot
+        full-history tokenization only when the count isn't supplied
+        (e.g. legacy callers, eval harness).
         """
         if self.summarization_mode not in ("token", "both"):
             return False
@@ -98,6 +112,9 @@ class ContextSummarizerMixin:
         # Need at least system + 1 user + 1 assistant to summarize.
         if len(messages) < 3:
             return False
+        if current_token_count is not None:
+            return current_token_count >= self.summarization_threshold_tokens
+        # Fallback: re-tokenize. Slow path; avoid in the hot loop.
         tokens, _ = convert_messages_to_tokens_and_masks(
             messages,
             tokenizer=tokenizer,

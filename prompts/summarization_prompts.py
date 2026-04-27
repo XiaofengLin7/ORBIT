@@ -3,15 +3,20 @@
 Three variants, picked by the engine + agent based on (trigger,
 env.enable_reflection):
 
-* ``TOKEN_SUMMARY_PROMPT`` — token trigger, fires mid-episode. The
-  episode is still in progress; the prompt asks the agent to compress
-  prior context and preserve current-episode progress so the agent can
-  continue.
+* ``TOKEN_SUMMARY_PROMPT`` — token trigger, fires mid-episode.
 * ``EPISODIC_SUMMARY_PROMPT`` — episodic trigger, env.enable_reflection
-  is False. An episode has just ended; compression-only, no reflection
-  language.
+  False. Compression at episode end without reflection language.
 * ``REFLECTIVE_SUMMARY_PROMPT`` — episodic trigger, env.enable_reflection
-  is True. Episode end + reflection in a single ask.
+  True. Episode end + reflection in one ask.
+
+Style: each prompt gives the model agency to decide WHAT to preserve
+("you decide what to include based on what will most help your
+downstream decisions"). The bullet lists are framed as suggestions —
+"possible things worth preserving" — rather than a fixed schema, so
+during RL training the policy can learn task-specific compression
+strategies. The hard constraint is the output format (``<context_summary>``
+tags) and the consequence framing ("the summary REPLACES your prior
+history"), both of which the engine relies on.
 
 All three must instruct the model to wrap its output in
 ``<context_summary>...</context_summary>`` tags so
@@ -19,52 +24,45 @@ All three must instruct the model to wrap its output in
 """
 
 TOKEN_SUMMARY_PROMPT = """\
-You are summarizing the interaction history of an agent solving a task across multiple episodes.
+Your context window is filling up while you are mid-task. Compress what you have seen so far into a compact memory that you will continue from.
 
-Produce a concise summary that preserves:
-1. The task description and rules
-2. Key information discovered across episodes (confirmed facts, ruled-out possibilities)
-3. Current episode progress: which episode you are in, all observations in this episode, what actions have been taken, and what you were about to do next
-4. Strategy insights that should inform future actions
+You decide what to include based on what will most help your downstream decisions. The summary REPLACES your prior history - whatever you don't write here, you won't have access to later. Aim for what's actually useful to act on, not a transcript.
 
-Do NOT include:
-- Verbatim copies of previous observations or actions from earlier episodes
-- Step-by-step reasoning traces
-- Redundant information
+Possible things worth preserving:
+- The task description, goal, and rules.
+- Confirmed facts about the environment or hidden state.
+- Hypotheses you've ruled out.
+- Current episode progress: where you are, what you were doing, what you intended to try next.
+- Patterns or insights that have been guiding your decisions.
 
 Write your summary inside <context_summary>...</context_summary> tags."""
 
 
 EPISODIC_SUMMARY_PROMPT = """\
-You have just completed one episode of interaction with the environment.
+You have just completed one episode. Compress your experience into a compact memory that the agent will start the next episode from.
 
-Produce a compact memory the agent can carry into the next episode.
+You decide what to include based on what will most help your future decisions. The summary REPLACES your prior history - whatever you don't write here, you won't have access to in later episodes. Aim for what's actually useful to act on, not a transcript.
 
-Cover:
-1. The task description and rules.
-2. Confirmed facts about the environment, task, or hidden state — including the outcome of the episode that just ended.
-3. Ruled-out states, actions, or hypotheses based on observed feedback.
-4. A concrete plan or belief to seed the next episode.
-
-Do NOT include:
-- Verbatim copies of past observations or actions.
-- Step-by-step reasoning traces.
-- Redundant information.
+Possible things worth preserving:
+- The task description, goal, and rules.
+- Confirmed facts about the environment or hidden state, including this episode's outcome.
+- States, actions, or hypotheses ruled out by what you observed.
+- A concrete plan or belief to seed the next episode.
 
 Write your summary inside <context_summary>...</context_summary> tags."""
 
 
 REFLECTIVE_SUMMARY_PROMPT = """\
-You have just completed one episode of interaction with the environment.
+You have just completed one episode. Reflect on it and compress your experience into a compact memory that the agent will start the next episode from.
 
-Reflect on this episode and distill a compressed memory to carry into the next episode.
+You decide what to include based on what will most help your future decisions. Reflection on what worked, what failed, and what to try next is welcome — but ultimately you choose what's worth keeping. The summary REPLACES your prior history - whatever you don't write here, you won't have access to in later episodes. Aim for what's actually useful to act on, not a transcript.
 
-Cover:
-1. Episode outcome (success/failure) and what was decisive about it.
-2. What worked, what failed, and what you would do differently.
-3. Confirmed facts about the environment, task, or hidden state.
-4. Ruled-out hypotheses or dead-end strategies.
-5. A concrete plan or belief to seed the next episode.
+Possible things worth preserving:
+- The task description, goal, and rules.
+- This episode's outcome and what was decisive about it.
+- What worked vs. what failed, and what you'd do differently.
+- Confirmed facts about the environment or hidden state.
+- Ruled-out hypotheses or dead-end strategies.
+- A concrete plan or belief to seed the next episode.
 
-Do NOT restate verbatim observations or step-by-step reasoning.
-Write your response inside <context_summary>...</context_summary> tags."""
+Write your summary inside <context_summary>...</context_summary> tags."""

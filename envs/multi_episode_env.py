@@ -38,7 +38,7 @@ class MultiEpisodeEnv(BaseEnv):
         total_step_cap: int = 30,
         success_reward: float = 1.0,
         episode_header: str = "New episode begins.",
-        enable_reflection: bool = False,
+        enable_reflection: bool = True,
         num_episodes: Optional[int] = None,
         reflection_via_summarization: bool = False,
         **kwargs: Any,
@@ -781,7 +781,7 @@ class MultiEpisodeEnv(BaseEnv):
         total_step_cap = info.get("total_step_cap", 30)
         success_reward = info.get("success_reward", 1.0)
         episode_header = info.get("episode_header", "New episode begins.")
-        enable_reflection = info.get("enable_reflection", False)
+        enable_reflection = info.get("enable_reflection", True)
         reflection_prompt = info.get("reflection_prompt", "")
         reflection_via_summarization = info.get("reflection_via_summarization", False)
 

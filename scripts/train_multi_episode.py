@@ -16,6 +16,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Disable Ray's worker-stdout dedup so each trajectory's
+# `Trajectory N completed …` / truncation print reaches the driver console.
+# Ray's default (RAY_DEDUP_LOGS=1) numeric-masks log lines and collapses
+# bursts of similar prints into a single line, hiding per-trajectory output.
+os.environ.setdefault("RAY_DEDUP_LOGS", "0")
+
 import hydra
 from omegaconf import OmegaConf
 
@@ -158,7 +164,7 @@ def main(cfg) -> None:  # type: ignore
         # new-episode advancement to the engine's summarization hook (the
         # engine calls env.start_new_episode() after summarizing). Don't
         # override an explicit user setting.
-        mode = summarization_config.get("mode", "token")
+        mode = summarization_config.get("mode", "episodic")
         if mode in ("episodic", "both"):
             env_args_node = cfg.rllm.env.get("env_args")
             current_env_args = (

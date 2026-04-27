@@ -108,7 +108,9 @@ class TestShouldSummarize:
         assert agent.should_summarize(tokenizer, parser) is False
 
     def test_returns_true_when_over_threshold(self):
-        agent = _make_agent(threshold=10)
+        # mode="token" is required to exercise the token-threshold trigger;
+        # the default mode is "episodic", which gates this predicate off.
+        agent = _make_agent(threshold=10, mode="token")
         _simulate_steps(agent, 3)
         tokenizer, parser = _make_tokenizer_and_parser()
         assert agent.should_summarize(tokenizer, parser) is True
@@ -289,6 +291,9 @@ class TestComposedClasses:
             agent = cls(
                 system_prompt=SYSTEM_PROMPT,
                 summarization_threshold_tokens=10,
+                # Default mode is "episodic"; ask explicitly for the token
+                # path here so should_summarize fires on threshold breach.
+                mode="token",
             )
             _simulate_steps(agent, 3)
             tokenizer, parser = _make_tokenizer_and_parser()
@@ -301,9 +306,9 @@ class TestComposedClasses:
 # ---------------------------------------------------------------------------
 
 class TestSummarizationMode:
-    def test_default_mode_is_token(self):
+    def test_default_mode_is_episodic(self):
         agent = _make_agent()
-        assert agent.summarization_mode == "token"
+        assert agent.summarization_mode == "episodic"
 
     def test_mode_set_via_kwarg(self):
         agent = _make_agent(mode="episodic")
