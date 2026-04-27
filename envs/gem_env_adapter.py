@@ -11,6 +11,49 @@ from typing import Any, Dict, Optional
 from rllm.agents.agent import Action  # type: ignore
 from rllm.environments.base.base_env import BaseEnv  # type: ignore
 
+
+def _silence_nltk_downloads_globally() -> None:
+    """Wrap nltk.download so its [nltk_data] log lines never reach stdio.
+
+    Some GEM envs (Wordle, Hangman) call ``nltk.download("words")`` from
+    their ``__init__`` without ``quiet=True``, which prints
+    ``[nltk_data]`` lines even when the corpus is already cached. We
+    can't edit third_party, so install a process-wide silent shim before
+    importing ``gem``. The wrapper:
+      * forces ``quiet=True`` (this is what actually suppresses output;
+        nltk respects this flag and skips the "[nltk_data]" prints)
+      * is idempotent (re-imports won't double-wrap)
+
+    IMPORTANT: do NOT use ``contextlib.redirect_stdout`` here. It mutates
+    the global ``sys.stdout`` and is *not* thread-safe. ``init_envs_and_agents``
+    creates 256 envs concurrently in a 64-thread pool; concurrent
+    ``redirect_stdout`` calls from per-env ``nltk.download`` invocations
+    permanently corrupt ``sys.stdout`` (they save each other's StringIO
+    buffers as "the original" and restore them in the wrong order). Every
+    subsequent ``print()``/``colorful_print()`` then writes into an
+    orphaned buffer no one reads, silently dropping all rollout-time
+    trajectory output. ``quiet=True`` alone is sufficient — keep it that way.
+    """
+    try:
+        import nltk  # type: ignore
+    except ImportError:
+        return
+    if getattr(nltk.download, "_silenced", False):
+        return
+
+    _orig = nltk.download
+
+    def _silent_download(*args, **kwargs):
+        kwargs.setdefault("quiet", True)
+        return _orig(*args, **kwargs)
+
+    _silent_download._silenced = True  # idempotency marker
+    nltk.download = _silent_download
+
+
+_silence_nltk_downloads_globally()
+
+
 try:
     import gem  # type: ignore
     import gem.envs  # type: ignore  # noqa: F401  # populate registries

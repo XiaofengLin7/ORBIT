@@ -342,7 +342,15 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     and agent.should_summarize_on_episode_end(info)
                 ):
                     summ_trigger = "episode_end"
-                elif agent.should_summarize(self.tokenizer, self.chat_parser):
+                elif agent.should_summarize(
+                    self.tokenizer,
+                    self.chat_parser,
+                    # The engine already tracks running token counts
+                    # incrementally; passing them avoids an O(history)
+                    # re-tokenization per step that pegs CPU and starves
+                    # vLLM, idling the GPU between training steps.
+                    current_token_count=prompt_token_len + response_token_len,
+                ):
                     summ_trigger = "token"
 
             if summ_trigger is not None:
@@ -366,24 +374,17 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     >= self.max_response_length
                 )
                 if budget_exhausted:
-                    if summ_trigger == "token":
-                        termination_reason = "SUMMARIZATION_BUDGET_EXCEEDED"
-                        colorful_print(
-                            f"Trajectory {idx}: summarization skipped — "
-                            f"response budget exhausted "
-                            f"({response_token_len}+{summ_budget_needed}"
-                            f">={self.max_response_length}).\n",
-                            "red",
-                        )
-                        break
-                    else:
-                        colorful_print(
-                            f"Trajectory {idx}: episodic summarization skipped — "
-                            f"response budget exhausted "
-                            f"({response_token_len}+{summ_budget_needed}"
-                            f">={self.max_response_length}).\n",
-                            "yellow",
-                        )
+                    # Both token and episodic modes terminate the trajectory
+                    # here. We can't summarize (no room) AND we can't continue
+                    # rolling out without summarizing — at the production
+                    # default (max_response_length=31744, thinking-enabled
+                    # responses, 256 concurrent rollouts) letting the
+                    # trajectory keep going past its budget pegs vLLM's KV
+                    # cache and effectively stalls the whole batch. Earlier
+                    # behavior was an implicit termination via env-done crash;
+                    # this is the clean version of the same.
+                    termination_reason = "SUMMARIZATION_BUDGET_EXCEEDED"
+                    break
                 else:
                     start_time = time.time()
                     summ_result = await self._do_summarization(
@@ -406,67 +407,64 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     total_time += delta_time
 
                     if summ_result is None:
-                        if summ_trigger == "token":
-                            termination_reason = "SUMMARIZATION_FAILED"
-                            colorful_print(
-                                f"Trajectory {idx}: summarization failed.\n",
-                                "red",
-                            )
-                            break
-                        else:
-                            # Episodic path: soft-skip on context-window
-                            # violation. Continue trajectory as usual.
-                            colorful_print(
-                                f"Trajectory {idx}: episodic summarization skipped "
-                                f"(context window would be exceeded).\n",
-                                "yellow",
-                            )
+                        # Both modes terminate on summarization failure for
+                        # the same reason as the budget-exhausted branch:
+                        # without a successful summary the agent has no clean
+                        # way to compress context, and continuing to roll out
+                        # past the budget thrashes vLLM at scale.
+                        termination_reason = "SUMMARIZATION_FAILED"
+                        break
                     else:
                         accumulated_prompt_ids, _ = summ_result
                         # Each segment is an independent training sample with
                         # its own response budget.
                         response_token_len = 0
 
-                        # Episodic: advance env to the new episode and inject
-                        # its initial observation into agent history + token
-                        # accumulation. This is how we keep the post-summary
-                        # layout `[sys, summary, new_episode_obs]` without a
-                        # wasted LLM call.
-                        if (
-                            summ_trigger == "episode_end"
-                            and getattr(env, "_pending_episode_start", False)
-                        ):
-                            new_obs, new_info = await loop.run_in_executor(
-                                self.executor, env.start_new_episode
-                            )
-                            new_info["max_steps"] = self.max_steps
-                            new_info["cur_tokens"] = response_token_len
-                            agent.update_from_env(
-                                observation=new_obs,
-                                reward=0.0,
-                                done=False,
-                                info=new_info,
-                            )
-                            new_env_msgs = [
-                                {"role": "user", "content": str(new_obs)}
-                            ]
-                            new_env_tokens, new_env_masks = (
-                                convert_messages_to_tokens_and_masks(
-                                    new_env_msgs,
-                                    tokenizer=self.tokenizer,
-                                    parser=self.chat_parser,
-                                    contains_first_msg=False,
-                                    contains_generation_msg=True,
-                                )
-                            )
-                            response_tokens.extend(new_env_tokens)
-                            response_masks.extend(new_env_masks)
-                            if (
-                                mode == "Token"
-                                and accumulated_prompt_ids is not None
-                                and new_env_tokens
-                            ):
-                                accumulated_prompt_ids.extend(new_env_tokens)
+                # Episodic env advance: must run whenever the env signaled an
+                # episode boundary (`_pending_episode_start=True`), regardless
+                # of whether summarization succeeded, was budget-skipped, or
+                # failed. Skipping this leaves the inner env in `done` state
+                # and crashes the next env.step with "Environment is done.
+                # Call reset() before step()."
+                if (
+                    summ_trigger == "episode_end"
+                    and getattr(env, "_pending_episode_start", False)
+                ):
+                    new_obs, new_info = await loop.run_in_executor(
+                        self.executor, env.start_new_episode
+                    )
+                    new_info["max_steps"] = self.max_steps
+                    new_info["cur_tokens"] = response_token_len
+                    # Inject the new episode's initial observation into
+                    # the agent's message history. We must NOT route
+                    # this through agent.update_from_env(reward=0.0):
+                    # that would overwrite the just-finished episode's
+                    # success reward (already set on the trajectory's
+                    # last step above) with 0, silently zeroing out
+                    # every episode reward except the very last one.
+                    agent._messages.append(
+                        {"role": "user", "content": str(new_obs)}
+                    )
+                    new_env_msgs = [
+                        {"role": "user", "content": str(new_obs)}
+                    ]
+                    new_env_tokens, new_env_masks = (
+                        convert_messages_to_tokens_and_masks(
+                            new_env_msgs,
+                            tokenizer=self.tokenizer,
+                            parser=self.chat_parser,
+                            contains_first_msg=False,
+                            contains_generation_msg=True,
+                        )
+                    )
+                    response_tokens.extend(new_env_tokens)
+                    response_masks.extend(new_env_masks)
+                    if (
+                        mode == "Token"
+                        and accumulated_prompt_ids is not None
+                        and new_env_tokens
+                    ):
+                        accumulated_prompt_ids.extend(new_env_tokens)
 
             if step_idx == self.max_steps - 1:
                 termination_reason = "MAX_STEPS"
@@ -674,20 +672,9 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             if hasattr(self, "max_model_len") and self.max_model_len:
                 headroom = self.max_model_len - len(accumulated_prompt_ids)
                 if headroom <= 0:
-                    colorful_print(
-                        f"Summarization prompt ({len(accumulated_prompt_ids)} tokens) "
-                        f"exceeds max_model_len ({self.max_model_len}). "
-                        "Skipping summarization.\n",
-                        "red",
-                    )
                     return None
                 # Clamp summary_max_tokens to available headroom.
                 if headroom < agent.summary_max_tokens:
-                    colorful_print(
-                        f"Summarization headroom limited to {headroom} tokens "
-                        f"(requested {agent.summary_max_tokens}).\n",
-                        "yellow",
-                    )
                     summ_kwargs["max_tokens"] = headroom
 
             summ_kwargs["accumulated_prompt_ids"] = accumulated_prompt_ids
@@ -696,20 +683,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             summary_output = await self.get_model_response(
                 summary_prompt, application_id, **summ_kwargs
             )
-        except Exception as e:
-            colorful_print(
-                f"Summarization generation failed: {e}\n",
-                "red",
-            )
+        except Exception:
             return None
 
         summ_completion_len = len(summary_output.completion_ids)
 
         if summ_completion_len == 0:
-            colorful_print(
-                "Summarization produced empty output. Skipping.\n",
-                "red",
-            )
             return None
 
         # Record summarization step in episode_steps.
@@ -734,14 +713,6 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         segment_chat_histories.append(agent.chat_completions)
 
         agent.apply_summary(summary_output.text, trigger=trigger)
-
-        colorful_print(
-            f"Summarization #{len(summarization_boundaries)} applied "
-            f"(trigger={trigger}, step {len(episode_steps) - 1}, "
-            f"summary_tokens={summ_completion_len}). "
-            f"Messages: {agent.get_summarization_metadata()}\n",
-            "cyan",
-        )
 
         # Build post-summary accumulated tokens incrementally.
         # After apply_summary: chat_completions = [sys, summary_user_msg].

@@ -1,11 +1,29 @@
 #!/bin/bash
 set -x
 
+# Suppress core dumps. Ray's auxiliary `dashboard-ReportHead` workers crash
+# periodically (Ray-version-dependent telemetry bug) and otherwise leave
+# 700 MB+ ELF core files in the cwd on every crash, polluting `git status`
+# and chewing through disk for no diagnostic value (training itself is fine).
+# Scoped to this shell — does not affect other sessions.
+ulimit -c 0
+
 # GPU assignment: use 4 GPUs (adjust if vLLM is using one; e.g., skip GPU0 if needed).
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
+
+# Don't forward the driver's CUDA_VISIBLE_DEVICES into Ray's runtime_env.
+# rllm's `_get_forwarded_env_vars` (third_party/rllm/rllm/trainer/verl/ray_runtime_env.py)
+# auto-forwards anything starting with `CUDA_`, which clobbers Ray's
+# per-worker GPU assignment when `n_gpus_per_node > 1`. With the
+# cluster-wide value forced into every worker, the FSDP `init_device_mesh`
+# binds workers to overlapping devices and fails with
+# "CUDA-capable device(s) is/are busy or unavailable" inside
+# `verl/workers/fsdp_workers.py:create_device_mesh`. Excluding it lets
+# Ray set per-actor `CUDA_VISIBLE_DEVICES` correctly.
+export RLLM_EXCLUDE=${RLLM_EXCLUDE:-CUDA_VISIBLE_DEVICES}
 
 # Multi-task configuration: path to YAML config file (required)
 TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_multi_episode_config.yaml}
@@ -76,7 +94,7 @@ python scripts/train_multi_episode.py \
     trainer.logger=['console','wandb'] \
     trainer.project_name='rllm-agent' \
     trainer.experiment_name="$EXPERIMENT_NAME" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1000 \
