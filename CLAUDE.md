@@ -128,6 +128,37 @@ Optional per-task field `num_episodes` caps the trajectory at exactly N complete
 
 - **Do not modify files under `third_party/`** without asking first. Custom changes to `third_party/rllm` or `third_party/gem` should follow the fork/patch strategy in `third_party/MAINTAINING_CUSTOM_CHANGES.md`.
 
+## Trajectory-uniform actor patch (segment training)
+
+When summarization training is enabled, we want each Ray FSDP worker to use
+`TrajectoryUniformPPOActor` (in `trainers/trajectory_uniform_actor.py`) instead
+of verl's stock `DataParallelPPOActor`. The patch is wired in via a `.pth`
+file in the active conda env's `site-packages`, written automatically by
+`scripts/train_multi_task_multi_episode.sh` (and any script that sources it,
+e.g. `train_multi_task_summarizing.sh`). The .pth file adds the repo root to
+`sys.path` and imports the **top-level** module `orbit_segtrain_patch`, which
+registers a `wrapt.when_imported` callback for `verl.workers.actor.dp_actor`;
+the callback fires once verl is imported inside
+`ActorRolloutRefWorker.init_model` (after Ray's GPU setup is complete).
+
+`orbit_segtrain_patch.py` is intentionally a top-level module (not inside the
+`trainers/` package) so that loading it via the .pth file doesn't trigger
+`trainers/__init__.py`, which transitively imports torch/verl and would
+initialize CUDA in every Python process — including Ray workers before they
+get their per-worker GPU assignment.
+
+We use this `.pth` mechanism instead of `runtime_env.worker_process_setup_hook`
+because the latter — for reasons we haven't fully identified — breaks Ray's
+per-worker GPU isolation on the SCC cluster: workers fail at `init_device_mesh`
+with "CUDA-capable device(s) is/are busy or unavailable" even when the hook
+is empty (confirmed via empty-hook bisection 2026-04-26). The .pth file
+auto-loads in every Python process via Python's `site` module, side-stepping
+Ray's runtime_env entirely.
+
+For someone cloning the repo to another conda env: just `bash scripts/train_*.sh`
+once — the script writes the .pth file into the active env's site-packages
+on the spot. To remove: `rm <site-packages>/orbit_segtrain.pth`.
+
 ## graphify
 
 This project has a graphify knowledge graph at graphify-out/.
