@@ -2,6 +2,15 @@
 
 This trainer extends AgentPPOTrainer to extract additional metrics from
 environments that have a get_metrics() method, such as MultiEpisodeEnv.
+
+It also enables PPO training on every segment of summarized trajectories:
+when ``summarization_config["enable"]`` is True, the trainer wraps the
+actor's ``update_actor`` so that just before the actual gradient step,
+the per-trajectory batch (advantage already computed by GRPO) is expanded
+into per-segment rows with broadcast advantages and trajectory-uniform
+per-token weights. The actor itself is replaced by
+:class:`TrajectoryUniformPPOActor`, which uses those weights to produce a
+loss equal to ``L = (1/N_G) Σ_i (1/N_t^i) Σ_{token in i} ℓ_token``.
 """
 
 from __future__ import annotations
@@ -18,6 +27,19 @@ from verl import DataProto  # type: ignore
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 from rllm.trainer.verl.agent_ppo_trainer import AgentPPOTrainer
+
+from trainers.segment_expansion import (
+    build_expanded_dataproto,
+    extract_advantage_per_trajectory,
+)
+# Note: the trajectory-uniform actor patch is NOT applied here in the driver.
+# Its eager import of verl.workers.actor.dp_actor would trigger
+# torch.cuda.is_available() (called at module top of verl.utils.device) which
+# initializes CUDA in the driver process and corrupts Ray's per-worker GPU
+# assignment. The patch is applied in EVERY Python process (including Ray
+# workers) via a `.pth` file in the conda env's site-packages — see the
+# top-level `orbit_segtrain_patch.py` module and the `scripts/train_*.sh`
+# setup that writes the .pth file.
 
 
 class MultiEpisodeAsyncAgentExecutionEngine(AsyncAgentExecutionEngine):
@@ -85,6 +107,12 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         # by _validate_agent at the end to emit val/{data_source}/<k>/<stat>
         # and val/all/<k>/<stat> metrics.
         self._val_traj_metrics_buffer: list[tuple[str, dict]] = []
+        # Cache for the most recent rollout's raw trajectory dicts (with
+        # their .segments list). Stashed in _transform_agent_trajectories
+        # and consumed by the wrapped update_actor (when
+        # summarization is enabled) to expand the per-trajectory batch into
+        # per-segment rows for the trajectory-uniform PPO loss.
+        self._cached_raw_trajectories: list[dict] | None = None
 
     def _get_engine_class(self):
         """Return the execution engine class to use."""
@@ -94,8 +122,34 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
             return SummarizingAgentExecutionEngine
         return MultiEpisodeAsyncAgentExecutionEngine
 
+    @property
+    def _segment_training_enabled(self) -> bool:
+        """True iff we should train PPO on every summarization segment.
+
+        Gated on summarization being enabled in the agent config — when
+        disabled, every trajectory has exactly one segment and the
+        expansion is a no-op, so there's no reason to incur its overhead.
+        """
+        return bool(
+            self.summarization_config and self.summarization_config.get("enable")
+        )
+
     def init_workers(self):
-        """Initialize workers with custom execution engine."""
+        """Initialize workers with custom execution engine.
+
+        We do NOT install the trajectory-uniform actor patch here in the
+        driver process. The patch must run inside each Ray worker process
+        anyway (workers are separate Python processes); that's handled by
+        the worker_process_setup_hook registered in
+        :func:`trainers.train_multi_episode.run_ppo_agent`. Calling
+        ``install_trajectory_uniform_actor`` in the driver eager-imports
+        ``verl.workers.actor.dp_actor``, which transitively imports
+        ``verl.utils.device`` → ``torch.cuda.is_available()`` → initializes
+        CUDA in the driver process. With CUDA initialized in the driver,
+        Ray's per-worker GPU assignment downstream goes wrong and the
+        actor workers fail to bind their devices with
+        "CUDA-capable device(s) is/are busy or unavailable".
+        """
         # Call grandparent's init_workers (skip AgentPPOTrainer's)
         from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -130,6 +184,140 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
             n_parallel_agents=n_parallel_agents,
             **engine_args,
         )
+
+        # When training PPO on every summarization segment, wrap
+        # actor_rollout_wg.update_actor so it expands the per-trajectory
+        # batch into per-segment rows just before the gradient step. The
+        # wrap is a method-attribute swap on the Python wrapper instance
+        # (the underlying Ray dispatch is unaffected — we still call the
+        # original method from inside the wrapper).
+        if self._segment_training_enabled:
+            self._install_segment_aware_update_actor()
+
+    def _install_segment_aware_update_actor(self) -> None:
+        """Wrap ``actor_rollout_wg.update_actor`` to expand segments first.
+
+        The wrapped function:
+          1. Takes the per-trajectory batch (as built by the parent fit_agent
+             flow up through ``compute_advantage``).
+          2. Reads the cached raw trajectory dicts from
+             ``self._cached_raw_trajectories``.
+          3. Extracts the per-trajectory scalar advantage A_i from
+             ``batch.batch["advantages"]``.
+          4. Builds the expanded per-segment DataProto with broadcast
+             advantages, ``traj_uniform_weight``, and replicated source
+             non-tensor fields.
+          5. Re-runs ``compute_log_prob`` on the expanded batch (each segment
+             has different prompt+response tokens than the per-trajectory
+             segment[0]).
+          6. Calls the original ``update_actor`` on the expanded batch (the
+             actor is the trajectory-uniform variant, which uses
+             ``traj_uniform_weight`` to compute the desired aggregation).
+        """
+        import torch as _torch
+
+        original_update_actor = self.actor_rollout_wg.update_actor
+
+        def _expanded_update_actor(batch: DataProto):
+            raw_trajs = self._cached_raw_trajectories
+            if raw_trajs is None or not any(t.get("segments") for t in raw_trajs):
+                # No cached segments (or every trajectory was 1-segment) —
+                # the expansion is a no-op. Run with the per-trajectory
+                # batch directly. We still need traj_uniform_weight = 1/N_t^i
+                # per row so the trajectory-uniform actor's loss math works.
+                return original_update_actor(
+                    self._attach_traj_uniform_weight_inplace(batch)
+                )
+
+            # Pull A_i per trajectory from the per-trajectory advantage tensor.
+            n_g = batch.batch["advantages"].shape[0]
+            assert n_g == len(raw_trajs), (
+                f"advantages batch size {n_g} != cached trajectory count {len(raw_trajs)}"
+            )
+            advantages_per_traj = extract_advantage_per_trajectory(
+                batch.batch["advantages"], batch.batch["response_mask"]
+            )
+
+            # Replicate source non-tensor fields per segment row.
+            source_non_tensor = {
+                k: v for k, v in batch.non_tensor_batch.items()
+                if hasattr(v, "shape") and v.shape and v.shape[0] == n_g
+            }
+
+            # Build the expanded DataProto.
+            expansion = build_expanded_dataproto(
+                raw_trajs,
+                advantages_per_trajectory=advantages_per_traj,
+                pad_token_id=self.tokenizer.pad_token_id,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                source_non_tensor_batch=source_non_tensor,
+            )
+            expanded_batch = expansion.data
+
+            # Carry meta_info forward (temperature, etc.) — required by
+            # actor's update_policy.
+            expanded_batch.meta_info = dict(batch.meta_info)
+
+            # Pad the expanded batch to a multiple of the actor worker group's
+            # world size. Verl's worker dispatch (DataProto.chunk) requires
+            # equal-size chunks per rank — Σ K_i isn't generally divisible by
+            # world_size. pad_dataproto_to_divisor pads by repeating rows
+            # from the front; we then zero traj_uniform_weight on the padded
+            # rows so they contribute nothing to the trajectory-uniform loss.
+            from verl.protocol import pad_dataproto_to_divisor
+
+            world_size = self.actor_rollout_wg.world_size
+            expanded_batch, pad_size = pad_dataproto_to_divisor(
+                expanded_batch, world_size
+            )
+            if pad_size > 0:
+                # Zero out the loss contribution of padded rows by killing
+                # their per-token weight. The actor's micro-batch loss is
+                # sum(pg * traj_uniform_weight * response_mask); with w=0,
+                # padded rows add 0 to the loss and 0 to the gradient.
+                expanded_batch.batch["traj_uniform_weight"][-pad_size:] = 0.0
+
+            # Recompute old_log_probs on the expanded batch (each segment's
+            # tokens are different from the per-trajectory segment[0]).
+            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(
+                expanded_batch
+            )
+            # Drop entropies field if present — we don't use it here.
+            if "entropys" in old_log_prob_output.batch.keys():
+                old_log_prob_output.batch.pop("entropys")
+            expanded_batch = expanded_batch.union(old_log_prob_output)
+
+            # Hand off to the trajectory-uniform actor.
+            actor_output = original_update_actor(expanded_batch)
+
+            # Clear the cache so a future stale call (if anything) raises.
+            self._cached_raw_trajectories = None
+            return actor_output
+
+        self.actor_rollout_wg.update_actor = _expanded_update_actor
+
+    def _attach_traj_uniform_weight_inplace(self, batch: DataProto) -> DataProto:
+        """Attach a `traj_uniform_weight` tensor for an unexpanded batch.
+
+        When the segment-training path is enabled but the rollout produced no
+        multi-segment trajectories (every traj is 1 segment), we still need
+        the actor's ``traj_uniform_weight`` field to be present, with values
+        such that the loss math comes out as
+        ``L = (1/N_G) Σ_i (1/N_t^i) Σ_token ℓ_token``. For 1-segment
+        trajectories, ``N_t^i`` = the row's mask=1 count, so
+        ``w[i, t] = 1 / (N_G · sum(response_mask[i]))`` for valid tokens.
+        """
+        import torch as _torch
+
+        response_mask = batch.batch["response_mask"]
+        n_g = response_mask.shape[0]
+        n_t_per_row = response_mask.sum(dim=1).clamp(min=1).to(_torch.float32)
+        weight_per_row = 1.0 / (n_g * n_t_per_row)
+        # Broadcast to (B, T): weight_per_row[i] at mask=1 positions.
+        traj_uniform_weight = response_mask.to(_torch.float32) * weight_per_row.unsqueeze(1)
+        batch.batch["traj_uniform_weight"] = traj_uniform_weight
+        return batch
 
     def _validate_agent(self):
         """Override validation to include environment metrics from MultiEpisodeEnv.
@@ -337,13 +525,20 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         return metric_dict
 
     def _transform_agent_trajectories(self, trajectories: list[dict]):
-        """Override to group traj metrics by data_source."""
-        # Strip segments key — segment flattening would change batch size,
-        # which is incompatible with verl's PPO pipeline (batch.union requires
-        # matching sizes).  The first segment is already used as the base
-        # trajectory in summarizing_engine.py.
-        for traj in trajectories:
-            traj.pop("segments", None)
+        """Override to group traj metrics by data_source.
+
+        We keep ``traj["segments"]`` intact (the parent transform doesn't
+        consult it; it uses the top-level ``prompt_tokens`` /
+        ``response_tokens`` / ``response_masks``, which equal ``segments[0]``
+        for any segmented trajectory) and stash the trajectory list on
+        ``self._cached_raw_trajectories`` so the wrapped ``update_actor``
+        (when summarization is enabled) can expand into per-segment rows
+        with broadcast advantages and trajectory-uniform per-token weights.
+        """
+        # Cache the segmented payload for the wrapped update_actor.
+        # We use a shallow copy so future mutations to `trajectories` don't
+        # leak into the cache.
+        self._cached_raw_trajectories = list(trajectories)
 
         # Call parent method to get the base transformation
         final_gen_batch_output, metrics = super()._transform_agent_trajectories(trajectories)

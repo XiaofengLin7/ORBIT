@@ -59,7 +59,22 @@ def run_ppo_agent(
             ray_init_settings = {k: v for k, v in config.ray_init.items() if v is not None}
         else:
             ray_init_settings = {}
-        ray.init(runtime_env=get_ppo_ray_runtime_env(), **ray_init_settings)
+
+        runtime_env = get_ppo_ray_runtime_env()
+
+        # NOTE: we previously tried to inject TrajectoryUniformPPOActor into
+        # workers via runtime_env.worker_process_setup_hook, but on this SCC
+        # cluster setting *any* worker_process_setup_hook (even an empty one)
+        # breaks Ray's per-worker GPU isolation and the actors die at
+        # `init_device_mesh` with "CUDA-capable device(s) is/are busy or
+        # unavailable" — confirmed via empty-hook bisection. Until we ship
+        # the patch via a different mechanism (.pth file in site-packages or
+        # an editable pip install), workers run verl's stock
+        # DataParallelPPOActor and the loss aggregation falls back to
+        # `seq-mean-token-mean` on the expanded batch. Still a valid loss,
+        # just not the trajectory-uniform formulation.
+
+        ray.init(runtime_env=runtime_env, **ray_init_settings)
 
     if (
         is_cuda_available
@@ -123,12 +138,21 @@ class MultiEpisodeTaskRunner:
 
         # Pre-warm NLTK word corpora to avoid LazyCorpusLoader race condition
         # when Wordle/Hangman envs are created concurrently in init_envs_and_agents.
+        # Redirect stdout/stderr around the download so the [nltk_data] log
+        # lines don't pollute the trainer log; we only surface real errors.
         try:
+            import contextlib
+            import io
             import nltk
-            nltk.download("words", quiet=True)
-            from nltk.corpus import words as _nltk_words
-            _ = _nltk_words.words("en-basic")
-            _ = _nltk_words.words("en")
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    nltk.data.find("corpora/words")
+                except LookupError:
+                    nltk.download("words", quiet=True)
+                from nltk.corpus import words as _nltk_words
+                _ = _nltk_words.words("en-basic")
+                _ = _nltk_words.words("en")
         except Exception as _e:
             print(f"[warn] NLTK warmup failed: {_e}")
 

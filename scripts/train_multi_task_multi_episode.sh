@@ -25,6 +25,32 @@ export VLLM_USE_V1=1
 # Ray set per-actor `CUDA_VISIBLE_DEVICES` correctly.
 export RLLM_EXCLUDE=${RLLM_EXCLUDE:-CUDA_VISIBLE_DEVICES}
 
+# Install the trajectory-uniform actor patch into the active conda env's
+# site-packages via a .pth file. Python auto-loads .pth files at startup
+# (via the `site` module) in EVERY Python process — including Ray's FSDP
+# worker processes. This is how we get our `TrajectoryUniformPPOActor`
+# to replace verl's stock `DataParallelPPOActor` in workers, without
+# going through `runtime_env.worker_process_setup_hook` (which on this
+# SCC cluster breaks Ray's per-worker GPU isolation — confirmed via
+# empty-hook bisection).
+#
+# Idempotent: rewrites the .pth file every launch with the current
+# repo root and the current env's site-packages. Also makes this
+# zero-setup for someone cloning the repo on a different machine —
+# they just `conda activate <env>` and run the launch script; the .pth
+# is written into their env automatically.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])" 2>/dev/null)
+if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
+    cat > "$SITE_PACKAGES/orbit_segtrain.pth" <<EOF
+$REPO_ROOT
+import orbit_segtrain_patch
+EOF
+    echo "[orbit] Installed trajectory-uniform actor patch at $SITE_PACKAGES/orbit_segtrain.pth"
+else
+    echo "[orbit] WARNING: could not locate active site-packages; trajectory-uniform actor patch NOT installed. Workers will fall back to seq-mean-token-mean."
+fi
+
 # Multi-task configuration: path to YAML config file (required)
 TASKS_CONFIG=${TASKS_CONFIG:-configs/multi_task_multi_episode_config.yaml}
 
