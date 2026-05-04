@@ -28,7 +28,9 @@ TRAJECTORY_TIMEOUT=${TRAJECTORY_TIMEOUT:-1200}
 # Sampling parameters
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.95}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-31744}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-16384}  # gpt-4o caps at 16384; gpt-5.2 accepts more — override upward if needed
+# Reasoning effort: only set for reasoning models (gpt-5*, o*); leave empty for gpt-4o etc.
+REASONING_EFFORT=${REASONING_EFFORT:-}
 
 # Output configuration
 OUTPUT_DIR=${OUTPUT_DIR:-results}
@@ -41,6 +43,11 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT=${OUTPUT:-${OUTPUT_DIR}/eval_${MODEL_SAFE}_${CONFIG_NAME}_${TIMESTAMP}.json}
 
 # Run evaluation
+EXTRA_ARGS=()
+if [ -n "$REASONING_EFFORT" ]; then
+    EXTRA_ARGS+=(--reasoning-effort "$REASONING_EFFORT")
+fi
+
 python scripts/eval/openai.py \
     --config "$CONFIG" \
     --model "$MODEL" \
@@ -55,4 +62,5 @@ python scripts/eval/openai.py \
     --env-mode "$ENV_MODE" \
     --output "$OUTPUT" \
     --log-chat-completions \
+    "${EXTRA_ARGS[@]}" \
     "$@"

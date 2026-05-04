@@ -15,25 +15,32 @@ Example usage:
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
+# This file is named `openai.py`; running it as a script puts its directory on
+# sys.path[0], which shadows the real `openai` package for any later
+# `import openai` (e.g. rllm's OpenAIEngine). Drop it before anything else imports.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p) != _HERE]
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import argparse
 import asyncio
 import json
 import logging
-import os
 import re
-import sys
 from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import yaml
 from transformers import AutoTokenizer
-# Add repo root to path for imports
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from agents.gem_text_agent import GEMTextAgent  # noqa: E402
 from envs.multi_episode_env import MultiEpisodeEnv  # noqa: E402
@@ -194,6 +201,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4096,
         help="Maximum response length in tokens.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        choices=[None, "minimal", "low", "medium", "high"],
+        help="Reasoning effort for reasoning models (gpt-5*, o*). Omit for non-reasoning models like gpt-4o.",
     )
     parser.add_argument(
         "--trajectory-timeout",
@@ -387,6 +401,61 @@ def get_default_system_prompt(env_mode: str) -> str:
     )
 
 
+# Per-call output token cap published by OpenAI for each model family. The
+# engine tracks a trajectory-level token budget (max_response_length, including
+# env observations) and computes a per-call remainder; we additionally clamp at
+# this published per-call cap so a generous trajectory budget (e.g. Qwen3-8B's
+# 31744 / 64512) doesn't trip the API on models with a tighter single-call cap.
+# Prefix-matched (longest first) so dated snapshots inherit the family value.
+OPENAI_MODEL_OUTPUT_CAPS: Dict[str, int] = {
+    "gpt-4o-mini": 16384,
+    "gpt-4o": 16384,
+    "gpt-5.5": 128000,
+    "gpt-5.2": 128000,
+    "gpt-5.1": 128000,
+    "gpt-5": 128000,
+    "o4-mini": 100000,
+    "o3-mini": 100000,
+    "o3": 100000,
+    "o1-mini": 65536,
+    "o1": 100000,
+}
+
+
+def _resolve_per_call_cap(model: str) -> Optional[int]:
+    for prefix in sorted(OPENAI_MODEL_OUTPUT_CAPS, key=len, reverse=True):
+        if model.startswith(prefix):
+            return OPENAI_MODEL_OUTPUT_CAPS[prefix]
+    return None
+
+
+def _install_bounded_max_tokens_patch(per_call_cap: Optional[int]) -> None:
+    """Replace OpenAIEngine._prepare_max_tokens_param so the per-turn API request
+    honors (a) the engine's dynamic remaining trajectory budget (max_tokens) and
+    (b) the model's published per-call output cap. Always emits the modern
+    `max_completion_tokens` param, which both reasoning and non-reasoning chat
+    models accept.
+    """
+    from rllm.engine.rollout.openai_engine import OpenAIEngine
+
+    def _bounded_prepare(self, sampling_params, prompt_length=None):
+        # Engine injects max_tokens=remaining_trajectory_budget per call.
+        dyn = sampling_params.pop("max_tokens", None)
+        # Static value (rare on this code path now that we don't set it).
+        static = sampling_params.pop("max_completion_tokens", None)
+        candidates = [v for v in (dyn, static) if isinstance(v, int) and v > 0]
+        budget = min(candidates) if candidates else self.max_response_length
+        if per_call_cap is not None:
+            budget = min(budget, per_call_cap)
+        if prompt_length and self.max_model_length:
+            ctx_remaining = self.max_model_length - prompt_length
+            if ctx_remaining > 0:
+                budget = min(budget, ctx_remaining)
+        return {"max_completion_tokens": max(1, int(budget))}
+
+    OpenAIEngine._prepare_max_tokens_param = _bounded_prepare
+
+
 def create_engine(
     args: argparse.Namespace,
     max_steps: int,
@@ -410,19 +479,25 @@ def create_engine(
     Returns:
         Configured EvalEngine.
     """
+    # Reasoning models (gpt-5*, o*) reject temperature/top_p — only the default is allowed.
+    # When --reasoning-effort is set, omit those params entirely.
+    is_reasoning_model = args.reasoning_effort is not None
+
+    inner_sampling: Dict[str, Any] = {}
+    if not is_reasoning_model:
+        inner_sampling["temperature"] = args.temperature
+        inner_sampling["top_p"] = args.top_p
+
     rollout_engine_args = {
         "model": args.model,
         "base_url": args.base_url,
         "api_key": args.api_key,
-        "sampling_params": {
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-        },
+        "sampling_params": inner_sampling,
     }
     # dummy tokenizer and parser for openai engine
     dummy_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
     dummy_parser = ChatTemplateParser.get_parser(dummy_tokenizer)
-    
+
     # Create dummy config with OmegaConf for attribute access (required by AgentExecutionEngine)
     from omegaconf import OmegaConf
     config = OmegaConf.create({
@@ -431,6 +506,20 @@ def create_engine(
             "disable_thinking": False,
         }
     })
+    # Don't set max_completion_tokens here: the parent engine passes a dynamic
+    # max_tokens (= max_response_length - response_token_len) per call which
+    # our patched _prepare_max_tokens_param will turn into a properly clamped
+    # max_completion_tokens for the API.
+    sampling_params: Dict[str, Any] = {}
+    if is_reasoning_model:
+        sampling_params["reasoning_effort"] = args.reasoning_effort
+    else:
+        sampling_params["temperature"] = args.temperature
+        sampling_params["top_p"] = args.top_p
+
+    # Install the per-call cap patch before EvalEngine constructs OpenAIEngine.
+    _install_bounded_max_tokens_patch(_resolve_per_call_cap(args.model))
+
     engine = EvalEngine(
         agent_class=GEMTextAgent,
         env_class=env_class,
@@ -446,12 +535,7 @@ def create_engine(
         max_response_length=args.max_response_length,
         max_prompt_length=1024,  # Generous prompt length for multi-turn
         trajectory_timeout=args.trajectory_timeout,
-        sampling_params={
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "max_completion_tokens": args.max_response_length,
-            "reasoning_effort": "low",
-        },
+        sampling_params=sampling_params,
     )
 
     return engine
