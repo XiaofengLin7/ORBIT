@@ -99,6 +99,10 @@ class MultiEpisodeEnv(BaseEnv):
         # Maze-only: track unique visited positions across the full trajectory.
         # This is intentionally scoped to Maze to keep this wrapper simple.
         self._maze_visited_positions: Optional[Set[Tuple[int, int]]] = None
+        # Maze-only: chronological per-episode path of visited positions.
+        # Each inner list is one episode's positions in order, including the
+        # episode's start. Consumed by the oracle summarizer.
+        self._maze_episode_paths: Optional[List[List[Tuple[int, int]]]] = None
         self._task: Optional[dict] = None
         self._seed: Optional[int] = None
         # Store the initial task from dataset (extracted in from_dict)
@@ -152,7 +156,11 @@ class MultiEpisodeEnv(BaseEnv):
         self._episode_successes = []
         self._episode_lengths = []
         self._episode_rewards = []
-        self._maze_visited_positions = set() if self._is_maze_inner_env() else None
+        is_maze = self._is_maze_inner_env()
+        self._maze_visited_positions = set() if is_maze else None
+        # Initial episode path bucket — initial position lands here via the
+        # _maybe_track_maze_state() call after _reset_inner_env() below.
+        self._maze_episode_paths = [[]] if is_maze else None
         # Use provided task, or fall back to initial task from dataset
         self._task = task if task is not None else self._initial_task
         self._seed = seed if seed is not None else self._seed
@@ -287,6 +295,7 @@ class MultiEpisodeEnv(BaseEnv):
 
                     # Reset for next episode (same task/seed) and bump index.
                     next_obs, reset_info = self._reset_inner_env()
+                    self._open_new_maze_episode_bucket()
                     self._maybe_track_maze_state()
                     self._episode_index += 1
                     self._episode_step = 0
@@ -342,6 +351,7 @@ class MultiEpisodeEnv(BaseEnv):
                 "episode_done=True under reflection_via_summarization=True."
             )
         next_obs, reset_info = self._reset_inner_env()
+        self._open_new_maze_episode_bucket()
         self._maybe_track_maze_state()
         self._episode_index += 1
         self._episode_step = 0
@@ -573,10 +583,25 @@ class MultiEpisodeEnv(BaseEnv):
             return
         try:
             state_id = self.inner_env.get_state_id()
-            self._maze_visited_positions.add(state_id)
         except Exception:
             # Tracking must never break the main env loop.
             return
+        self._maze_visited_positions.add(state_id)
+        if self._maze_episode_paths is not None:
+            # Always append; an empty bucket was opened at trajectory start
+            # or when a new episode began.
+            self._maze_episode_paths[-1].append(state_id)
+
+    def _open_new_maze_episode_bucket(self) -> None:
+        """Open a fresh per-episode path bucket for the upcoming episode.
+
+        Called immediately before tracking the new episode's start position,
+        so the start is the first entry of the new bucket rather than the
+        last entry of the previous one.
+        """
+        if self._maze_episode_paths is None:
+            return
+        self._maze_episode_paths.append([])
 
     @property
     def task_type(self) -> Optional[str]:

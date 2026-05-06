@@ -256,12 +256,25 @@ def parse_args() -> argparse.Namespace:
         help="Token threshold for mid-trajectory context summarization. "
         "When set, the agent summarizes its context when it exceeds this many tokens.",
     )
+    parser.add_argument(
+        "--oracle-summarizer",
+        action="store_true",
+        help="Substitute the LLM-generated summary with a rule-based oracle "
+        "summarizer at episode boundaries (currently supported: maze). "
+        "Requires --summarization-threshold so the summarization engine is active.",
+    )
 
     args = parser.parse_args()
 
     # Handle log-chat-completions flag
     if args.no_log_chat_completions:
         args.log_chat_completions = False
+
+    if args.oracle_summarizer and not args.summarization_threshold:
+        parser.error(
+            "--oracle-summarizer requires --summarization-threshold to be set "
+            "so the summarization-aware agent + engine are activated."
+        )
 
     # Set API key from environment if not provided
     if args.api_key is None:
@@ -453,12 +466,21 @@ def create_engine(
     
     # Create dummy config with OmegaConf for attribute access (required by AgentExecutionEngine)
     from omegaconf import OmegaConf
-    config = OmegaConf.create({
+    config_dict: Dict[str, Any] = {
         "rllm": {
             "filter_token_mismatch": False,
             "disable_thinking": False,
         }
-    })
+    }
+    if getattr(args, "oracle_summarizer", False):
+        # The summarizing engine reads oracle config from
+        # rllm.agent.summarization.oracle.{enable,scope}.
+        config_dict["rllm"]["agent"] = {
+            "summarization": {
+                "oracle": {"enable": True, "scope": "maze"},
+            }
+        }
+    config = OmegaConf.create(config_dict)
     engine_cls = SummarizingEvalEngine if args.summarization_threshold else EvalEngine
     engine = engine_cls(
         agent_class=agent_class,

@@ -29,6 +29,7 @@ from rllm.agents.utils import (
 from rllm.environments.env_utils import compute_mc_return, compute_trajectory_reward
 from rllm.utils import colorful_print
 
+from agents.oracle_summarizers import get_oracle_summarizer
 from prompts.summarization_prompts import (
     EPISODIC_SUMMARY_PROMPT,
     REFLECTIVE_SUMMARY_PROMPT,
@@ -401,6 +402,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                         trigger=summ_trigger,
                         use_reflective_prompt=use_reflective,
                         summ_instruction_tokens=instr_tokens,
+                        env=env,
                     )
                     delta_time = time.time() - start_time
                     llm_time += delta_time
@@ -605,6 +607,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         trigger: str = "token",
         use_reflective_prompt: bool = False,
         summ_instruction_tokens: list[int] | None = None,
+        env: object | None = None,
     ) -> tuple[list[int] | None, int] | None:
         """Generate a summary, apply it, and return updated accumulated_prompt_ids.
 
@@ -629,6 +632,46 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             or ``None`` if summarization failed (e.g. prompt exceeded
             max_model_len).
         """
+        # Oracle short-circuit: when an env-specific rule-based summarizer is
+        # registered AND the user has opted in via Hydra, skip the LLM call
+        # and feed the oracle's text into apply_summary directly. The oracle
+        # output is *not* recorded as a trainable step — the model is never
+        # asked to imitate it.
+        oracle_fn = self._maybe_oracle_summarizer(env, trigger)
+        if oracle_fn is not None:
+            try:
+                oracle_text = oracle_fn(env)
+            except Exception as exc:  # never let oracle failures crash a rollout
+                logger.warning("oracle summarizer failed: %s", exc)
+                oracle_text = ""
+            if not oracle_text:
+                return None
+            # Snapshot pre-summary chat for logging parity with the LLM path.
+            segment_chat_histories.append(agent.chat_completions)
+            agent.apply_summary(oracle_text, trigger=trigger)
+            # Mark the segment break at the LAST PRE-ORACLE step so
+            # `assemble_segments` splits pre- and post-oracle steps into
+            # separate segments. Without the split, `assemble_steps` walks
+            # through the chat-history compression as if it were continuous
+            # tokens and trips its retokenization-mismatch guard at the
+            # boundary (zero-masking the whole trajectory). We do NOT add
+            # a placeholder oracle step to `episode_steps`, so the oracle
+            # text is still never a PPO training target.
+            if episode_steps:
+                summarization_boundaries.append(len(episode_steps) - 1)
+            new_accumulated: list[int] | None = None
+            if mode == "Token":
+                summary_user_msg = agent.chat_completions[1]
+                summary_msg_tokens, _ = convert_messages_to_tokens_and_masks(
+                    [summary_user_msg],
+                    tokenizer=self.tokenizer,
+                    parser=self.chat_parser,
+                    contains_first_msg=False,
+                    contains_generation_msg=True,
+                )
+                new_accumulated = initial_system_tokens + list(summary_msg_tokens)
+            return new_accumulated, 0
+
         summary_prompt = agent.build_summarization_prompt(
             trigger=trigger, use_reflective_prompt=use_reflective_prompt
         )
@@ -733,6 +776,29 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         response_len_delta = summ_instruction_len + summ_completion_len
 
         return new_accumulated, response_len_delta
+
+    def _maybe_oracle_summarizer(self, env, trigger: str):
+        """Return an env-specific oracle summarizer, or ``None``.
+
+        Oracle is opted into via ``rllm.agent.summarization.oracle.enable``
+        and currently fires only at episode boundaries (the rule-based
+        maze summarizer's contract is "after one episode").
+        """
+        if env is None or trigger != "episode_end":
+            return None
+        try:
+            oracle_cfg = self.config.rllm.agent.summarization.get("oracle", None)
+        except Exception:
+            return None
+        if oracle_cfg is None:
+            return None
+        try:
+            enabled = bool(oracle_cfg.get("enable", False))
+        except Exception:
+            enabled = bool(getattr(oracle_cfg, "enable", False))
+        if not enabled:
+            return None
+        return get_oracle_summarizer(env)
 
     # ------------------------------------------------------------------
     # Training data assembly
