@@ -5,12 +5,15 @@
 # total_step_cap = num_episodes * max_turns_per_episode = 10 * 9 = 90
 # test_size starts small (32) for a sanity run; bump as needed.
 train_tasks:
-  - env_id: "rockpaperscissors"
-    max_turns_per_episode: 5
-    total_step_cap: 15
+  - env_id: "maze"
+    max_turns_per_episode: 9
+    num_episodes: 3
+    total_step_cap: 27
+    shortest_path_max_length: 8
+    shortest_path_min_length: 7
     train_size: 512
-    inner_env_class: 'envs.rps_env_adapter.RockPaperScissorsEnvAdapter'
-    min_dom:  0.4
+    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+    shapes: [[6,6],[7,6],[7,7],[6,7]]
     
 val_tasks:
   - env_id: "maze"

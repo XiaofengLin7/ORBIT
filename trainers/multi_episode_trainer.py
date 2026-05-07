@@ -122,6 +122,28 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
             return SummarizingAgentExecutionEngine
         return MultiEpisodeAsyncAgentExecutionEngine
 
+    def _balance_batch(self, batch, metrics, **kwargs):
+        """No-op when segment training is enabled.
+
+        The skinny per-trajectory batch is a fictional carrier whose row
+        order is bound to ``_cached_raw_trajectories`` (set in
+        :meth:`_transform_agent_trajectories`). The parent's
+        :meth:`_balance_batch` reorders rows for DP load balancing using
+        ``attention_mask`` over ``segments[0]`` only — that's neither the
+        actual training workload (the actor trains on the segment-expanded
+        rows produced inside :meth:`_expanded_update_actor`) nor invariant
+        under our positional cache lookup. Letting it run silently swaps
+        advantages between trajectories.
+
+        We disable the skinny reorder here and apply
+        :meth:`RayPPOTrainer._balance_batch` directly to the post-expansion
+        batch inside :meth:`_expanded_update_actor`, where the workload
+        signal is real and there's nothing to de-sync.
+        """
+        if self._segment_training_enabled:
+            return
+        return super()._balance_batch(batch, metrics, **kwargs)
+
     @property
     def _segment_training_enabled(self) -> bool:
         """True iff we should train PPO on every summarization segment.
@@ -218,6 +240,15 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
 
         original_update_actor = self.actor_rollout_wg.update_actor
 
+        # Imported once here for use inside the closure: we need to call the
+        # parent class's `_balance_batch` directly to bypass our trainer's
+        # no-op override (which protects the skinny per-trajectory batch).
+        # Inside `_expanded_update_actor` the batch we balance is either the
+        # post-expansion batch (slow path) or the weight-attached skinny
+        # batch (fast path), both of which represent real `update_actor`
+        # workload and are safe to reorder.
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
         def _expanded_update_actor(batch: DataProto):
             raw_trajs = self._cached_raw_trajectories
             if raw_trajs is None or not any(t.get("segments") for t in raw_trajs):
@@ -225,9 +256,16 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 # the expansion is a no-op. Run with the per-trajectory
                 # batch directly. We still need traj_uniform_weight = 1/N_t^i
                 # per row so the trajectory-uniform actor's loss math works.
-                return original_update_actor(
-                    self._attach_traj_uniform_weight_inplace(batch)
+                attached = self._attach_traj_uniform_weight_inplace(batch)
+                # Skinny batch IS what update_actor trains on in the fast
+                # path, so balance it here on the actual workload (the
+                # parent method's reorder is bypassed via the explicit
+                # RayPPOTrainer call to skip our no-op override).
+                RayPPOTrainer._balance_batch(
+                    self, attached, metrics={},
+                    logging_prefix="expanded_seqlen",
                 )
+                return original_update_actor(attached)
 
             # Pull A_i per trajectory from the per-trajectory advantage tensor.
             n_g = batch.batch["advantages"].shape[0]
@@ -277,6 +315,19 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 # sum(pg * traj_uniform_weight * response_mask); with w=0,
                 # padded rows add 0 to the loss and 0 to the gradient.
                 expanded_batch.batch["traj_uniform_weight"][-pad_size:] = 0.0
+
+            # Balance the EXPANDED batch on actual seq lengths so each DP
+            # rank gets a comparable workload during compute_log_prob and
+            # update_actor. Bypasses our no-op override (which only protects
+            # the skinny pre-expansion batch). Per-row tensors
+            # (`advantages`, `traj_uniform_weight`) are already correctly
+            # bound to their rows, so reordering preserves correctness —
+            # each row's per-token weight still attaches to that row's
+            # mask=1 positions.
+            RayPPOTrainer._balance_batch(
+                self, expanded_batch, metrics={},
+                logging_prefix="expanded_seqlen",
+            )
 
             # Recompute old_log_probs on the expanded batch (each segment's
             # tokens are different from the per-trajectory segment[0]).
