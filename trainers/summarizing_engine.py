@@ -158,6 +158,20 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
             if not self.enforce_max_prompt_length:
                 max_tokens = self.max_response_length - response_token_len
+                # Guard: vLLM raises ValueError("max_tokens must be at least 1")
+                # if max_tokens <= 0. The downstream TRUNCATION check fires
+                # only at the END of a step (after `response_token_len` is
+                # incremented), so a step that overshoots the budget by
+                # exactly the assistant+env tokens of its predecessor can
+                # leave `response_token_len > max_response_length` at the
+                # top of the next iteration. Terminate cleanly here instead
+                # of letting vLLM raise — same semantics as TRUNCATION,
+                # without the noisy traceback + retry storm.
+                if max_tokens <= 0:
+                    termination_reason = "TRUNCATION"
+                    cur_step = agent.get_current_state()
+                    cur_step.done = True
+                    break
             else:
                 max_tokens = self.max_response_length
                 prompt_str = self.chat_parser.parse(
