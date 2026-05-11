@@ -45,6 +45,23 @@ set -x
 #                            only honored when USE_DYNAMIC_BSZ=False)
 #     USE_DYNAMIC_BSZ        actor.use_dynamic_bsz            (default: True)
 #     GPU_MEM_UTIL           rollout.gpu_memory_utilization   (default: 0.8)
+#
+#   Length-penalty knobs (overlong reward shaping; OFF by default):
+#     LENGTH_PENALTY         "true" to enable per-episode length penalty
+#                            (default: false)
+#     RESPONSE_LENGTH        reference value for data.max_response_length
+#                            used to derive L_cache from a fraction
+#                            (default: 31744 — matches the parent script's
+#                            data.max_response_length). Override if you
+#                            also override data.max_response_length.
+#     LP_MAX_TOKENS          episode_max_tokens (L_max). Default: unset →
+#                            engine uses data.max_response_length.
+#     LP_CACHE_TOKENS        episode_cache_tokens (L_cache), absolute.
+#                            Default: unset → see LP_CACHE_FRACTION.
+#     LP_CACHE_FRACTION      L_cache as a fraction of RESPONSE_LENGTH
+#                            (default: 0.25). Set 0.5 to make the cache
+#                            half the response length. Ignored when
+#                            LP_CACHE_TOKENS is set explicitly.
 # =============================================================================
 
 export TASKS_CONFIG=${TASKS_CONFIG:-configs/eval_maze_oracle_10ep.yaml}
@@ -74,6 +91,29 @@ if [ -n "${MICRO_BATCH:-}" ] && [ "$USE_DYNAMIC_BSZ" = "False" ]; then
     SPEED_OVERRIDES+=(actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH)
 fi
 
+# ---- Length penalty (overlong reward shaping; off by default) ------------
+RESPONSE_LENGTH=${RESPONSE_LENGTH:-31744}
+LP_CACHE_FRACTION=${LP_CACHE_FRACTION:-0.25}
+LP_OVERRIDES=()
+if [ "${LENGTH_PENALTY:-false}" = "true" ] || [ "${LENGTH_PENALTY:-false}" = "True" ]; then
+    LP_OVERRIDES+=(+rllm.length_penalty.enable=true)
+    # L_max: explicit override only; otherwise the engine defaults it to
+    # data.max_response_length.
+    if [ -n "${LP_MAX_TOKENS:-}" ]; then
+        LP_OVERRIDES+=(+rllm.length_penalty.episode_max_tokens=$LP_MAX_TOKENS)
+        _LP_BASE=$LP_MAX_TOKENS
+    else
+        _LP_BASE=$RESPONSE_LENGTH
+    fi
+    # L_cache: explicit absolute value wins; otherwise derive from the
+    # fraction of the base (either the explicit L_max or RESPONSE_LENGTH).
+    if [ -z "${LP_CACHE_TOKENS:-}" ]; then
+        LP_CACHE_TOKENS=$(awk "BEGIN{printf \"%d\", $_LP_BASE * $LP_CACHE_FRACTION}")
+    fi
+    LP_OVERRIDES+=(+rllm.length_penalty.episode_cache_tokens=$LP_CACHE_TOKENS)
+    echo "[wrapper] length penalty ON: L_max=${LP_MAX_TOKENS:-<engine default = data.max_response_length>} L_cache=$LP_CACHE_TOKENS"
+fi
+
 # Episodic summary fits the user's "summarize at episode end" intent;
 # threshold is set high so token-trigger never fires (oracle is the only
 # summary source we want here).
@@ -91,4 +131,5 @@ bash scripts/train_multi_task_summarizing.sh \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.project_name='segment-training-validation' \
     "${SPEED_OVERRIDES[@]}" \
+    "${LP_OVERRIDES[@]}" \
     "$@"
