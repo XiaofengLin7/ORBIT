@@ -314,6 +314,15 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
             response_token_len += len(assistant_msg_tokens) + len(env_msg_tokens)
 
+            # Stamp per-step delta on the just-appended action step (the
+            # current loop iteration's prompt_response_pair, line ~217).
+            # Consumed by ``trainers/length_penalty.py`` to compute the
+            # per-episode response-token total for the overlong reward
+            # shaping. Defaults to 0 when not stamped, so absence is safe.
+            prompt_response_pair["response_token_delta"] = (
+                len(assistant_msg_tokens) + len(env_msg_tokens)
+            )
+
             if (
                 not self.enforce_max_prompt_length
                 and response_token_len >= self.max_response_length
@@ -598,6 +607,80 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             else:
                 ep_rewards = [float(trajectory.reward)]
 
+            # ---- Optional per-episode length penalty (overlong reward
+            # shaping, arXiv:2510.11701 Eq. 9). Off by default. Reads
+            # config defensively via .get(...), same pattern as the
+            # oracle summarizer block elsewhere in this file. The
+            # penalty is added on top of ep_rewards BEFORE the result
+            # dict is built — so chunk_advantage downstream sees shaped
+            # rewards transparently. In token-summarization mode the
+            # summarizer auto-manages length, so this is skipped unless
+            # the user explicitly disables ``skip_if_token_mode``.
+            lp_response_tokens: list[int] = []
+            lp_penalties: list[float] = []
+            try:
+                lp_cfg = self.config.rllm.get("length_penalty", None)
+            except Exception:
+                lp_cfg = None
+            if lp_cfg is not None and bool(lp_cfg.get("enable", False)):
+                try:
+                    summ_cfg_node = self.config.rllm.agent.get(
+                        "summarization", None
+                    )
+                    summ_mode = (
+                        str(summ_cfg_node.get("mode", "episodic"))
+                        if summ_cfg_node is not None
+                        else "episodic"
+                    )
+                except Exception:
+                    summ_mode = "episodic"
+                skip_token = bool(lp_cfg.get("skip_if_token_mode", True))
+                if (
+                    not (skip_token and summ_mode == "token")
+                    and len(ep_rewards) > 0
+                ):
+                    from trainers.length_penalty import (
+                        apply_length_penalty_to_episode_rewards,
+                    )
+                    # L_max default: data.max_response_length. Rationale:
+                    # in episodic mode each episode starts from a fresh
+                    # summary-compressed context, so any single episode
+                    # has the full response budget available before it
+                    # would risk truncation.
+                    l_max_default = int(self.config.data.max_response_length)
+                    l_max = int(
+                        lp_cfg.get("episode_max_tokens", l_max_default)
+                    )
+                    l_cache_cfg = lp_cfg.get("episode_cache_tokens", None)
+                    l_cache = (
+                        int(l_cache_cfg)
+                        if l_cache_cfg is not None
+                        else max(1, l_max // 4)
+                    )
+                    shaped, lp_response_tokens, lp_penalties = (
+                        apply_length_penalty_to_episode_rewards(
+                            ep_rewards,
+                            episode_steps,
+                            l_max=l_max,
+                            l_cache=l_cache,
+                        )
+                    )
+                    ep_rewards = shaped
+
+            # Aggregate length-penalty metrics, computed once so the
+            # dict literal below stays readable.
+            _lp_aggregate_metrics: dict = {}
+            if lp_penalties:
+                _lp_aggregate_metrics = {
+                    "length_penalty/mean_penalty": (
+                        sum(lp_penalties) / len(lp_penalties)
+                    ),
+                    "length_penalty/triggered_fraction": (
+                        sum(1 for p in lp_penalties if p < 0.0)
+                        / len(lp_penalties)
+                    ),
+                }
+
             # First segment as base for backward compatibility.
             result = {
                 **segments[0],
@@ -616,6 +699,15 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     "token_mismatch": 0.0,
                     "summarization_count": len(summarization_boundaries),
                     "segment_count": len(segments),
+                    **{
+                        f"length_penalty/episode_{i + 1}_response_tokens": float(t)
+                        for i, t in enumerate(lp_response_tokens)
+                    },
+                    **{
+                        f"length_penalty/episode_{i + 1}_penalty": float(p)
+                        for i, p in enumerate(lp_penalties)
+                    },
+                    **_lp_aggregate_metrics,
                 },
             }
         elif mode == "Conversation":
@@ -807,6 +899,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 "logprobs": getattr(summary_output, "logprobs", []),
                 "is_summarization": True,
                 "trigger": trigger,
+                # Per-step delta consumed by trainers/length_penalty.py.
+                # The summary contributes its instruction (mask=0) plus
+                # its completion (mask=1) to the trajectory's response
+                # tokens. Both are added to ``response_token_len`` via
+                # the caller's ``response_len_delta`` below.
+                "response_token_delta": summ_instruction_len + summ_completion_len,
             }
         )
         summarization_boundaries.append(len(episode_steps) - 1)
