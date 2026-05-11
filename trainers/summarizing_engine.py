@@ -668,12 +668,17 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     ep_rewards = shaped
 
             # Aggregate length-penalty metrics, computed once so the
-            # dict literal below stays readable.
+            # dict literal below stays readable. NOTE: the trainer's
+            # metric aggregator filters values < 0 (used to drop the
+            # env's -1 "missing episode" placeholders). Penalties are
+            # always in [-1, 0], so they'd be silently dropped if logged
+            # raw. We emit the MAGNITUDE (always in [0, 1]) so the
+            # filter passes everything through.
             _lp_aggregate_metrics: dict = {}
             if lp_penalties:
                 _lp_aggregate_metrics = {
-                    "length_penalty/mean_penalty": (
-                        sum(lp_penalties) / len(lp_penalties)
+                    "length_penalty/mean_penalty_magnitude": (
+                        sum(-p for p in lp_penalties) / len(lp_penalties)
                     ),
                     "length_penalty/triggered_fraction": (
                         sum(1 for p in lp_penalties if p < 0.0)
@@ -703,8 +708,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                         f"length_penalty/episode_{i + 1}_response_tokens": float(t)
                         for i, t in enumerate(lp_response_tokens)
                     },
+                    # Penalty magnitude (= -penalty), always in [0, 1].
+                    # We emit the magnitude instead of the raw negative
+                    # penalty so the trainer's metric aggregator (which
+                    # filters values < 0) doesn't silently drop it.
                     **{
-                        f"length_penalty/episode_{i + 1}_penalty": float(p)
+                        f"length_penalty/episode_{i + 1}_penalty_magnitude":
+                            float(-p)
                         for i, p in enumerate(lp_penalties)
                     },
                     **_lp_aggregate_metrics,
