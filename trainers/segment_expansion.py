@@ -72,16 +72,57 @@ def _pad_1d(t: torch.Tensor, length: int, pad_value: int = 0,
     return torch.cat([pad, t], dim=0) if left_pad else torch.cat([t, pad], dim=0)
 
 
+def _mask1_runs(mask: torch.Tensor) -> list[tuple[int, int]]:
+    """Return maximal runs of 1s in a 1-D 0/1 tensor.
+
+    Each run corresponds to one step's response tokens (assistant
+    completion). Padding zeros at the right do not introduce spurious
+    runs because the rising/falling-edge diff is taken on a zero-padded
+    sequence.
+
+    Returns a list of ``(start_inclusive, end_exclusive)`` pairs.
+    """
+    if mask.numel() == 0:
+        return []
+    m = mask.to(torch.long).cpu()
+    padded = torch.cat([
+        torch.zeros(1, dtype=torch.long),
+        m,
+        torch.zeros(1, dtype=torch.long),
+    ])
+    diff = padded[1:] - padded[:-1]
+    starts = (diff == 1).nonzero(as_tuple=True)[0].tolist()
+    ends = (diff == -1).nonzero(as_tuple=True)[0].tolist()
+    return list(zip(starts, ends))
+
+
 def build_expanded_dataproto(
     trajectories: list[dict],
     *,
-    advantages_per_trajectory: torch.Tensor,
+    advantages_per_trajectory: torch.Tensor | None = None,
+    per_chunk_returns: list[list[tuple[float, bool]]] | None = None,
+    emit_is_positive: bool = True,
     pad_token_id: int,
     max_prompt_length: int,
     max_response_length: int,
     source_non_tensor_batch: dict | None = None,
 ) -> ExpandedBatch:
     """Materialize the segment-expanded ``DataProto`` for the actor update.
+
+    Two advantage-filling modes:
+
+    * **GRPO-broadcast** (default): pass ``advantages_per_trajectory``.
+      Element ``i`` is the scalar advantage ``A_i`` broadcast to every
+      valid token of every segment of trajectory ``i``. ``per_chunk_returns``
+      must be ``None``.
+
+    * **Chunk-discounted** (IPA-style sibling method): pass
+      ``per_chunk_returns`` — outer list indexed by trajectory, inner list
+      indexed by chunk (one entry per assistant turn / summarization step
+      in trajectory order). Each entry is ``(G_k, is_positive)``. The
+      function fills ``advantages[row, chunk_token_range] = G_k`` and
+      attaches a per-token ``is_positive`` tensor. ``advantages_per_trajectory``
+      must be ``None``.
 
     Args:
         trajectories: list of ``N_G`` trajectory dicts (sorted by ``idx`` =
@@ -92,9 +133,16 @@ def build_expanded_dataproto(
             If ``"segments"`` is missing or empty, the trajectory is treated
             as a single-segment one using its top-level ``prompt_tokens`` /
             ``response_tokens`` / ``response_masks``.
-        advantages_per_trajectory: 1-D Tensor of length ``N_G``. Element ``i``
-            is the scalar advantage ``A_i`` to broadcast to every valid token
-            of every segment of trajectory ``i``.
+        advantages_per_trajectory: 1-D Tensor of length ``N_G``. Mutually
+            exclusive with ``per_chunk_returns``.
+        per_chunk_returns: per-trajectory list of (G_k, is_positive)
+            tuples — one entry per chunk in trajectory-then-chunk order.
+            Mutually exclusive with ``advantages_per_trajectory``.
+        emit_is_positive: when ``per_chunk_returns`` is set, whether to
+            emit the per-token ``is_positive`` tensor that triggers the
+            actor's TOPR positive/negative split. Default True. Set to
+            False to use chunk-discounted returns *without* the TOPR
+            asymmetric loss (ablation: chunk credit, standard PPO surrogate).
         pad_token_id: tokenizer pad id.
         max_prompt_length: target padded length for prompts.
         max_response_length: target padded length for responses.
@@ -108,10 +156,27 @@ def build_expanded_dataproto(
     """
     n_g = len(trajectories)
     assert n_g > 0, "build_expanded_dataproto: empty trajectories list"
-    assert advantages_per_trajectory.shape == (n_g,), (
-        f"advantages_per_trajectory shape {tuple(advantages_per_trajectory.shape)} "
-        f"must match number of trajectories {n_g}"
-    )
+
+    use_per_chunk = per_chunk_returns is not None
+    if use_per_chunk:
+        assert advantages_per_trajectory is None, (
+            "build_expanded_dataproto: pass exactly one of "
+            "advantages_per_trajectory or per_chunk_returns, not both."
+        )
+        assert len(per_chunk_returns) == n_g, (
+            f"per_chunk_returns has {len(per_chunk_returns)} trajectories, "
+            f"expected {n_g}"
+        )
+    else:
+        assert advantages_per_trajectory is not None, (
+            "build_expanded_dataproto: must pass either "
+            "advantages_per_trajectory (GRPO mode) or per_chunk_returns "
+            "(chunk-discounted mode)."
+        )
+        assert advantages_per_trajectory.shape == (n_g,), (
+            f"advantages_per_trajectory shape {tuple(advantages_per_trajectory.shape)} "
+            f"must match number of trajectories {n_g}"
+        )
 
     # ---- Pass 1: gather per-segment row plans + N_t^i per trajectory ----
     seg_plans: list[dict] = []         # one entry per output row
@@ -147,7 +212,6 @@ def build_expanded_dataproto(
 
     # ---- Pass 2: build padded tensor batches ----
     n_rows = len(seg_plans)
-    device = advantages_per_trajectory.device
 
     input_ids = torch.full(
         (n_rows, max_prompt_length + max_response_length),
@@ -175,12 +239,27 @@ def build_expanded_dataproto(
     traj_uniform_weight = torch.zeros(
         (n_rows, max_response_length), dtype=torch.float32,
     )
+    # is_positive is only emitted in chunk-discounted mode and only when
+    # emit_is_positive is True. The actor's TOPR branch fires iff this
+    # tensor is present in the batch; absence ⇒ standard PPO surrogate.
+    is_positive: torch.Tensor | None = None
+    if use_per_chunk and emit_is_positive:
+        is_positive = torch.zeros(
+            (n_rows, max_response_length), dtype=torch.float32,
+        )
 
-    a_cpu = advantages_per_trajectory.detach().cpu()
+    a_cpu = (
+        None if use_per_chunk
+        else advantages_per_trajectory.detach().cpu()
+    )
+
+    # Per-trajectory cursor into per_chunk_returns: each segment of a
+    # trajectory consumes `n_chunks_in_segment` entries from the head of
+    # the trajectory's return list, in order.
+    chunk_cursor: list[int] = [0] * n_g
 
     for row_i, plan in enumerate(seg_plans):
         traj_i = plan["traj_i"]
-        a_i = float(a_cpu[traj_i].item())
         weight_const = 1.0 / (n_g * float(n_t_per_traj_clamped[traj_i]))
 
         # Truncate / pad the per-segment prompt and response.
@@ -210,10 +289,45 @@ def build_expanded_dataproto(
         response_real_len = min(response_real_len, max_response_length)
         attention_mask[row_i, max_prompt_length:max_prompt_length + response_real_len] = 1
 
-        # Broadcast trajectory-level advantage and per-token weight to valid tokens.
+        # Per-token traj_uniform_weight is identical in both modes.
         valid = seg_mask.bool()
-        advantages[row_i].masked_fill_(valid, a_i)
         traj_uniform_weight[row_i].masked_fill_(valid, weight_const)
+
+        if use_per_chunk:
+            # Walk the segment's mask to identify per-chunk token ranges
+            # (one contiguous mask=1 run per chunk), then write each chunk's
+            # G_k and TOPR sign into the per-token tensors.
+            chunk_runs = _mask1_runs(seg_mask)
+            traj_returns = per_chunk_returns[traj_i]
+            cursor = chunk_cursor[traj_i]
+            for run_idx, (start, end) in enumerate(chunk_runs):
+                chunk_idx = cursor + run_idx
+                if chunk_idx >= len(traj_returns):
+                    # Engine emitted more mask=1 runs than recorded chunks;
+                    # leave the tail at zero (logged once below).
+                    continue
+                G_k, is_pos = traj_returns[chunk_idx]
+                advantages[row_i, start:end] = float(G_k)
+                if is_positive is not None:
+                    is_positive[row_i, start:end] = 1.0 if is_pos else 0.0
+            chunk_cursor[traj_i] = cursor + len(chunk_runs)
+        else:
+            advantages[row_i].masked_fill_(valid, float(a_cpu[traj_i].item()))
+
+    if use_per_chunk:
+        # Sanity: every trajectory should have consumed exactly its return
+        # list. Mismatches indicate an alignment bug between step_metadata
+        # and the assembled segments — log loudly without crashing.
+        for traj_i, consumed in enumerate(chunk_cursor):
+            expected = len(per_chunk_returns[traj_i])
+            if consumed != expected:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "build_expanded_dataproto: trajectory %d consumed %d "
+                    "chunks via response_masks but per_chunk_returns has %d. "
+                    "Per-chunk advantages may be misaligned.",
+                    traj_i, consumed, expected,
+                )
 
     # position_ids = cumsum(attention_mask) - 1, masked to 0 at pad positions.
     position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask
@@ -229,6 +343,8 @@ def build_expanded_dataproto(
         "token_level_scores": token_level_scores,
         "traj_uniform_weight": traj_uniform_weight,
     }
+    if is_positive is not None:
+        tensors["is_positive"] = is_positive
 
     # Replicate non-tensor source fields per segment row.
     non_tensors: dict[str, np.ndarray] = {}

@@ -28,7 +28,9 @@ from verl import DataProto  # type: ignore
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 from rllm.trainer.verl.agent_ppo_trainer import AgentPPOTrainer
 
+from trainers.chunk_advantage import compute_chunk_returns_for_batch
 from trainers.segment_expansion import (
+    _mask1_runs,
     build_expanded_dataproto,
     extract_advantage_per_trajectory,
 )
@@ -267,13 +269,9 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 )
                 return original_update_actor(attached)
 
-            # Pull A_i per trajectory from the per-trajectory advantage tensor.
             n_g = batch.batch["advantages"].shape[0]
             assert n_g == len(raw_trajs), (
                 f"advantages batch size {n_g} != cached trajectory count {len(raw_trajs)}"
-            )
-            advantages_per_traj = extract_advantage_per_trajectory(
-                batch.batch["advantages"], batch.batch["response_mask"]
             )
 
             # Replicate source non-tensor fields per segment row.
@@ -282,15 +280,128 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 if hasattr(v, "shape") and v.shape and v.shape[0] == n_g
             }
 
-            # Build the expanded DataProto.
-            expansion = build_expanded_dataproto(
-                raw_trajs,
-                advantages_per_trajectory=advantages_per_traj,
-                pad_token_id=self.tokenizer.pad_token_id,
-                max_prompt_length=self.config.data.max_prompt_length,
-                max_response_length=self.config.data.max_response_length,
-                source_non_tensor_batch=source_non_tensor,
+            # Method dispatch:
+            #   "grpo" (default): GRPO advantage already in batch; broadcast
+            #       the per-trajectory scalar to every valid token of every
+            #       segment row (existing behavior — bit-for-bit unchanged).
+            #   "chunk_discounted_topr": IPA-style sibling method. Bypass
+            #       compute_advantage's GRPO normalization; instead compute
+            #       per-chunk discounted returns G_k = γ^Δ · R from the
+            #       per-trajectory step_metadata + episode_rewards stamped
+            #       on raw_trajs by SummarizingAgentExecutionEngine, and
+            #       fill advantages per-chunk plus a per-token is_positive
+            #       tensor for the actor's TOPR branch.
+            method_name = OmegaConf.select(
+                self.config, "rllm.advantage_method.name", default="grpo"
             )
+            if method_name == "grpo":
+                advantages_per_traj = extract_advantage_per_trajectory(
+                    batch.batch["advantages"], batch.batch["response_mask"]
+                )
+                expansion = build_expanded_dataproto(
+                    raw_trajs,
+                    advantages_per_trajectory=advantages_per_traj,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    max_prompt_length=self.config.data.max_prompt_length,
+                    max_response_length=self.config.data.max_response_length,
+                    source_non_tensor_batch=source_non_tensor,
+                )
+            elif method_name == "chunk_discounted_topr":
+                cd_cfg = self.config.rllm.advantage_method.chunk_discounted_topr
+                scope = OmegaConf.select(cd_cfg, "reward_scope", default="per_episode")
+                gamma = float(OmegaConf.select(cd_cfg, "gamma", default=0.95))
+                # The TOPR positive/negative split lives under the method
+                # config — NOT under actor_rollout_ref.actor, because verl's
+                # FSDPActorConfig is a strict dataclass and rejects unknown
+                # keys (Hydra would crash at instantiate time).
+                topr_enable = bool(
+                    OmegaConf.select(cd_cfg, "topr_split.enable", default=True)
+                )
+                per_chunk_returns = compute_chunk_returns_for_batch(
+                    raw_trajs, scope=scope, gamma=gamma,
+                )
+                # Overwrite the per-trajectory advantage tensor with the
+                # chunk-discounted G_k values for segment[0]. The actor
+                # trains on ``expanded_batch`` (built below), but verl's
+                # ``compute_data_metrics`` reads ``batch.batch["advantages"]``
+                # for ``critic/advantages/{mean,max,min}``. Without this
+                # overwrite, those metrics would still report GRPO
+                # advantages even when the trainer is using the
+                # chunk-discounted method, which is misleading.
+                _adv = batch.batch["advantages"]
+                _adv.zero_()
+                _seg0_mask = batch.batch["response_mask"]
+                for traj_i in range(n_g):
+                    runs = _mask1_runs(_seg0_mask[traj_i])
+                    traj_returns = per_chunk_returns[traj_i]
+                    for run_idx, (start, end) in enumerate(runs):
+                        if run_idx >= len(traj_returns):
+                            break
+                        G_k, _ = traj_returns[run_idx]
+                        _adv[traj_i, start:end] = float(G_k)
+                # Diagnostics: surface mismatches between trajectory
+                # rewards (what wandb's `traj/<ds>/score_*` reports) and
+                # what our chunk-fill ends up writing into `advantages`.
+                # The first run after a config change is when these are
+                # most useful, so we always print compactly.
+                _all_g = [g for traj in per_chunk_returns for g, _ in traj]
+                _ep_rewards_all = [
+                    r for t in raw_trajs
+                    for r in (t.get("episode_rewards") or [])
+                ]
+                _n_pos_eps = sum(1 for r in _ep_rewards_all if r > 0)
+                _n_eps_total = len(_ep_rewards_all)
+                _n_chunks_with_nonzero_g = sum(1 for g in _all_g if g != 0.0)
+                _n_trajs_with_step_metadata = sum(
+                    1 for t in raw_trajs if t.get("step_metadata")
+                )
+                print(
+                    f"[chunk-discounted-topr] step diagnostics: "
+                    f"trajs={len(raw_trajs)} "
+                    f"trajs_with_step_metadata={_n_trajs_with_step_metadata} "
+                    f"episodes_total={_n_eps_total} "
+                    f"positive_episodes={_n_pos_eps} "
+                    f"chunks_total={len(_all_g)} "
+                    f"chunks_with_nonzero_G={_n_chunks_with_nonzero_g}"
+                )
+                # Spot-check: print episode_rewards for the first couple of
+                # trajectories. If wandb shows score>0 but these are all
+                # zeros / empty, the engine→cache propagation broke and the
+                # method config is reading a stale field.
+                for _i, _t in enumerate(raw_trajs[:3]):
+                    print(
+                        f"[chunk-discounted-topr] traj[{_i}]: "
+                        f"episode_rewards={_t.get('episode_rewards')} "
+                        f"step_metadata_len={len(_t.get('step_metadata') or [])} "
+                        f"summarization_boundaries={_t.get('summarization_boundaries')}"
+                    )
+                expansion = build_expanded_dataproto(
+                    raw_trajs,
+                    per_chunk_returns=per_chunk_returns,
+                    emit_is_positive=topr_enable,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    max_prompt_length=self.config.data.max_prompt_length,
+                    max_response_length=self.config.data.max_response_length,
+                    source_non_tensor_batch=source_non_tensor,
+                )
+                # Post-build sanity: confirm the tensor that the actor
+                # actually sees has the expected non-zero entries.
+                _adv = expansion.data.batch.get("advantages")
+                _is_pos = expansion.data.batch.get("is_positive")
+                if _adv is not None:
+                    print(
+                        f"[chunk-discounted-topr] tensor stats: "
+                        f"advantages.abs().sum()={float(_adv.abs().sum().item()):.4f} "
+                        f"advantages>0 fraction="
+                        f"{float((_adv > 0).float().mean().item()):.4f} "
+                        f"is_positive>0 fraction="
+                        f"{(float((_is_pos > 0).float().mean().item()) if _is_pos is not None else 'n/a')}"
+                    )
+            else:
+                raise ValueError(
+                    f"unknown rllm.advantage_method.name {method_name!r}; "
+                    "expected 'grpo' or 'chunk_discounted_topr'."
+                )
             expanded_batch = expansion.data
 
             # Carry meta_info forward (temperature, etc.) — required by

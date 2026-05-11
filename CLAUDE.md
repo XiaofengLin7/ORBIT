@@ -77,31 +77,56 @@ scripts/train_multi_episode.py   (Hydra config entry point)
 
 ### Context Self-Summarization
 
-When context exceeds a token threshold mid-trajectory, the model generates a summary of its conversation history. The compressed summary replaces the history, and the trajectory continues. This avoids `PROMPT_TRUNCATION` termination and enables longer trajectories.
+When context fills up (token threshold hit) or an episode ends, the model produces a summary of its conversation history. The compressed summary replaces the history, the trajectory continues, and the engine records the position as a *segment boundary*. Each trajectory is split into K+1 PPO segments where K = number of summarizations; every segment becomes an independent PPO training row.
 
-Implemented across three new files:
-- `agents/context_summarizer.py` — `ContextSummarizerMixin` + composed agent classes (`GEMTextAgentWithSummarization`, `GEMTextAgentNonCumulativeWithSummarization`)
-- `trainers/summarizing_engine.py` — `SummarizingAgentExecutionEngine` overrides the step loop to insert a summarization check after each `agent.update_from_env()`
-- `prompts/summarization_prompts.py` — default summarization prompt template
+Implemented across these files:
+- `agents/context_summarizer.py` — `ContextSummarizerMixin` + composed agent classes (`GEMTextAgentWithSummarization`, `GEMTextAgentNonCumulativeWithSummarization`).
+- `trainers/summarizing_engine.py` — `SummarizingAgentExecutionEngine` overrides the step loop to insert a summarization check after each `agent.update_from_env()`. `_do_summarization` chooses between LLM-generated and oracle (rule-based) summaries.
+- `prompts/summarization_prompts.py` — `TOKEN_SUMMARY_PROMPT`, `EPISODIC_SUMMARY_PROMPT`, `REFLECTIVE_SUMMARY_PROMPT`.
+- `agents/oracle_summarizers/` — oracle (rule-based) summarizers; currently `maze.py` for the maze env.
 
-**Training data handling:**
-- **Stepwise mode** (`stepwise_advantage.enable=True`, recommended): Transparent — each step is independent, post-summary steps just have shorter prompts.
-- **Cumulative mode** (`stepwise_advantage.enable=False`): Pre-summary segment only is assembled for training. Full trajectory reward (including post-summary success) is used.
-- Summary generation tokens are excluded from training data (utility call).
-- No recent turns are preserved after summarization (avoids off-policy context). The summarization prompt captures current episode progress.
-- Post-summarization token accumulation is built incrementally (system tokens cached + summary tokenized once) to avoid re-tokenization mismatches.
+**Triggers (`rllm.agent.summarization.mode`):**
+- `token` — fires when `prompt + response token count >= threshold_tokens`.
+- `episodic` — fires at every episode boundary (`info["episode_done"]=True`).
+- `both` — episodic takes priority, token is the fallback.
+
+**Two summary sources:**
+
+1. **LLM-generated summary (default)**. The model is asked to compress its own context. The summary IS trainable: the LLM's output tokens are appended to `episode_steps` with `response_mask=1` and participate in PPO with the trajectory's GRPO advantage broadcast across them — the model learns to write summaries that correlate with trajectory success. The summarization-instruction *prompt* (asking the model to summarize) is mask=0 (treated as an env message). See `summarizing_engine.py:751-767`.
+
+2. **Oracle (rule-based) summary**. Opt-in via `+rllm.agent.summarization.oracle.enable=true +rllm.agent.summarization.oracle.scope=maze`. A deterministic, env-derived "mental map" string replaces the LLM call. The oracle text is fed into `agent.apply_summary` so the next segment's prompt contains it, but **no `episode_step` is appended → mask=0 everywhere → never trained on**. Designed to isolate the question "do perfect summaries lift in-context performance?" from "can the model write good summaries?". See `summarizing_engine.py:649-688`.
+
+**Segment-based PPO training (always on when summarization is enabled):**
+
+1. `assemble_segments` (summarizing_engine.py:821) splits each trajectory at `summarization_boundaries` into per-segment training rows.
+2. `MultiEpisodeAgentPPOTrainer._expanded_update_actor` (multi_episode_trainer.py:252) intercepts the actor update: extracts the per-trajectory GRPO advantage `A_i`, then `build_expanded_dataproto` (segment_expansion.py:75) materializes one DataProto row per segment, with:
+   - `advantages = A_i` broadcast to mask=1 positions (the trajectory's group-relative GRPO score).
+   - `traj_uniform_weight = 1/(N_G · N_t^i)` per token, where `N_t^i` is the total mask=1 token count summed across **all** of trajectory i's segments.
+3. `TrajectoryUniformPPOActor.update_policy` (trajectory_uniform_actor.py:83) replaces verl's `DataParallelPPOActor.update_policy`. Loss = `(1/N_G) Σ_i (1/N_t^i) Σ_token pg_token` — every trajectory contributes equally regardless of segment count or token length.
+
+**Distributed-correctness fixes (relevant for ≥2 GPU runs):**
+
+- `MultiEpisodeAgentPPOTrainer._balance_batch` (multi_episode_trainer.py:125) **no-ops on the skinny per-trajectory batch** when segment training is enabled. The parent rLLM trainer's `fit_agent` calls `_balance_batch` after `compute_advantage`; the parent reorder would de-sync the per-trajectory cache from the row positions, swapping advantages between trajectories. Instead, we balance the *post-expansion* batch directly inside `_expanded_update_actor` (where the workload signal is real). Regression test: `tests/test_segment_balance_correctness.py`.
+- `summarizing_engine.py:170` guards `max_tokens <= 0` at step start, terminating cleanly with `TRUNCATION` instead of letting vLLM raise `ValueError: max_tokens must be at least 1`.
+- `loss_micro * dp_world_size` (trajectory_uniform_actor.py:297) cancels FSDP/DDP's post-backward grad-mean. Empirically validated bit-exact on 2 GPUs in `tests/test_distributed_loss.py`.
 
 **Config (Hydra overrides):**
 ```bash
 rllm.agent.name=gem_text_agent_summarizing  # or gem_text_agent_noncumulative_summarizing
 +rllm.agent.summarization.enable=true
++rllm.agent.summarization.mode=episodic       # token | episodic | both
 +rllm.agent.summarization.threshold_tokens=16384
 +rllm.agent.summarization.summary_max_tokens=8192
+# Oracle (rule-based) summary, currently maze-only:
++rllm.agent.summarization.oracle.enable=true
++rllm.agent.summarization.oracle.scope=maze
 ```
 
 **Eval:**
 ```bash
 bash scripts/eval/openai.sh --summarization-threshold 4096
+# With oracle:
+bash scripts/eval/openai.sh --summarization-threshold 131072 --oracle-summarizer
 ```
 
 ### Environment Adapters
@@ -130,10 +155,19 @@ Optional per-task field `num_episodes` caps the trajectory at exactly N complete
 
 ## Trajectory-uniform actor patch (segment training)
 
-When summarization training is enabled, we want each Ray FSDP worker to use
+When summarization is enabled, each Ray FSDP worker uses
 `TrajectoryUniformPPOActor` (in `trainers/trajectory_uniform_actor.py`) instead
-of verl's stock `DataParallelPPOActor`. The patch is wired in via a `.pth`
-file in the active conda env's `site-packages`, written automatically by
+of verl's stock `DataParallelPPOActor`. The actor's only structural change vs
+verl's is the loss aggregation: it consumes a per-token `traj_uniform_weight`
+field (pre-baked by `build_expanded_dataproto`) and computes
+`numer = (pg_per_token · traj_uniform_weight · response_mask).sum()` instead
+of `agg_loss(..., loss_agg_mode='token-mean')`. This makes every trajectory
+contribute equally to the loss regardless of how many segments it was split
+into. See "Segment-based PPO training" under Context Self-Summarization for
+the full pipeline.
+
+The patch is wired in via a `.pth` file in the active conda env's
+`site-packages`, written automatically by
 `scripts/train_multi_task_multi_episode.sh` (and any script that sources it,
 e.g. `train_multi_task_summarizing.sh`). The .pth file adds the repo root to
 `sys.path` and imports the **top-level** module `orbit_segtrain_patch`, which
@@ -158,6 +192,11 @@ Ray's runtime_env entirely.
 For someone cloning the repo to another conda env: just `bash scripts/train_*.sh`
 once — the script writes the .pth file into the active env's site-packages
 on the spot. To remove: `rm <site-packages>/orbit_segtrain.pth`.
+
+If the .pth patch fails to load, workers silently fall back to verl's stock
+`DataParallelPPOActor` and the loss reverts to `seq-mean-token-mean`. Look
+for `[orbit] Installed trajectory-uniform actor patch at <path>` in stdout
+to confirm the patch landed.
 
 ## graphify
 

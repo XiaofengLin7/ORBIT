@@ -47,7 +47,13 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
-__all__ = ["TrajectoryUniformPPOActor", "install_trajectory_uniform_actor"]
+from trainers._pg_surrogate import compute_pg_per_token
+
+__all__ = [
+    "TrajectoryUniformPPOActor",
+    "compute_pg_per_token",
+    "install_trajectory_uniform_actor",
+]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -103,6 +109,11 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
             select_keys.append("rollout_is_weights")
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # is_positive is emitted by build_expanded_dataproto in chunk-
+        # discounted mode; absent under GRPO. Carry it through micro-batch
+        # splits so the TOPR branch below can consume it per-token.
+        if "is_positive" in data.batch.keys():
+            select_keys.append("is_positive")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = (
@@ -201,7 +212,23 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
                     else:
                         old_log_prob = model_inputs["old_log_probs"]
 
-                    # ---- Per-token PPO surrogate (vanilla; mirrors verl) ----
+                    # ---- Per-token PPO surrogate + optional TOPR split ----
+                    # Standard verl PPO clipping plus the TOPR branch from
+                    # arXiv:2512.24873 Eq. 5. TOPR fires iff the batch
+                    # carries an ``is_positive`` per-token tensor (which
+                    # the trainer attaches in chunk-discounted-topr mode
+                    # when its ``topr_split.enable`` is true). Positive
+                    # chunks use a plain SL-style update ``-advantages``
+                    # (no IS ratio, no clip); negatives fall through to
+                    # the existing 3-way-clipped surrogate. Inference/
+                    # training mismatch handling is unaffected.
+                    #
+                    # We gate purely on tensor presence — no read of
+                    # ``self.config.topr_split.*`` here, because verl's
+                    # FSDPActorConfig is a strict dataclass that rejects
+                    # unknown keys (the TOPR enable flag lives instead
+                    # under ``rllm.advantage_method.chunk_discounted_topr``,
+                    # which the trainer reads when it builds the batch).
                     cliprange = self.config.clip_ratio
                     cliprange_low = (
                         self.config.clip_ratio_low
@@ -215,22 +242,23 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
                     )
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
 
-                    negative_approx_kl = log_prob - old_log_prob
-                    negative_approx_kl = torch.clamp(
-                        negative_approx_kl, min=-20.0, max=20.0
+                    is_pos_field = model_inputs.get("is_positive")
+                    surrogate = compute_pg_per_token(
+                        advantages=advantages,
+                        log_prob=log_prob,
+                        old_log_prob=old_log_prob,
+                        cliprange_low=cliprange_low,
+                        cliprange_high=cliprange_high,
+                        clip_ratio_c=clip_ratio_c,
+                        is_positive=is_pos_field,
+                        topr_enabled=is_pos_field is not None,
                     )
-                    ratio = torch.exp(negative_approx_kl)
-
-                    pg_losses1 = -advantages * ratio
-                    pg_losses2 = -advantages * torch.clamp(
-                        ratio, 1 - cliprange_low, 1 + cliprange_high
-                    )
-                    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-                    pg_losses3 = -advantages * clip_ratio_c
-                    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-                    pg_per_token = torch.where(
-                        advantages < 0, clip_pg_losses2, clip_pg_losses1
-                    )
+                    pg_per_token = surrogate["pg_per_token"]
+                    pg_losses1 = surrogate["pg_losses1"]
+                    pg_losses2 = surrogate["pg_losses2"]
+                    clip_pg_losses1 = surrogate["clip_pg_losses1"]
+                    pg_losses3 = surrogate["pg_losses3"]
+                    negative_approx_kl = surrogate["negative_approx_kl"]
 
                     # ---- Trajectory-uniform aggregation ----
                     # numer_local += sum_token (pg * w * mask). Weights already

@@ -260,6 +260,23 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             cur_step.done = done
             cur_step.info.update(info)
 
+            # Stamp episode-level metadata onto the action step we just
+            # appended (line ~217). Consumed by chunk-advantage methods
+            # (see trainers/chunk_advantage.py) to attribute each chunk to
+            # an episode-MDP. Action steps don't currently carry this info
+            # in episode_steps; the prompt_response_pair was built before
+            # env.step, so we patch it here once `info` is available.
+            prompt_response_pair["episode_done"] = bool(
+                info.get("episode_done", False)
+            )
+            prompt_response_pair["episode_index"] = int(
+                info.get("episode_index", 0)
+            )
+            prompt_response_pair["raw_reward"] = float(
+                info.get("raw_reward", reward)
+            )
+            prompt_response_pair["shaped_reward"] = float(reward)
+
             chat_completions_messages = agent.chat_completions
             assistant_message, env_messages = get_recent_assistant_user_messages(
                 chat_completions_messages
@@ -556,12 +573,40 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 trajectory_reward=trajectory.reward,
             )
 
+            # Per-step metadata (small, Ray-serializable) consumed by
+            # chunk-advantage methods. Mirrors episode_steps order; pairs
+            # with summarization_boundaries to recover segment-step ranges
+            # via the same split_points logic as `assemble_segments`.
+            step_metadata = [
+                {
+                    "is_summarization": bool(s.get("is_summarization", False)),
+                    "trigger": s.get("trigger", None),
+                    "episode_done": bool(s.get("episode_done", False)),
+                    "episode_index": int(s.get("episode_index", 0)),
+                }
+                for s in episode_steps
+            ]
+
+            # Per-episode rewards (consumed by variant B per-episode chunk
+            # discounting). Pulled from MultiEpisodeEnv when available;
+            # otherwise fall back to the single trajectory reward as one
+            # episode, which keeps single-episode envs correct under both
+            # variants A and B.
+            ep_rewards: list[float]
+            if hasattr(env, "_episode_rewards"):
+                ep_rewards = [float(r) for r in env._episode_rewards]
+            else:
+                ep_rewards = [float(trajectory.reward)]
+
             # First segment as base for backward compatibility.
             result = {
                 **segments[0],
                 "idx": env.idx,
                 "chat_completions": segment_chat_histories,
                 "segments": segments if len(segments) > 1 else None,
+                "step_metadata": step_metadata,
+                "summarization_boundaries": list(summarization_boundaries),
+                "episode_rewards": ep_rewards,
                 "metrics": {
                     "steps": len(trajectory.steps),
                     "reward_time": reward_time,
