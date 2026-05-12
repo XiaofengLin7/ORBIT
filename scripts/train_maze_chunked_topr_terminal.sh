@@ -49,21 +49,21 @@ set -x
 #   Length-penalty knobs (overlong reward shaping; OFF by default):
 #     LENGTH_PENALTY         "true" to enable per-episode length penalty
 #                            (default: false)
-#     RESPONSE_LENGTH        reference value for data.max_response_length
-#                            used to derive L_cache from a fraction
-#                            (default: 31744 — matches the parent script's
-#                            data.max_response_length). Override if you
-#                            also override data.max_response_length.
+#     RESPONSE_LENGTH        reference for data.max_response_length used to
+#                            derive L_cache from a fraction (default: 31744 —
+#                            matches the parent script). Override if you also
+#                            override data.max_response_length.
 #     LP_MAX_TOKENS          episode_max_tokens (L_max). Default: unset →
 #                            engine uses data.max_response_length.
 #     LP_CACHE_TOKENS        episode_cache_tokens (L_cache), absolute.
 #                            Default: unset → see LP_CACHE_FRACTION.
-#     LP_CACHE_FRACTION      L_cache as a fraction of RESPONSE_LENGTH
-#                            (default: 0.25). Set 0.5 to make the cache
-#                            half the response length. Ignored when
-#                            LP_CACHE_TOKENS is set explicitly.
+#     LP_CACHE_FRACTION      L_cache as a fraction of LP_MAX_TOKENS (if set,
+#                            relative to it) else of RESPONSE_LENGTH
+#                            (default: 0.25). Set 0.5 → cache = half the
+#                            response length. Ignored when LP_CACHE_TOKENS
+#                            is set explicitly.
 # =============================================================================
-
+export RAY_object_store_memory=$((50 * 1024 * 1024 * 1024))
 export TASKS_CONFIG=${TASKS_CONFIG:-configs/eval_maze_oracle_10ep.yaml}
 export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
 GAMMA=${GAMMA:-0.95}
@@ -73,7 +73,7 @@ GAMMA=${GAMMA:-0.95}
 TRAIN_BATCH=${TRAIN_BATCH:-32}
 ROLLOUT_N=${ROLLOUT_N:-8}
 MINI_BATCH=${MINI_BATCH:-128}
-MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-65536}
+MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-32768}
 USE_DYNAMIC_BSZ=${USE_DYNAMIC_BSZ:-True}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.8}
 
@@ -97,16 +97,12 @@ LP_CACHE_FRACTION=${LP_CACHE_FRACTION:-0.25}
 LP_OVERRIDES=()
 if [ "${LENGTH_PENALTY:-false}" = "true" ] || [ "${LENGTH_PENALTY:-false}" = "True" ]; then
     LP_OVERRIDES+=(+rllm.length_penalty.enable=true)
-    # L_max: explicit override only; otherwise the engine defaults it to
-    # data.max_response_length.
     if [ -n "${LP_MAX_TOKENS:-}" ]; then
         LP_OVERRIDES+=(+rllm.length_penalty.episode_max_tokens=$LP_MAX_TOKENS)
         _LP_BASE=$LP_MAX_TOKENS
     else
         _LP_BASE=$RESPONSE_LENGTH
     fi
-    # L_cache: explicit absolute value wins; otherwise derive from the
-    # fraction of the base (either the explicit L_max or RESPONSE_LENGTH).
     if [ -z "${LP_CACHE_TOKENS:-}" ]; then
         LP_CACHE_TOKENS=$(awk "BEGIN{printf \"%d\", $_LP_BASE * $LP_CACHE_FRACTION}")
     fi
