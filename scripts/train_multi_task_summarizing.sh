@@ -27,6 +27,11 @@ set -x
 #                              (default: 16384)
 #   SUMMARY_MAX_TOKENS         summary completion budget
 #                              (default: 4096)
+#   CARRYOVER                  episode-end carryover form
+#                              freeform | obs_action | obs_action_reflection
+#                              (default: obs_action_reflection). Used as the
+#                              default experiment_name unless EXP_NAME is set.
+#   EXP_NAME                   override the wandb experiment_name (default: $CARRYOVER)
 #
 # Any additional Hydra overrides given as positional args are forwarded.
 # =============================================================================
@@ -54,20 +59,33 @@ case "$MODE" in
         ;;
 esac
 
+CARRYOVER=${CARRYOVER:-obs_action_reflection}
+case "$CARRYOVER" in
+    freeform|obs_action|obs_action_reflection) ;;
+    *)
+        echo "Error: CARRYOVER must be one of {freeform, obs_action, obs_action_reflection} (got '$CARRYOVER')" >&2
+        exit 1
+        ;;
+esac
+
+EXP_NAME=${EXP_NAME:-$CARRYOVER}
+
 SUMM=(
     rllm.agent.name=gem_text_agent_summarizing
     +rllm.agent.summarization.enable=true
     +rllm.agent.summarization.mode="$MODE"
     +rllm.agent.summarization.threshold_tokens=$SUMMARIZATION_THRESHOLD
     +rllm.agent.summarization.summary_max_tokens=$SUMMARY_MAX_TOKENS
-    +rllm.agent.summarization.episodic_carryover=obs_action_reflection
-    trainer.experiment_name="obs_action_reflection"  
+    +rllm.agent.summarization.episodic_carryover="$CARRYOVER"
+    trainer.experiment_name="$EXP_NAME"
 )
 
 echo "=========================================="
 echo "Training summarizing agent"
 echo "  TASKS_CONFIG = $TASKS_CONFIG"
 echo "  MODE         = $MODE"
+echo "  CARRYOVER    = $CARRYOVER"
+echo "  EXP_NAME     = $EXP_NAME"
 echo "  threshold    = $SUMMARIZATION_THRESHOLD"
 echo "  summary_max  = $SUMMARY_MAX_TOKENS"
 echo "=========================================="

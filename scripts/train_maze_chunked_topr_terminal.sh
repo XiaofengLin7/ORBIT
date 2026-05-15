@@ -2,7 +2,7 @@
 set -x
 
 # =============================================================================
-# Train Qwen3-1.7B on the maze env with:
+# Train Qwen3-8B on the maze env with:
 #   - oracle (rule-based) episodic summarizer
 #   - chunk-discounted-TOPR advantage method (sibling to GRPO)
 #   - reward_scope="terminal" (variant A: R_total = sum of episode rewards;
@@ -22,9 +22,22 @@ set -x
 #   bash scripts/train_maze_chunked_topr_terminal.sh
 #
 # Env-var overrides:
-#   TASKS_CONFIG             yaml config (default: configs/eval_maze_oracle_10ep.yaml)
+#   TASKS_CONFIG             yaml config (default: configs/maze.yaml)
 #   MODEL_PATH               model (default: Qwen/Qwen3-1.7B)
 #   GAMMA                    chunk discount factor (default: 0.95)
+#   ORACLE                   "true" to enable the rule-based maze summarizer
+#                            (default: true). Set to "false" when benchmarking
+#                            $CARRYOVER modes — oracle wins regardless of
+#                            episodic_carryover and would collapse all three
+#                            modes to the same behavior.
+#   CARRYOVER                episode-end carryover form (forwarded to
+#                            train_multi_task_summarizing.sh). One of:
+#                            freeform | obs_action | obs_action_reflection
+#                            (default: obs_action_reflection).
+#   EXP_NAME                 wandb experiment_name. Default:
+#                              "<model>_${CARRYOVER}_${MODE}" when ORACLE=false,
+#                              "<model>_oracle_${MODE}"      when ORACLE=true.
+#                              <model> is basename($MODEL_PATH).
 #   N_GPUS                   number of GPUs (default: 2). When set, takes
 #                            precedence over CUDA_VISIBLE_DEVICES — the script
 #                            picks 0..N_GPUS-1.
@@ -63,10 +76,28 @@ set -x
 #                            response length. Ignored when LP_CACHE_TOKENS
 #                            is set explicitly.
 # =============================================================================
-export RAY_object_store_memory=$((50 * 1024 * 1024 * 1024))
-export TASKS_CONFIG=${TASKS_CONFIG:-configs/eval_maze_oracle_10ep.yaml}
-export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-1.7B}
+# export RAY_object_store_memory=$((50 * 1024 * 1024 * 1024))
+export TASKS_CONFIG=${TASKS_CONFIG:-configs/maze.yaml}
+export MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-8B}
 GAMMA=${GAMMA:-0.95}
+
+# ---- GPU assignment ------------------------------------------------------
+# Precedence: explicit N_GPUS > derive from CUDA_VISIBLE_DEVICES > default 2.
+# If N_GPUS is set but CUDA_VISIBLE_DEVICES is not, pin to 0..N_GPUS-1 so
+# Ray + vLLM see a contiguous device range.
+if [ -n "${N_GPUS:-}" ]; then
+    if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        _ids=$(seq -s, 0 $((N_GPUS - 1)))
+        export CUDA_VISIBLE_DEVICES=$_ids
+    fi
+elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    N_GPUS=$(awk -F, '{print NF}' <<< "$CUDA_VISIBLE_DEVICES")
+else
+    N_GPUS=2
+    export CUDA_VISIBLE_DEVICES=0,1
+fi
+export N_GPUS
+echo "[wrapper] N_GPUS=$N_GPUS CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 
 # ---- Speed knobs ---------------------------------------------------------
@@ -117,15 +148,44 @@ export MODE=${MODE:-episodic}
 export SUMMARIZATION_THRESHOLD=${SUMMARIZATION_THRESHOLD:-131072}
 export SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-4096}
 
+ORACLE=${ORACLE:-true}
+ORACLE_OVERRIDES=()
+case "$ORACLE" in
+    true|True)
+        ORACLE_OVERRIDES+=(
+            +rllm.agent.summarization.oracle.enable=true
+            +rllm.agent.summarization.oracle.scope=maze
+        )
+        ;;
+    false|False) ;;
+    *)
+        echo "Error: ORACLE must be true or false (got '$ORACLE')" >&2
+        exit 1
+        ;;
+esac
+
+# Build the wandb experiment_name from model + carryover + summarization
+# mode so benchmarking runs are visually grouped. When oracle is on, the
+# carryover mode is overridden by the oracle path, so the name reflects
+# that instead. User can still override with EXP_NAME=...
+export CARRYOVER=${CARRYOVER:-obs_action_reflection}
+# Use the trailing path component of MODEL_PATH (e.g. "Qwen/Qwen3-8B" → "Qwen3-8B",
+# "/path/to/ckpt/global_step_100" → "global_step_100").
+_MODEL_TAG=$(basename "$MODEL_PATH")
+case "$ORACLE" in
+    true|True)  _EXP_LABEL="${_MODEL_TAG}_oracle_${MODE}" ;;
+    *)          _EXP_LABEL="${_MODEL_TAG}_${CARRYOVER}_${MODE}" ;;
+esac
+export EXP_NAME=${EXP_NAME:-$_EXP_LABEL}
+
 bash scripts/train_multi_task_summarizing.sh \
-    +rllm.agent.summarization.oracle.enable=true \
-    +rllm.agent.summarization.oracle.scope=maze \
+    "${ORACLE_OVERRIDES[@]}" \
     +rllm.advantage_method.name=chunk_discounted_topr \
     +rllm.advantage_method.chunk_discounted_topr.reward_scope=per_episode \
     +rllm.advantage_method.chunk_discounted_topr.gamma=$GAMMA \
     +rllm.advantage_method.chunk_discounted_topr.topr_split.enable=true \
     trainer.n_gpus_per_node=$N_GPUS \
-    trainer.project_name='segment-training-validation' \
+    trainer.project_name='COMET' \
     "${SPEED_OVERRIDES[@]}" \
     "${LP_OVERRIDES[@]}" \
     "$@"

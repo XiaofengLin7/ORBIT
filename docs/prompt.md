@@ -108,7 +108,7 @@ Helper: `ContextSummarizerMixin._format_episode_label(episode_index, num_episode
 
 `K` (episode index) is always available on `MultiEpisodeEnv` — initialized to 0 in `__init__`, bumped on each boundary. At `episode_end` trigger time it's the **just-finished** episode (`MultiEpisodeEnv` defers the bump until `start_new_episode` is called by the engine after summarization). At `token` trigger time it's the **currently-running** episode.
 
-`N` (total episodes) is the per-task config field `num_episodes` from the tasks YAML. Set on maze / summarization configs (e.g. `configs/multi_task_summarization_config.yaml`, `configs/eval_maze_oracle_10ep.yaml`); not set on `configs/multi_task_multi_episode_config.yaml`, `configs/eval_alfworld_multi.yaml`, `configs/eval_webshop_multi.yaml`. When unset, only `K` is shown.
+`N` (total episodes) is the per-task config field `num_episodes` from the tasks YAML. Set on maze / summarization configs (e.g. `configs/multi_task_summarization_config.yaml`, `configs/maze.yaml`); not set on `configs/multi_task_multi_episode_config.yaml`, `configs/eval_alfworld_multi.yaml`, `configs/eval_webshop_multi.yaml`. When unset, only `K` is shown.
 
 `SingleEpisodeEnv` doesn't expose either attribute; `getattr(..., None)` returns None and the label is dropped — `apply_summary` omits the header; `apply_episode_carryover` falls back to `[End of previous episode]`.
 
