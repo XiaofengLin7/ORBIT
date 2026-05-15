@@ -180,6 +180,28 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     cur_step = agent.get_current_state()
                     cur_step.done = True
                     break
+
+                # Second guard: vLLM's async server ignores our
+                # `max_tokens` kwarg and recomputes it as
+                # `max_model_len - len(prompt_ids)` (see
+                # verl/workers/rollout/vllm_rollout/vllm_async_server.py
+                # ::vLLMHttpServer.generate). When the accumulated
+                # prompt fills the model context — e.g. obs/action
+                # carryover grew the history past max_model_len, or
+                # the response budget is generous but the prompt is
+                # already saturated — vLLM raises
+                # ValueError("max_tokens must be at least 1, got -N")
+                # before our `max_tokens` ever takes effect. Terminate
+                # cleanly here on the same condition vLLM checks.
+                if (
+                    accumulated_prompt_ids is not None
+                    and getattr(self, "max_model_len", None)
+                    and len(accumulated_prompt_ids) >= self.max_model_len
+                ):
+                    termination_reason = "TRUNCATION"
+                    cur_step = agent.get_current_state()
+                    cur_step.done = True
+                    break
             else:
                 max_tokens = self.max_response_length
                 prompt_str = self.chat_parser.parse(
