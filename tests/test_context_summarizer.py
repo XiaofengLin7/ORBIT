@@ -441,3 +441,222 @@ class TestApplySummaryLayout:
         )
         event = agent._summarization_events[-1]
         assert event["trigger"] == "episode_end"
+
+    def test_episode_label_episode_end(self):
+        """Episode-end summary message includes 'End of episode K/N' header."""
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        agent.apply_summary(
+            "<context_summary>body</context_summary>",
+            trigger="episode_end",
+            episode_index=0,
+            num_episodes=3,
+        )
+        content = agent._messages[-1]["content"]
+        assert content.startswith("[End of episode 1/3]\n")
+        assert "<context_summary>" in content
+        assert content.endswith("[Continuing task]")
+
+    def test_episode_label_token_trigger(self):
+        """Token-trigger summary uses 'Mid-episode K/N compression' header."""
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        agent.apply_summary(
+            "<context_summary>body</context_summary>",
+            trigger="token",
+            episode_index=1,
+            num_episodes=3,
+        )
+        content = agent._messages[-1]["content"]
+        assert content.startswith("[Mid-episode 2/3 compression]\n")
+        assert "<context_summary>" in content
+
+    def test_episode_label_without_total(self):
+        """When num_episodes is unknown, label is just 'K' not 'K/N'."""
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        agent.apply_summary(
+            "<context_summary>body</context_summary>",
+            trigger="episode_end",
+            episode_index=0,
+            num_episodes=None,
+        )
+        content = agent._messages[-1]["content"]
+        assert content.startswith("[End of episode 1]\n")
+
+    def test_episode_label_missing_index_omits_header(self):
+        """Legacy callers (no episode_index) get the old layout, no header."""
+        agent = _make_agent()
+        _simulate_steps(agent, 2)
+        agent.apply_summary(
+            "<context_summary>body</context_summary>",
+            trigger="episode_end",
+        )
+        content = agent._messages[-1]["content"]
+        assert content.startswith("<context_summary>")
+        assert "End of episode" not in content
+
+
+# ---------------------------------------------------------------------------
+# Tests: episodic context-carryover (obs_action / obs_action_reflection)
+# ---------------------------------------------------------------------------
+
+class TestEpisodicCarryover:
+    def test_default_is_freeform(self):
+        agent = _make_agent()
+        assert agent.episodic_carryover == "freeform"
+
+    def test_invalid_value_raises(self):
+        with pytest.raises(ValueError):
+            _make_agent(episodic_carryover="not_a_mode")
+
+    def test_valid_values_accepted(self):
+        for v in ("freeform", "obs_action", "obs_action_reflection"):
+            assert _make_agent(episodic_carryover=v).episodic_carryover == v
+
+    def test_obs_action_keeps_transcript_strips_thinking(self):
+        agent = _make_agent(episodic_carryover="obs_action")
+        agent._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "<think>long</think> hmm \\boxed{up}"},
+            {"role": "user", "content": "obs2"},
+            {"role": "assistant", "content": "reasoning \\boxed{left}"},
+            {"role": "user", "content": "terminal obs"},
+        ]
+        agent.apply_episode_carryover(
+            episode_start_msg_idx=1,
+            reflection_text=None,
+            episode_index=0,
+            num_episodes=3,
+        )
+        assert agent._messages == [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+            {"role": "user", "content": "obs2"},
+            {"role": "assistant", "content": "\\boxed{left}"},
+            {"role": "user", "content": "terminal obs"},
+            {"role": "user", "content": "[End of episode 1/3] — [Continuing task]"},
+        ]
+
+    def test_obs_action_reflection_appends_reflection_block(self):
+        agent = _make_agent(episodic_carryover="obs_action_reflection")
+        agent._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "t \\boxed{up}"},
+            {"role": "user", "content": "terminal obs"},
+        ]
+        agent.apply_episode_carryover(
+            episode_start_msg_idx=1,
+            reflection_text="<reflection>do X next</reflection>",
+            episode_index=0,
+            num_episodes=3,
+        )
+        assert agent._messages[-1] == {
+            "role": "user",
+            "content": (
+                "[End of episode 1/3]\n"
+                "<reflection>\ndo X next\n</reflection>"
+                "\n\n[Continuing task]"
+            ),
+        }
+        # transcript preserved before the reflection block
+        assert agent._messages[:-1] == [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+            {"role": "user", "content": "terminal obs"},
+        ]
+
+    def test_reflection_fallback_when_no_tags(self):
+        agent = _make_agent(episodic_carryover="obs_action_reflection")
+        agent._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+        ]
+        agent.apply_episode_carryover(
+            episode_start_msg_idx=1, reflection_text="raw text no tags"
+        )
+        assert "raw text no tags" in agent._messages[-1]["content"]
+
+    def test_only_last_episode_kept_across_two_carryovers(self):
+        agent = _make_agent(episodic_carryover="obs_action")
+        # Episode 1.
+        agent._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "ep1 obs1"},
+            {"role": "assistant", "content": "t \\boxed{a1}"},
+            {"role": "user", "content": "ep1 terminal"},
+        ]
+        agent.apply_episode_carryover(
+            episode_start_msg_idx=1,
+            reflection_text=None,
+            episode_index=0,
+            num_episodes=3,
+        )
+        # Engine appends episode 2's first obs after the boundary marker.
+        ep2_start = len(agent._messages)
+        agent._messages.append({"role": "user", "content": "ep2 obs1"})
+        agent._messages.append({"role": "assistant", "content": "t \\boxed{a2}"})
+        agent._messages.append({"role": "user", "content": "ep2 terminal"})
+        agent.apply_episode_carryover(
+            episode_start_msg_idx=ep2_start,
+            reflection_text=None,
+            episode_index=1,
+            num_episodes=3,
+        )
+        assert agent._messages == [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "ep2 obs1"},
+            {"role": "assistant", "content": "\\boxed{a2}"},
+            {"role": "user", "content": "ep2 terminal"},
+            {"role": "user", "content": "[End of episode 2/3] — [Continuing task]"},
+        ]
+
+    def test_records_carryover_event(self):
+        agent = _make_agent(episodic_carryover="obs_action")
+        agent._messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+        ]
+        agent.apply_episode_carryover(episode_start_msg_idx=1, reflection_text=None)
+        event = agent._summarization_events[-1]
+        assert event["trigger"] == "episode_end"
+        assert event["kind"] == "carryover"
+        assert agent._summarization_count == 1
+
+    def test_carryover_without_system_prompt(self):
+        agent = _make_agent(
+            cls=GEMTextAgentNonCumulativeWithSummarization,
+            episodic_carryover="obs_action",
+            system_prompt=None,
+        )
+        agent._messages = [
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+            {"role": "user", "content": "terminal"},
+        ]
+        agent.apply_episode_carryover(episode_start_msg_idx=0, reflection_text=None)
+        # No episode_index/num_episodes passed → fallback marker.
+        assert agent._messages == [
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "\\boxed{up}"},
+            {"role": "user", "content": "terminal"},
+            {"role": "user", "content": "[End of previous episode] — [Continuing task]"},
+        ]
+
+    def test_build_reflection_prompt(self):
+        from prompts.summarization_prompts import REFLECTION_PROMPT
+
+        agent = _make_agent(episodic_carryover="obs_action_reflection")
+        _simulate_steps(agent, 2)
+        n = len(agent._messages)
+        prompt = agent.build_reflection_prompt()
+        assert len(prompt) == n + 1
+        assert prompt[-1] == {"role": "user", "content": REFLECTION_PROMPT}
+        # does not mutate the agent's history
+        assert len(agent._messages) == n

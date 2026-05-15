@@ -39,6 +39,7 @@ from agents.gem_text_agent import GEMTextAgent  # noqa: E402
 from agents.context_summarizer import GEMTextAgentWithSummarization  # noqa: E402
 from envs.multi_episode_env import MultiEpisodeEnv  # noqa: E402
 from envs.single_episode_env import SingleEpisodeEnv  # noqa: E402
+from prompts.system_prompts import build_multi_episode_system_prompt  # noqa: E402
 from trainers.multi_episode_trainer import (  # noqa: E402
     MultiEpisodeAsyncAgentExecutionEngine,
 )
@@ -263,6 +264,23 @@ def parse_args() -> argparse.Namespace:
         "summarizer at episode boundaries (currently supported: maze). "
         "Requires --summarization-threshold so the summarization engine is active.",
     )
+    parser.add_argument(
+        "--episodic-carryover",
+        choices=("freeform", "obs_action", "obs_action_reflection"),
+        default="freeform",
+        help="Carryover form at episode boundaries (matches the agent kwarg). "
+        "Documented in the default system prompt's memory-protocol section so "
+        "the model knows what the next-episode user message will contain. "
+        "Only meaningful when --summarization-threshold is set.",
+    )
+    parser.add_argument(
+        "--summarization-mode",
+        choices=("token", "episodic", "both"),
+        default="episodic",
+        help="When summarization is active, which trigger to use. Mirrors "
+        "rllm.agent.summarization.mode in training. Used by the default "
+        "system prompt's memory-protocol section.",
+    )
 
     args = parser.parse_args()
 
@@ -408,22 +426,32 @@ def load_eval_tasks(
     return all_tasks, config
 
 
-def get_default_system_prompt(env_mode: str) -> str:
-    """Return a default system prompt for the selected evaluation mode."""
-    if env_mode == "single":
-        return (
-            "You are solving a task in a single episode. "
-            "Analyze the situation carefully and take the best actions to succeed. "
-            "Think briefly and respond with actions inside \\boxed{} each turn. Overlong responses will be penalized."
-        )
-    return (
-        "You are solving the same task across multiple episodes with a fixed total step budget. "
-        "Each episode resets the environment but keeps the task identical. "
-        "Leverage information gathered from earlier episodes to succeed faster. "
-        # "Think step by step and respond with actions inside \\boxed{} each turn."
-        "Think briefly and respond with actions inside \\boxed{} each turn. "
-        "Overlong responses will be penalized."
-        
+def get_default_system_prompt(
+    env_mode: str,
+    *,
+    summarization_threshold: int | None = None,
+    summarization_mode: str = "episodic",
+    episodic_carryover: str = "freeform",
+    oracle_summarizer: bool = False,
+) -> str:
+    """Return a default system prompt for the selected evaluation mode.
+
+    Delegates to :func:`prompts.system_prompts.build_multi_episode_system_prompt`
+    so the prompt's "Memory protocol" section reflects the active carryover
+    mode. When ``summarization_threshold`` is None the prompt has no protocol
+    section — matching the no-summarization training path.
+    """
+    summarization_cfg: dict | None = None
+    if summarization_threshold is not None:
+        summarization_cfg = {
+            "enable": True,
+            "mode": summarization_mode,
+            "episodic_carryover": episodic_carryover,
+            "oracle": {"enable": bool(oracle_summarizer)},
+        }
+    return build_multi_episode_system_prompt(
+        summarization=summarization_cfg,
+        single_episode=(env_mode == "single"),
     )
 
 
@@ -933,7 +961,13 @@ async def main() -> None:
     }
 
     # Build agent_args
-    system_prompt = args.system_prompt or get_default_system_prompt(args.env_mode)
+    system_prompt = args.system_prompt or get_default_system_prompt(
+        args.env_mode,
+        summarization_threshold=args.summarization_threshold,
+        summarization_mode=args.summarization_mode,
+        episodic_carryover=args.episodic_carryover,
+        oracle_summarizer=args.oracle_summarizer,
+    )
     agent_args: Dict[str, Any] = {
         "system_prompt": system_prompt,
         "max_steps": max_steps,
@@ -943,6 +977,8 @@ async def main() -> None:
     agent_cls: type = GEMTextAgent
     if args.summarization_threshold:
         agent_args["summarization_threshold_tokens"] = args.summarization_threshold
+        agent_args["mode"] = args.summarization_mode
+        agent_args["episodic_carryover"] = args.episodic_carryover
         agent_cls = GEMTextAgentWithSummarization
 
     # Create engine

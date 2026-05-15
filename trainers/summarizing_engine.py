@@ -32,6 +32,7 @@ from rllm.utils import colorful_print
 from agents.oracle_summarizers import get_oracle_summarizer
 from prompts.summarization_prompts import (
     EPISODIC_SUMMARY_PROMPT,
+    REFLECTION_PROMPT,
     REFLECTIVE_SUMMARY_PROMPT,
     TOKEN_SUMMARY_PROMPT,
 )
@@ -111,6 +112,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             "token": _tokenize_instruction(TOKEN_SUMMARY_PROMPT),
             "episodic": _tokenize_instruction(EPISODIC_SUMMARY_PROMPT),
             "reflective": _tokenize_instruction(REFLECTIVE_SUMMARY_PROMPT),
+            "reflection": _tokenize_instruction(REFLECTION_PROMPT),
         }
 
         # Reset environment
@@ -123,6 +125,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         agent.update_from_env(
             observation=observation, reward=0.0, done=False, info=info
         )
+        # Index in agent._messages of the current episode's first observation
+        # message. Updated whenever a new episode is started (see the
+        # env.start_new_episode() block below). Consumed by the
+        # episodic_carryover="obs_action[_reflection]" path to slice off
+        # everything before the just-finished episode.
+        episode_start_msg_idx = len(getattr(agent, "_messages", [])) - 1
         messages = agent.chat_completions
         prompt_tokens, _ = convert_messages_to_tokens_and_masks(
             messages,
@@ -395,22 +403,46 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     summ_trigger = "token"
 
             if summ_trigger is not None:
+                # Episodic context-carryover mode (see ContextSummarizerMixin).
+                # Only consulted at episode boundaries; the token trigger always
+                # uses the freeform path. The oracle path, if active, still wins
+                # inside _do_summarization regardless of this.
+                carryover = (
+                    getattr(agent, "episodic_carryover", "freeform")
+                    if summ_trigger == "episode_end"
+                    else "freeform"
+                )
                 # Select the instruction variant the next call would actually
                 # use, so the budget check counts its tokens too.
                 use_reflective = (
                     summ_trigger == "episode_end"
+                    and carryover == "freeform"
                     and getattr(env, "enable_reflection", False)
                 )
-                if use_reflective:
+                if carryover == "obs_action":
+                    # Deterministic carryover: no LLM call, no generation.
+                    instr_kind = None
+                    instr_tokens = []
+                elif carryover == "obs_action_reflection":
+                    instr_kind = "reflection"
+                    instr_tokens = cached_instruction_tokens[instr_kind]
+                elif use_reflective:
                     instr_kind = "reflective"
+                    instr_tokens = cached_instruction_tokens[instr_kind]
                 elif summ_trigger == "episode_end":
                     instr_kind = "episodic"
+                    instr_tokens = cached_instruction_tokens[instr_kind]
                 else:
                     instr_kind = "token"
-                instr_tokens = cached_instruction_tokens[instr_kind]
-                summ_budget_needed = agent.summary_max_tokens + len(instr_tokens)
+                    instr_tokens = cached_instruction_tokens[instr_kind]
+                if instr_kind is None:
+                    # Deterministic carryover can never run out of budget.
+                    summ_budget_needed = 0
+                else:
+                    summ_budget_needed = agent.summary_max_tokens + len(instr_tokens)
                 budget_exhausted = (
                     not self.enforce_max_prompt_length
+                    and summ_budget_needed > 0
                     and response_token_len + summ_budget_needed
                     >= self.max_response_length
                 )
@@ -441,8 +473,10 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                         mode=mode,
                         trigger=summ_trigger,
                         use_reflective_prompt=use_reflective,
-                        summ_instruction_tokens=instr_tokens,
+                        summ_instruction_tokens=instr_tokens if instr_kind else None,
                         env=env,
+                        carryover=carryover,
+                        episode_start_msg_idx=episode_start_msg_idx,
                     )
                     delta_time = time.time() - start_time
                     llm_time += delta_time
@@ -487,6 +521,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     agent._messages.append(
                         {"role": "user", "content": str(new_obs)}
                     )
+                    episode_start_msg_idx = len(agent._messages) - 1
                     new_env_msgs = [
                         {"role": "user", "content": str(new_obs)}
                     ]
@@ -769,6 +804,8 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         use_reflective_prompt: bool = False,
         summ_instruction_tokens: list[int] | None = None,
         env: object | None = None,
+        carryover: str = "freeform",
+        episode_start_msg_idx: int = 1,
     ) -> tuple[list[int] | None, int] | None:
         """Generate a summary, apply it, and return updated accumulated_prompt_ids.
 
@@ -787,12 +824,35 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 tokens (the chat-template rendering of the summarization
                 prompt as a user message). When provided, avoids a
                 re-tokenization call. Must match ``use_reflective_prompt``.
+            carryover: Episodic context-carryover mode (only meaningful when
+                ``trigger == "episode_end"`` and no oracle is active).
+                ``"freeform"`` — the default LLM-summary path. ``"obs_action"``
+                — deterministic: keep the last episode's obs + boxed actions,
+                no LLM call, no trainable step. ``"obs_action_reflection"`` —
+                same kept transcript plus a trainable ``<reflection>`` block
+                generated via ``REFLECTION_PROMPT``.
+            episode_start_msg_idx: Index in ``agent._messages`` of the
+                just-finished episode's first observation; used to slice the
+                carried-over transcript.
 
         Returns:
             Tuple of (new_accumulated_prompt_ids, response_token_len_delta),
             or ``None`` if summarization failed (e.g. prompt exceeded
-            max_model_len).
+            max_model_len). Carryover modes never return ``None``.
         """
+        # Episode context passed to apply_summary / apply_episode_carryover so
+        # the carryover user message can label which episode the block is
+        # from. `_episode_index` is 0-based on MultiEpisodeEnv; at
+        # `episode_end` it's the just-finished episode (the env defers the
+        # bump until `start_new_episode`). For `token` trigger it's the
+        # currently-running episode. Both render 1-based for display.
+        env_episode_index = (
+            getattr(env, "_episode_index", None) if env is not None else None
+        )
+        env_num_episodes = (
+            getattr(env, "num_episodes", None) if env is not None else None
+        )
+
         # Oracle short-circuit: when an env-specific rule-based summarizer is
         # registered AND the user has opted in via Hydra, skip the LLM call
         # and feed the oracle's text into apply_summary directly. The oracle
@@ -809,7 +869,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 return None
             # Snapshot pre-summary chat for logging parity with the LLM path.
             segment_chat_histories.append(agent.chat_completions)
-            agent.apply_summary(oracle_text, trigger=trigger)
+            agent.apply_summary(
+                oracle_text,
+                trigger=trigger,
+                episode_index=env_episode_index,
+                num_episodes=env_num_episodes,
+            )
             # Mark the segment break at the LAST PRE-ORACLE step so
             # `assemble_segments` splits pre- and post-oracle steps into
             # separate segments. Without the split, `assemble_steps` walks
@@ -832,6 +897,111 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 )
                 new_accumulated = initial_system_tokens + list(summary_msg_tokens)
             return new_accumulated, 0
+
+        # ---- Episodic context-carryover (non-freeform) -------------------
+        # Keep the just-finished episode's observations + boxed actions in the
+        # history (thinking discarded) rather than replacing everything with a
+        # summary. ``obs_action_reflection`` additionally generates a trainable
+        # ``<reflection>`` block on top. Reachable only at episode boundaries
+        # and only when no oracle summarizer is active (oracle wins above).
+        if carryover in ("obs_action", "obs_action_reflection"):
+            reflection_text: str | None = None
+            response_len_delta = 0
+
+            if carryover == "obs_action_reflection":
+                reflection_prompt = agent.build_reflection_prompt()
+                summ_kwargs = {
+                    k: v
+                    for k, v in generation_kwargs.items()
+                    if k not in ("accumulated_prompt_ids",)
+                }
+                summ_kwargs["max_tokens"] = agent.summary_max_tokens
+                if summ_instruction_tokens is None:
+                    summ_instruction_tokens, _ = convert_messages_to_tokens_and_masks(
+                        [{"role": "user", "content": REFLECTION_PROMPT}],
+                        tokenizer=self.tokenizer,
+                        parser=self.chat_parser,
+                        contains_first_msg=False,
+                        contains_generation_msg=True,
+                    )
+                summ_instruction_len = len(summ_instruction_tokens)
+
+                ok_to_generate = True
+                if accumulated_prompt_ids is not None and mode == "Token":
+                    acc_for_reflection = list(accumulated_prompt_ids)
+                    acc_for_reflection.extend(summ_instruction_tokens)
+                    if getattr(self, "max_model_len", None):
+                        headroom = self.max_model_len - len(acc_for_reflection)
+                        if headroom <= 0:
+                            # No room to reflect — degrade to plain obs_action.
+                            ok_to_generate = False
+                        elif headroom < agent.summary_max_tokens:
+                            summ_kwargs["max_tokens"] = headroom
+                    if ok_to_generate:
+                        summ_kwargs["accumulated_prompt_ids"] = acc_for_reflection
+
+                if ok_to_generate:
+                    try:
+                        reflection_output = await self.get_model_response(
+                            reflection_prompt, application_id, **summ_kwargs
+                        )
+                    except Exception:
+                        reflection_output = None
+                    if (
+                        reflection_output is not None
+                        and len(reflection_output.completion_ids) > 0
+                    ):
+                        reflection_text = reflection_output.text
+                        summ_completion_len = len(reflection_output.completion_ids)
+                        # Trainable step: mask=1 on the reflection completion,
+                        # mask=0 on the instruction (same as the freeform
+                        # summary step).
+                        episode_steps.append(
+                            {
+                                "prompt": self.chat_parser.parse(
+                                    reflection_prompt,
+                                    add_generation_prompt=True,
+                                    is_first_msg=True,
+                                ),
+                                "response": reflection_output.text,
+                                "prompt_ids": list(reflection_output.prompt_ids),
+                                "completion_ids": list(
+                                    reflection_output.completion_ids
+                                ),
+                                "logprobs": getattr(
+                                    reflection_output, "logprobs", []
+                                ),
+                                "is_summarization": True,
+                                "trigger": trigger,
+                                "response_token_delta": (
+                                    summ_instruction_len + summ_completion_len
+                                ),
+                            }
+                        )
+                        response_len_delta = (
+                            summ_instruction_len + summ_completion_len
+                        )
+
+            # Segment break at the last recorded step (the reflection step if
+            # one was added, otherwise the last action step), so
+            # assemble_segments splits at the history rewrite — same rationale
+            # as the oracle path.
+            if episode_steps:
+                summarization_boundaries.append(len(episode_steps) - 1)
+
+            segment_chat_histories.append(agent.chat_completions)
+            agent.apply_episode_carryover(
+                episode_start_msg_idx,
+                reflection_text=reflection_text,
+                trigger=trigger,
+                episode_index=env_episode_index,
+                num_episodes=env_num_episodes,
+            )
+
+            new_accumulated = self._accumulated_from_chat(
+                agent, initial_system_tokens, mode
+            )
+            return new_accumulated, response_len_delta
 
         summary_prompt = agent.build_summarization_prompt(
             trigger=trigger, use_reflective_prompt=use_reflective_prompt
@@ -922,7 +1092,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         # Snapshot this segment's full conversation before it's replaced.
         segment_chat_histories.append(agent.chat_completions)
 
-        agent.apply_summary(summary_output.text, trigger=trigger)
+        agent.apply_summary(
+            summary_output.text,
+            trigger=trigger,
+            episode_index=env_episode_index,
+            num_episodes=env_num_episodes,
+        )
 
         # Build post-summary accumulated tokens incrementally.
         # After apply_summary: chat_completions = [sys, summary_user_msg].
@@ -943,6 +1118,32 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         response_len_delta = summ_instruction_len + summ_completion_len
 
         return new_accumulated, response_len_delta
+
+    def _accumulated_from_chat(
+        self, agent, initial_system_tokens: list[int], mode: str
+    ) -> list[int] | None:
+        """Rebuild ``accumulated_prompt_ids`` from the agent's chat history.
+
+        Used after an episodic-carryover history rewrite, which (unlike the
+        freeform summary, ``[sys, summary]``) leaves an arbitrary number of
+        non-system messages. Mirrors how the engine builds accumulated tokens
+        incrementally elsewhere: ``initial_system_tokens`` followed by the
+        chat-template rendering of the remaining messages plus a generation
+        prompt. Returns ``None`` for non-Token modes.
+        """
+        if mode != "Token":
+            return None
+        non_system = [m for m in agent.chat_completions if m["role"] != "system"]
+        if not non_system:
+            return list(initial_system_tokens)
+        body_tokens, _ = convert_messages_to_tokens_and_masks(
+            non_system,
+            tokenizer=self.tokenizer,
+            parser=self.chat_parser,
+            contains_first_msg=False,
+            contains_generation_msg=True,
+        )
+        return list(initial_system_tokens) + list(body_tokens)
 
     def _maybe_oracle_summarizer(self, env, trigger: str):
         """Return an env-specific oracle summarizer, or ``None``.

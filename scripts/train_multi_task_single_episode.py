@@ -34,12 +34,16 @@ from trainers.train_multi_episode import run_ppo_agent  # noqa: E402
 
 
 def _default_single_episode_prompt() -> str:
-    """System prompt for single-episode tasks."""
-    return (
-        "You are solving a task in a single episode. "
-        "Analyze the situation carefully and take the best actions to succeed. "
-        "Think briefly and respond with actions inside \\boxed{} each turn. Overlong responses will be penalized."
-    )
+    """System prompt for single-episode tasks.
+
+    Delegates to :func:`prompts.system_prompts.build_multi_episode_system_prompt`
+    so single-episode training and eval share one prompt source. No
+    summarization config is passed: token-mode summarization is not used in
+    single-episode training, so the "Memory protocol" section is omitted.
+    """
+    from prompts.system_prompts import build_multi_episode_system_prompt
+
+    return build_multi_episode_system_prompt(single_episode=True)
 
 
 @hydra.main(

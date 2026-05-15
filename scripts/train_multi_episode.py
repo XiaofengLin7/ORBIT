@@ -40,6 +40,7 @@ from data.prepare_gem_data import (  # noqa: E402
     prepare_multi_task_gem_data,
 )
 from envs.multi_episode_env import MultiEpisodeEnv  # noqa: E402
+from prompts.system_prompts import build_multi_episode_system_prompt  # noqa: E402
 from rllm.data import DatasetRegistry  # type: ignore  # noqa: E402
 from trainers.train_multi_episode import run_ppo_agent  # noqa: E402
 
@@ -52,24 +53,15 @@ AGENT_CLASSES = {
 }
 
 
-def _default_multi_episode_prompt() -> str:
-    """System prompt that reminds the policy about multi-episode control.
+"""System prompt comes from :func:`prompts.system_prompts.build_multi_episode_system_prompt`.
 
-    The literal ``{num_episodes}`` placeholder is substituted by
-    :class:`agents.gem_text_agent.GEMTextAgent` on the first
-    ``update_from_env`` using ``info["num_episodes"]`` exposed by
-    :class:`envs.multi_episode_env.MultiEpisodeEnv`. For tasks that do not
-    set ``num_episodes``, the placeholder remains literal — callers who want
-    a placeholder-free prompt should override ``rllm.agent.agent_args.system_prompt``.
-    """
-    return (
-        "You are solving the same task across {num_episodes} episodes with a fixed total step budget. "
-        "Each episode resets the environment but keeps the task identical. "
-        "You will interact with the environment for exactly {num_episodes} episodes - "
-        "use earlier episodes to gather information so later episodes succeed faster. "
-        "Think briefly and respond with actions inside \\boxed{} each turn. "
-        "Overlong responses will be penalized."
-    )
+The builder takes the resolved summarization config so the prompt documents
+the active carryover protocol (freeform / obs_action / obs_action_reflection
+/ oracle / token). The literal ``{num_episodes}`` placeholder is substituted
+by :class:`agents.gem_text_agent.GEMTextAgent` on the first ``update_from_env``
+using ``info["num_episodes"]``. Callers who want a placeholder-free or fully
+custom prompt should override ``rllm.agent.agent_args.system_prompt``.
+"""
 
 
 @hydra.main(
@@ -130,7 +122,6 @@ def main(cfg) -> None:  # type: ignore
         cfg.rllm.agent.get("agent_args", {}), resolve=True
     )  # type: ignore
     agent_args = dict(agent_args or {})
-    agent_args.setdefault("system_prompt", _default_multi_episode_prompt())
 
     # Resolve agent class from config (supports action-only non-cumulative agent)
     agent_name = cfg.rllm.agent.get("name", "math_agent")
@@ -144,6 +135,14 @@ def main(cfg) -> None:  # type: ignore
         summarization_config = OmegaConf.to_container(summarization_cfg, resolve=True) or {}
     else:
         summarization_config = {}
+
+    # Build the default system prompt AFTER reading the summarization config
+    # so the prompt's "Memory protocol" section reflects the active carryover
+    # mode. User overrides via rllm.agent.agent_args.system_prompt still win.
+    agent_args.setdefault(
+        "system_prompt",
+        build_multi_episode_system_prompt(summarization=summarization_config),
+    )
     if summarization_config.get("enable"):
         for key in (
             "summarization_threshold_tokens",
@@ -159,6 +158,13 @@ def main(cfg) -> None:  # type: ignore
         # Forward the summarization mode (token | episodic | both) to the agent.
         if "mode" in summarization_config:
             agent_args["mode"] = summarization_config["mode"]
+
+        # Episodic context-carryover form: freeform | obs_action |
+        # obs_action_reflection. Only affects the episode-end trigger.
+        if "episodic_carryover" in summarization_config:
+            agent_args["episodic_carryover"] = summarization_config[
+                "episodic_carryover"
+            ]
 
         # When episodic summarization is enabled, tell the env to defer
         # new-episode advancement to the engine's summarization hook (the

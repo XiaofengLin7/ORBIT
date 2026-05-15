@@ -27,13 +27,16 @@ def _inject_workflow_flag(cfg) -> None:
 
 
 def _default_multi_episode_prompt() -> str:
-    """System prompt that reminds the policy about multi-episode control."""
-    return (
-        "You are solving the same task across multiple episodes with a fixed total step budget. "
-        "Each episode resets the environment but keeps the task identical. "
-        "Leverage information gathered from earlier episodes to succeed faster. "
-        "Think briefly and respond with actions inside \\boxed{} each turn. Overlong responses will be penalized."
-    )
+    """System prompt that reminds the policy about multi-episode control.
+
+    Delegates to :func:`prompts.system_prompts.build_multi_episode_system_prompt`
+    so all training/eval entry points share one prompt source. This entry
+    point does not configure mid-trajectory summarization, so no memory-
+    protocol section is appended.
+    """
+    from prompts.system_prompts import build_multi_episode_system_prompt
+
+    return build_multi_episode_system_prompt()
 
 
 @hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
