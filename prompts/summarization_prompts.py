@@ -18,9 +18,17 @@ strategies. The hard constraint is the output format (``<context_summary>``
 tags) and the consequence framing ("the summary REPLACES your prior
 history"), both of which the engine relies on.
 
-All three must instruct the model to wrap its output in
+The first three must instruct the model to wrap their output in
 ``<context_summary>...</context_summary>`` tags so
 ``agents.context_summarizer._SUMMARY_TAG_RE`` can extract it.
+
+A fourth prompt, ``REFLECTION_PROMPT``, is used by the
+``episodic_carryover="obs_action_reflection"`` mode: the previous episode's
+observations and (boxed) actions are kept verbatim in the history, and the
+model is asked only to add a short ``<reflection>...</reflection>`` block on
+top — so this prompt does NOT replace history. It must wrap its output in
+``<reflection>...</reflection>`` tags (parsed by
+``agents.context_summarizer._REFLECTION_TAG_RE``).
 """
 
 TOKEN_SUMMARY_PROMPT = """\
@@ -50,6 +58,14 @@ Possible things worth preserving:
 - A concrete plan or belief to seed the next episode.
 
 Write your summary inside <context_summary>...</context_summary> tags."""
+
+
+REFLECTION_PROMPT = """\
+You have just completed one episode. The full sequence of observations and actions from that episode is still visible above and will remain visible to you in the next episode — you do NOT need to restate it.
+
+Write a reflection on top of it: what worked, what failed, what was decisive, and what you would do differently next episode. Keep it to what's actually useful to act on, not a recap of moves already shown above.
+
+Write your reflection inside <reflection>...</reflection> tags."""
 
 
 REFLECTIVE_SUMMARY_PROMPT = """\

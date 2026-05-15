@@ -96,6 +96,12 @@ Implemented across these files:
 
 2. **Oracle (rule-based) summary**. Opt-in via `+rllm.agent.summarization.oracle.enable=true +rllm.agent.summarization.oracle.scope=maze`. A deterministic, env-derived "mental map" string replaces the LLM call. The oracle text is fed into `agent.apply_summary` so the next segment's prompt contains it, but **no `episode_step` is appended → mask=0 everywhere → never trained on**. Designed to isolate the question "do perfect summaries lift in-context performance?" from "can the model write good summaries?". See `summarizing_engine.py:649-688`.
 
+**Episodic context-carryover form (`rllm.agent.summarization.episodic_carryover`, episode-end trigger only):**
+- `freeform` *(default)* — the LLM-generated summary above; history is wiped to `[system, <context_summary>]`.
+- `obs_action` — **no LLM call, no trainable step.** History is rewritten to `[system] + the just-finished episode's (obs, action) turns`, with each assistant turn reduced to `\boxed{<action>}` (thinking discarded). Like the oracle path: a segment boundary is recorded, but nothing is appended to `episode_steps`. Implemented via `ContextSummarizerMixin.apply_episode_carryover`.
+- `obs_action_reflection` — same kept transcript, plus the LLM is shown the episode and asked (via `prompts/summarization_prompts.REFLECTION_PROMPT`) to add a `<reflection>...</reflection>` block. That generation **is a trainable step** (mask=1, GRPO advantage broadcast — like the freeform summary). If the reflection generation fails or has no room, it silently degrades to `obs_action`.
+- This knob supersedes `env.enable_reflection` → `REFLECTIVE_SUMMARY_PROMPT` selection at episode end. The oracle path keeps priority: if an oracle summarizer is active, it wins regardless of `episodic_carryover`. The engine tracks `episode_start_msg_idx` (the index of each episode's first obs message in `agent._messages`) to slice the carried-over transcript; for Token mode the post-rewrite `accumulated_prompt_ids` is rebuilt by `_accumulated_from_chat`.
+
 **Segment-based PPO training (always on when summarization is enabled):**
 
 1. `assemble_segments` (summarizing_engine.py:821) splits each trajectory at `summarization_boundaries` into per-segment training rows.
@@ -117,6 +123,7 @@ rllm.agent.name=gem_text_agent_summarizing  # or gem_text_agent_noncumulative_su
 +rllm.agent.summarization.mode=episodic       # token | episodic | both
 +rllm.agent.summarization.threshold_tokens=16384
 +rllm.agent.summarization.summary_max_tokens=8192
++rllm.agent.summarization.episodic_carryover=freeform   # freeform | obs_action | obs_action_reflection
 # Oracle (rule-based) summary, currently maze-only:
 +rllm.agent.summarization.oracle.enable=true
 +rllm.agent.summarization.oracle.scope=maze

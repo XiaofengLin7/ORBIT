@@ -60,6 +60,8 @@ SUMM=(
     +rllm.agent.summarization.mode="$MODE"
     +rllm.agent.summarization.threshold_tokens=$SUMMARIZATION_THRESHOLD
     +rllm.agent.summarization.summary_max_tokens=$SUMMARY_MAX_TOKENS
+    +rllm.agent.summarization.episodic_carryover=obs_action_reflection
+    trainer.experiment_name="obs_action_reflection"  
 )
 
 echo "=========================================="
