@@ -84,6 +84,23 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         # verl-style token accumulation
         accumulated_prompt_ids: list[int] | None = None
 
+        # Lazy-init `self.max_model_len` to match what vLLM computes
+        # internally. The vLLM async server unconditionally sets
+        # `config.max_model_len = prompt_length + response_length` (see
+        # verl/workers/rollout/vllm_rollout/vllm_async_server.py:155),
+        # and later uses that value to compute
+        # `max_tokens = max_model_len - len(prompt_ids)`. Several
+        # in-method guards reference `self.max_model_len` (the step-loop
+        # overflow guard below, plus the summary and reflection
+        # headroom checks in `_do_summarization`), but no parent class
+        # ever assigns it, so without this line every check
+        # short-circuits and vLLM ends up raising
+        # `ValueError: max_tokens must be at least 1, got -N`.
+        if getattr(self, "max_model_len", None) is None:
+            self.max_model_len = (
+                self.max_prompt_length + self.max_response_length
+            )
+
         # Detect whether agent supports summarization.
         agent_can_summarize = hasattr(agent, "should_summarize")
 
