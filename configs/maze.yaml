@@ -16,12 +16,45 @@ train_tasks:
     shapes: [[6,6],[7,6],[7,7],[6,7]]
     
 val_tasks:
-  - env_id: "maze"
-    max_turns_per_episode: 9
-    num_episodes: 10
-    total_step_cap: 90
-    shortest_path_max_length: 8
-    shortest_path_min_length: 7
-    test_size: 128
-    inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
-    shapes: [[6,6],[7,6],[7,7],[6,7]]
+ - env_id: "maze"
+   max_turns_per_episode: 9
+   num_episodes: 3
+   total_step_cap: 27
+   shortest_path_max_length: 8
+   shortest_path_min_length: 7
+   test_size: 64
+   inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+   shapes: [[6,6],[7,6],[7,7],[6,7]]
+
+
+ - env_id: "maze"
+   max_turns_per_episode: 9
+   num_episodes: 5
+   total_step_cap: 45
+   shortest_path_max_length: 8
+   shortest_path_min_length: 7
+   test_size: 64
+   inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+   shapes: [[6,6],[7,6],[7,7],[6,7]]
+
+
+ - env_id: "maze"
+   max_turns_per_episode: 9
+   num_episodes: 10
+   total_step_cap: 90
+   shortest_path_max_length: 8
+   shortest_path_min_length: 7
+   test_size: 64
+   inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+   shapes: [[6,6],[7,6],[7,7],[6,7]]
+
+
+ - env_id: "maze"
+   max_turns_per_episode: 9
+   num_episodes: 15
+   total_step_cap: 135
+   shortest_path_max_length: 8
+   shortest_path_min_length: 7
+   test_size: 64
+   inner_env_class: 'envs.maze_env_adapter.MazeEnvAdapter'
+   shapes: [[6,6],[7,6],[7,7],[6,7]]
