@@ -27,6 +27,7 @@ from verl import DataProto  # type: ignore
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 from rllm.trainer.verl.agent_ppo_trainer import AgentPPOTrainer
+from rllm.utils import colorful_print
 
 from trainers.chunk_advantage import compute_chunk_returns_for_batch
 from trainers.segment_expansion import (
@@ -42,6 +43,85 @@ from trainers.segment_expansion import (
 # workers) via a `.pth` file in the conda env's site-packages — see the
 # top-level `orbit_segtrain_patch.py` module and the `scripts/train_*.sh`
 # setup that writes the .pth file.
+
+
+# Termination reasons that mark a trajectory as "truncated". Mirrors the
+# tuple at ``summarizing_engine.py:627`` used to zero step rewards in the
+# engine; we keep a separate copy to avoid importing engine internals
+# into the trainer module.
+DEFAULT_TRUNCATION_REASONS: tuple[str, ...] = (
+    "TRUNCATION",
+    "PROMPT_TRUNCATION",
+    "SUMMARIZATION_BUDGET_EXCEEDED",
+    "SUMMARIZATION_FAILED",
+)
+
+
+def _is_truncated_trajectory(traj: dict, reasons: set[str]) -> bool:
+    """True iff ``traj`` was produced by a truncation-class termination."""
+    return traj.get("termination_reason") in reasons
+
+
+def compute_kept_trajectory_indices(
+    trajectories: list[dict],
+    *,
+    enable: bool,
+    is_validation: bool,
+    reasons: set[str] | None = None,
+) -> tuple[list[int], bool]:
+    """Return ``(kept_indices_into_input, fallback_applied)``.
+
+    ``kept_indices_into_input`` is a sorted-ascending list of positions
+    in ``trajectories`` that survive the filter, suitable for indexing
+    both ``raw_trajs`` and the parallel ``DataProto`` (via
+    ``select_idxs``) so they stay aligned row-for-row.
+
+    ``fallback_applied`` is True when *all* trajectories would be
+    dropped; in that case we return the full index list so the caller
+    keeps the unfiltered batch, avoiding an empty-batch crash in
+    ``build_expanded_dataproto`` / Ray padding.
+
+    No-ops (returns the full index list, ``fallback=False``) when
+    ``enable`` is False, ``is_validation`` is True, or ``trajectories``
+    is empty.
+    """
+    n = len(trajectories)
+    full = list(range(n))
+    if not enable or is_validation or n == 0:
+        return full, False
+    reasons_set = (
+        set(reasons) if reasons is not None
+        else set(DEFAULT_TRUNCATION_REASONS)
+    )
+    kept = [
+        i for i, t in enumerate(trajectories)
+        if not _is_truncated_trajectory(t, reasons_set)
+    ]
+    if not kept:
+        return full, True
+    return kept, False
+
+
+def filter_truncated_trajectories(
+    trajectories: list[dict],
+    *,
+    enable: bool,
+    is_validation: bool,
+    reasons: set[str] | None = None,
+) -> tuple[list[dict], bool]:
+    """Thin wrapper over :func:`compute_kept_trajectory_indices` that
+    returns the actual filtered ``trajectories`` list instead of indices.
+
+    Kept for backwards-compatibility and convenience in callers that
+    don't need to slice a parallel DataProto.
+    """
+    kept_idxs, fallback = compute_kept_trajectory_indices(
+        trajectories,
+        enable=enable,
+        is_validation=is_validation,
+        reasons=reasons,
+    )
+    return [trajectories[i] for i in kept_idxs], fallback
 
 
 class MultiEpisodeAsyncAgentExecutionEngine(AsyncAgentExecutionEngine):
@@ -253,6 +333,51 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
 
         def _expanded_update_actor(batch: DataProto):
             raw_trajs = self._cached_raw_trajectories
+
+            # ---- Optional truncation filter ----
+            # Filter here (rather than in _transform_agent_trajectories)
+            # because the upstream prompt batch has already been unioned
+            # with our transformed batch; filtering earlier would break
+            # batch.union's size-match assertion. select_idxs keeps the
+            # prompt-side rows aligned with the filtered trajectories —
+            # both `batch` and `raw_trajs` are sliced by the same sorted
+            # ascending `kept_idxs`, so batch[j] still corresponds to
+            # raw_trajs[j] downstream (which is what
+            # `compute_chunk_returns_for_batch` and the per-row advantage
+            # fill loop assume).
+            if raw_trajs is not None:
+                filter_enable = bool(
+                    OmegaConf.select(
+                        self.config,
+                        "rllm.filter_truncated_trajectories.enable",
+                        default=False,
+                    )
+                )
+                reasons_cfg = OmegaConf.select(
+                    self.config,
+                    "rllm.filter_truncated_trajectories.reasons",
+                    default=None,
+                )
+                kept_idxs, fallback_applied = compute_kept_trajectory_indices(
+                    raw_trajs,
+                    enable=filter_enable,
+                    is_validation=getattr(self, "_is_validation_mode", False),
+                    reasons=set(reasons_cfg) if reasons_cfg is not None else None,
+                )
+                n_before = len(raw_trajs)
+                if fallback_applied:
+                    colorful_print(
+                        f"[filter_truncated] all {n_before} trajectories "
+                        "would be dropped this step; falling back to "
+                        "unfiltered batch.",
+                        "red",
+                    )
+                elif len(kept_idxs) < n_before:
+                    # Slice in lockstep — preserves credit assignment:
+                    # raw_trajs[j] still pairs with batch row j after this.
+                    batch = batch.select_idxs(kept_idxs)
+                    raw_trajs = [raw_trajs[i] for i in kept_idxs]
+
             if raw_trajs is None or not any(t.get("segments") for t in raw_trajs):
                 # No cached segments (or every trajectory was 1-segment) —
                 # the expansion is a no-op. Run with the per-trajectory
@@ -696,6 +821,11 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         ``self._cached_raw_trajectories`` so the wrapped ``update_actor``
         (when summarization is enabled) can expand into per-segment rows
         with broadcast advantages and trajectory-uniform per-token weights.
+
+        Note: truncated-trajectory filtering happens inside
+        ``_expanded_update_actor`` (not here), because the upstream prompt
+        batch and the transformed batch must keep matching row counts so
+        ``fit_agent``'s ``batch.union(final_gen_batch_output)`` can fire.
         """
         # Cache the segmented payload for the wrapped update_actor.
         # We use a shallow copy so future mutations to `trajectories` don't

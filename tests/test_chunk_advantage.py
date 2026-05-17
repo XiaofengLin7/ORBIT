@@ -302,3 +302,156 @@ def test_batch_returns_ordering():
     assert len(out) == 2
     assert len(out[0]) == 12
     assert len(out[1]) == 2
+
+
+# --------------------- ep1=success + ep2=truncated -----------------------
+#
+# Scenario: TOPR (chunk_discounted_topr) + reward_scope=per_episode +
+# summarization mode=episodic. Episode 1 finishes successfully (R=1.0);
+# episode 2 is truncated by the step cap (no episode_done=True, env
+# appends a 0.0 placeholder reward). The single summarization step sits
+# at the ep1→ep2 boundary with trigger="episode_end". Expected behaviour:
+# the summary inherits zero credit (G=0), because per-episode scope books
+# ep1's reward on the action that ended ep1 (already past) and ep2 has
+# no future reward to flow back.
+
+def _truncated_traj_metadata() -> list[dict]:
+    """[a×3 ep1 (last ends), s_ep, a×2 ep2 (truncated, neither ends)]."""
+    md: list[dict] = []
+    for i in range(3):
+        md.append(_action_step(episode_done=(i == 2), episode_index=0))
+    md.append(_sum_step(trigger="episode_end"))      # index 3
+    for i in range(2):
+        md.append(_action_step(episode_done=False, episode_index=1))
+    return md
+
+
+def test_summary_credit_ep1_success_ep2_truncated_zero():
+    """Summary at the ep1→ep2 boundary gets G=0 and is_positive=False
+    when ep2 is truncated. ep1's reward was already booked on the action
+    that ended ep1, and no future reward survives the Bellman backward
+    pass through the truncated tail."""
+    md = _truncated_traj_metadata()
+    # episode_rewards = [1.0 (ep1 success), 0.0 (ep2 truncated placeholder)].
+    out = compute_chunk_returns_per_episode(md, [1.0, 0.0], gamma=0.9)
+    g_values = [g for g, _ in out]
+    is_pos = [p for _, p in out]
+
+    summary_idx = 3
+    assert g_values[summary_idx] == 0.0, (
+        f"summary expected G=0, got {g_values[summary_idx]}"
+    )
+    assert is_pos[summary_idx] is False
+
+    # Ep1's terminal action (index 2) gets the +1 reward.
+    assert math.isclose(g_values[2], 1.0, rel_tol=1e-12)
+    # Earlier ep1 actions discount back from index 2.
+    assert math.isclose(g_values[1], 0.9, rel_tol=1e-12)
+    assert math.isclose(g_values[0], 0.9 ** 2, rel_tol=1e-12)
+    # Truncated ep2 actions (and the summary) all see zero future reward.
+    for k in (3, 4, 5):
+        assert g_values[k] == 0.0
+        assert is_pos[k] is False
+
+
+def test_summary_credit_ep1_success_ep2_truncated_no_placeholder():
+    """Same scenario but env did not append a placeholder reward for the
+    truncated episode. Bellman backward is identical: the summary still
+    gets G=0 because the per-chunk reward array only fires on
+    is_summarization=False AND episode_done=True (lines 232-238)."""
+    md = _truncated_traj_metadata()
+    out = compute_chunk_returns_per_episode(md, [1.0], gamma=0.9)
+    g_values = [g for g, _ in out]
+    assert g_values[3] == 0.0
+    # Tail chunks zero, ep1 actions discounted from R=1 at index 2.
+    assert math.isclose(g_values[2], 1.0, rel_tol=1e-12)
+    assert all(g == 0.0 for g in g_values[3:])
+
+
+def _both_mode_traj_metadata() -> list[dict]:
+    """summarization mode = both: one token-triggered summary INSIDE ep1
+    plus one episode-end summary at the ep1→ep2 boundary, then a
+    truncated ep2.
+
+    Shape: [a, a, s_token, a(ep1 done, R=1), s_ep_end, a, a (ep2 truncated)]
+    Indices:  0  1   2         3                4        5  6
+    """
+    md: list[dict] = []
+    md.append(_action_step(episode_done=False, episode_index=0))   # 0
+    md.append(_action_step(episode_done=False, episode_index=0))   # 1
+    md.append(_sum_step(trigger="token"))                          # 2 (mid-ep1)
+    md.append(_action_step(episode_done=True, episode_index=0))    # 3 (R=1)
+    md.append(_sum_step(trigger="episode_end"))                    # 4 (boundary)
+    md.append(_action_step(episode_done=False, episode_index=1))   # 5
+    md.append(_action_step(episode_done=False, episode_index=1))   # 6 (truncated)
+    return md
+
+
+def test_both_mode_token_summary_gets_credit_episode_end_summary_zero():
+    """summarization mode=both, per_episode scope, ep1 success + ep2 truncated.
+
+    The two summary chunks get very different credit:
+    * Token-triggered summary INSIDE ep1 (index 2): non-zero G — discount
+      from ep1's terminal action one step ahead. Trained on ep1's success.
+    * Episode-end summary at the ep1→ep2 boundary (index 4): G=0 — ep1's
+      reward was already booked on the action that ended ep1, and no
+      future reward survives the truncated ep2.
+
+    This is the asymmetry that surprises people: under per_episode scope,
+    mid-episode summaries are BETTER credited than end-of-episode summaries.
+    """
+    md = _both_mode_traj_metadata()
+    gamma = 0.9
+    out = compute_chunk_returns_per_episode(md, [1.0, 0.0], gamma=gamma)
+    g_values = [g for g, _ in out]
+    is_pos = [p for _, p in out]
+
+    # r-array: only index 3 (ep1's terminal action with episode_done=True
+    # and is_summarization=False) carries r=1.0. The truncated ep2 has no
+    # episode_done step, so its placeholder reward (0.0) is never assigned.
+    # Bellman backward from there.
+    assert math.isclose(g_values[3], 1.0, rel_tol=1e-12)
+    # Token summary at index 2 → Δ=1 from ep1's terminal action → G=γ.
+    assert math.isclose(g_values[2], gamma, rel_tol=1e-12)
+    assert is_pos[2] is True, "token-triggered summary should be TOPR-positive"
+    # Earlier ep1 actions discount back from R=1 at index 3.
+    assert math.isclose(g_values[1], gamma ** 2, rel_tol=1e-12)
+    assert math.isclose(g_values[0], gamma ** 3, rel_tol=1e-12)
+    # Episode-end summary at index 4 and the truncated ep2 actions: all G=0.
+    for k in (4, 5, 6):
+        assert g_values[k] == 0.0, f"chunk {k} expected G=0, got {g_values[k]}"
+        assert is_pos[k] is False, f"chunk {k} expected TOPR-negative"
+
+
+def test_both_mode_summary_credit_terminal_scope_uniform():
+    """Under reward_scope=terminal, BOTH summaries get non-zero credit
+    (γ^Δ · sum_rewards), confirming the zero-credit asymmetry is
+    per_episode-specific."""
+    md = _both_mode_traj_metadata()
+    gamma = 0.9
+    out = compute_chunk_returns_terminal(md, [1.0, 0.0], gamma=gamma)
+    g_values = [g for g, _ in out]
+    K = len(md)  # 7
+    # R_total = 1.0; every chunk gets γ^Δ · 1.0.
+    for k, g in enumerate(g_values):
+        expected = (gamma ** (K - 1 - k)) * 1.0
+        assert math.isclose(g, expected, rel_tol=1e-12)
+    # Both summary chunks (k=2 token, k=4 episode_end) have non-zero G.
+    assert g_values[2] > 0.0
+    assert g_values[4] > 0.0
+
+
+def test_summary_credit_terminal_scope_picks_up_ep1_reward():
+    """Counter-example: under reward_scope=terminal, the same truncated
+    trajectory broadcasts R=1.0 to every chunk including the summary,
+    discounted by Δ from the trajectory's last chunk. Confirms the
+    'summary gets zero credit' problem is specific to per_episode scope."""
+    md = _truncated_traj_metadata()
+    out = compute_chunk_returns_terminal(md, [1.0, 0.0], gamma=0.9)
+    g_values = [g for g, _ in out]
+    K = len(md)  # 6
+    for k, g in enumerate(g_values):
+        expected = (0.9 ** (K - 1 - k)) * 1.0
+        assert math.isclose(g, expected, rel_tol=1e-12)
+    # Summary at k=3 → Δ=2 → G = 0.9^2 = 0.81 (NOT zero).
+    assert math.isclose(g_values[3], 0.81, rel_tol=1e-12)

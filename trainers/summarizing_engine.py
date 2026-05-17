@@ -681,6 +681,27 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             else:
                 ep_rewards = [float(trajectory.reward)]
 
+            # Truncated trajectories contribute zero credit across all
+            # episodes — consistent treatment under both advantage methods.
+            #
+            #   GRPO path: the step-reward zeroing at line ~634 already
+            #   handles trajectory.steps[i].reward; compute_trajectory_reward
+            #   then sets trajectory.reward = sum(steps) = 0. That flows
+            #   into assemble_segments(...trajectory_reward=0) → result
+            #   dict → traj["trajectory_reward"] → score_batch's last-token
+            #   slot → token_level_scores. GRPO's group normalization sees
+            #   0 for truncated rows.
+            #
+            #   TOPR (chunk_discounted_topr) path: this method reads
+            #   traj["episode_rewards"] directly (compute_chunk_returns_*),
+            #   which is populated from env._episode_rewards — NOT derived
+            #   from trajectory.steps. So without this explicit zeroing, a
+            #   successful earlier episode in a truncated trajectory would
+            #   still propagate positive G_k back to its action chunks
+            #   through the Bellman backward. The zero below closes that.
+            if termination_reason in truncation_reasons:
+                ep_rewards = [0.0] * len(ep_rewards)
+
             # ---- Optional per-episode length penalty (overlong reward
             # shaping, arXiv:2510.11701 Eq. 9). Off by default. Reads
             # config defensively via .get(...), same pattern as the
@@ -769,6 +790,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 "step_metadata": step_metadata,
                 "summarization_boundaries": list(summarization_boundaries),
                 "episode_rewards": ep_rewards,
+                "termination_reason": termination_reason,
                 "metrics": {
                     "steps": len(trajectory.steps),
                     "reward_time": reward_time,
