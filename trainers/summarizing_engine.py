@@ -104,6 +104,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
         # Detect whether agent supports summarization.
         agent_can_summarize = hasattr(agent, "should_summarize")
 
+        # Resolve ref-routing once per trajectory. When enabled, action
+        # calls go to the frozen ref endpoint, and the action turn is
+        # excluded from the training data (no episode_step row; zero
+        # trajectory-level mask). The summ model still sees those tokens
+        # at summarization time because they remain in agent._messages.
+        ref_routing = self._get_ref_engine() is not None
+
         # Cache generation prompt tokens (used for incremental token
         # construction across summarization boundaries).
         gen_prompt_tokens = list(
@@ -237,7 +244,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 kwargs["accumulated_prompt_ids"] = accumulated_prompt_ids
 
             start_time = time.time()
-            model_output = await self.get_model_response(
+            model_output = await self._get_action_response(
                 prompt_messages, application_id, **kwargs
             )
             response = model_output.text
@@ -261,7 +268,12 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 "completion_ids": model_output.completion_ids,
                 "logprobs": model_output.logprobs,
             }
-            episode_steps.append(prompt_response_pair)
+            # Ref-routed actions are excluded from training data: keep
+            # them in agent._messages (via update_from_model below) so
+            # the summ model sees the full context at summarization
+            # time, but skip the PPO training row.
+            if not ref_routing:
+                episode_steps.append(prompt_response_pair)
 
             action: Action = agent.update_from_model(response)
             action = action.action
@@ -350,6 +362,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                         contains_generation_msg=False,
                     )
                 )
+                # Ref-routed action tokens stay in the trajectory's
+                # response stream (preserves context bookkeeping and
+                # token counts) but are not trained on: zero their
+                # mask so the trajectory-level training tensor
+                # contains no off-policy action tokens.
+                if ref_routing:
+                    assistant_msg_masks = [0] * len(assistant_msg_masks)
             if env_messages:
                 env_msg_tokens, env_msg_masks = convert_messages_to_tokens_and_masks(
                     env_messages,
@@ -944,7 +963,16 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             # boundary (zero-masking the whole trajectory). We do NOT add
             # a placeholder oracle step to `episode_steps`, so the oracle
             # text is still never a PPO training target.
-            if episode_steps:
+            #
+            # Dedupe guard: under ref-routing, action steps aren't
+            # appended to ``episode_steps``, so two adjacent oracle
+            # carryovers with only ref-actions between them would
+            # otherwise record the same boundary twice (yielding an
+            # empty segment).
+            if episode_steps and (
+                not summarization_boundaries
+                or summarization_boundaries[-1] != len(episode_steps) - 1
+            ):
                 summarization_boundaries.append(len(episode_steps) - 1)
             new_accumulated: list[int] | None = None
             if mode == "Token":
@@ -1003,7 +1031,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
                 if ok_to_generate:
                     try:
-                        reflection_output = await self.get_model_response(
+                        reflection_output = await self._get_summary_response(
                             reflection_prompt, application_id, **summ_kwargs
                         )
                     except Exception:
@@ -1046,8 +1074,14 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             # Segment break at the last recorded step (the reflection step if
             # one was added, otherwise the last action step), so
             # assemble_segments splits at the history rewrite — same rationale
-            # as the oracle path.
-            if episode_steps:
+            # as the oracle path. Same dedupe guard as the oracle path:
+            # under ref-routing, action steps aren't in ``episode_steps``,
+            # so two adjacent carryovers with no reflection in between
+            # would record the same boundary twice.
+            if episode_steps and (
+                not summarization_boundaries
+                or summarization_boundaries[-1] != len(episode_steps) - 1
+            ):
                 summarization_boundaries.append(len(episode_steps) - 1)
 
             segment_chat_histories.append(agent.chat_completions)
@@ -1115,7 +1149,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             summ_kwargs["accumulated_prompt_ids"] = accumulated_prompt_ids
 
         try:
-            summary_output = await self.get_model_response(
+            summary_output = await self._get_summary_response(
                 summary_prompt, application_id, **summ_kwargs
             )
         except Exception:
@@ -1205,6 +1239,188 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             contains_generation_msg=True,
         )
         return list(initial_system_tokens) + list(body_tokens)
+
+    # ------------------------------------------------------------------
+    # Ref-model routing (optional)
+    # ------------------------------------------------------------------
+    #
+    # When ``rllm.agent.summarization.ref_model.enable`` is true, the
+    # engine splits inference between two endpoints:
+    #
+    #   * Regular task actions  -> a frozen reference model served by an
+    #     external vLLM/OpenAI-compatible endpoint. Tokens generated here
+    #     never enter the training data (they are kept in the agent's
+    #     chat history so the summ model sees the full context at
+    #     summarization time, but the per-action episode_step is skipped
+    #     and the trajectory-level mask is zeroed).
+    #
+    #   * Summary / reflection  -> the trainable engine (verl's rollout
+    #     pool), unchanged.
+    #
+    # This isolates "is the model learning to write good summaries?"
+    # from "is the model learning to act?" by holding the actor fixed
+    # and training only the summarization head.
+
+    def _get_ref_engine(self):
+        """Return the frozen-ref ``OpenAIEngine``, lazy-initialized; ``None`` if disabled."""
+        if hasattr(self, "_ref_engine_cache"):
+            return self._ref_engine_cache
+
+        ref_cfg = None
+        try:
+            summ_cfg = self.config.rllm.agent.get("summarization", None)
+            if summ_cfg is not None:
+                ref_cfg = summ_cfg.get("ref_model", None)
+        except Exception:
+            ref_cfg = None
+
+        enabled = False
+        if ref_cfg is not None:
+            try:
+                enabled = bool(ref_cfg.get("enable", False))
+            except Exception:
+                enabled = bool(getattr(ref_cfg, "enable", False))
+
+        if not enabled:
+            self._ref_engine_cache = None
+            return None
+
+        from rllm.engine.rollout.openai_engine import OpenAIEngine
+
+        base_url = ref_cfg.get("base_url", "http://localhost:8765/v1")
+        api_key = ref_cfg.get("api_key", "EMPTY")
+        model_name = ref_cfg.get("model_name", "ref-model")
+        max_resp = int(ref_cfg.get("max_response_length", self.max_response_length))
+
+        self._ref_engine_cache = OpenAIEngine(
+            model=model_name,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.max_prompt_length,
+            max_response_length=max_resp,
+            max_model_length=getattr(self, "max_model_len", None),
+            base_url=base_url,
+            api_key=api_key,
+        )
+
+        # Silence the per-call "Warning: Decreasing max_tokens to X to
+        # stay within max_model_length" print emitted from
+        # ``OpenAIEngine._prepare_max_tokens_param``. It fires on every
+        # action call once the chat history exceeds the (small)
+        # ``max_prompt_length`` and just spams stdout — the clamp itself
+        # is correct, only the noise is unwanted. We replace the method
+        # on this instance only; the original module-level function is
+        # untouched.
+        def _silent_prepare_max_tokens_param(
+            self_, sampling_params, prompt_length=None
+        ):
+            if "max_completion_tokens" in sampling_params:
+                return {
+                    "max_completion_tokens": sampling_params.pop(
+                        "max_completion_tokens"
+                    )
+                }
+            mt = sampling_params.pop(
+                "max_tokens",
+                sampling_params.pop(
+                    "max_new_tokens", self_.max_response_length
+                ),
+            )
+            if prompt_length and self_.max_model_length:
+                remaining = self_.max_model_length - prompt_length
+                if remaining <= mt:
+                    mt = remaining
+            return {"max_tokens": mt}
+
+        # Defensive: tests stub OpenAIEngine with sentinels that don't
+        # accept attribute assignment. Silencing is best-effort.
+        try:
+            self._ref_engine_cache._prepare_max_tokens_param = (
+                _silent_prepare_max_tokens_param.__get__(
+                    self._ref_engine_cache, type(self._ref_engine_cache)
+                )
+            )
+        except (AttributeError, TypeError):
+            pass
+
+        print(
+            f"[orbit] ref-routing enabled; action calls -> {base_url} "
+            f"(model={model_name})"
+        )
+        return self._ref_engine_cache
+
+    # Kwargs that the verl rollout engine threads through but the
+    # OpenAI client rejects. ``OpenAIEngine`` already pops a few
+    # (application_id, validate, model, enforce_max_prompt_length,
+    # tools, accumulate_reasoning, reasoning_effort); the rest must be
+    # stripped here before forwarding, otherwise they hit
+    # ``client.completions.create(**sampling_params)`` and raise
+    # ``TypeError: unexpected keyword argument``.
+    _VERL_ONLY_KWARGS = frozenset(
+        {
+            "accumulated_prompt_ids",  # verl pre-tokenized prompt fast-path
+            "meta_info",  # verl per-request metadata bag
+            "timing_raw",  # verl timing telemetry dict
+            "uids",  # verl group-id passthrough
+        }
+    )
+
+    async def _get_action_response(
+        self, prompt_messages, application_id, **kwargs
+    ):
+        """Route an action-generation call to the ref engine if configured.
+
+        Token-ID fast path: when the trajectory loop has built an
+        ``accumulated_prompt_ids`` running sequence, we hand it to the ref
+        engine's ``completion`` endpoint *as token IDs* instead of letting
+        ``OpenAIEngine.get_model_response`` re-tokenize ``prompt_messages``
+        via the chat parser. This keeps the accumulator in one canonical
+        form across ref and trainable engines — without it, every ref
+        action call would replace the incremental token sequence with a
+        fresh chat-templated render of the conversation, and any
+        ID-level drift between the two encodings (special-token
+        whitespace, BOS handling) would silently propagate into the
+        next summary call's prompt.
+        """
+        ref_engine = self._get_ref_engine()
+        if ref_engine is None:
+            return await self.get_model_response(
+                prompt_messages, application_id, **kwargs
+            )
+        # Pull accumulated tokens out before stripping the verl-only kwarg set;
+        # we want to USE them rather than discard them.
+        accumulated = kwargs.pop("accumulated_prompt_ids", None)
+        ref_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in self._VERL_ONLY_KWARGS
+        }
+        # Mirror the parent ``AgentExecutionEngine`` convention: the
+        # trajectory loop already handles prompt-length budget
+        # (truncation / PROMPT_TRUNCATION breaks), so the inner rollout
+        # engine should NOT enforce again. ``OpenAIEngine`` defaults to
+        # ``enforce_max_prompt_length=True``, which would raise
+        # ``TerminationEvent`` for any prompt above the (often small)
+        # ``data.max_prompt_length`` even though the trajectory loop
+        # would have handled it. Override here.
+        ref_kwargs.setdefault("enforce_max_prompt_length", False)
+        if accumulated is not None:
+            # Direct completion call bypasses the chat-template re-render.
+            # OpenAIEngine.completion accepts either a string prompt or
+            # a list[int] of token IDs (openai_engine.py:157-160).
+            return await ref_engine.completion(
+                list(accumulated), application_id=application_id, **ref_kwargs
+            )
+        return await ref_engine.get_model_response(
+            prompt_messages, application_id=application_id, **ref_kwargs
+        )
+
+    async def _get_summary_response(
+        self, prompt_messages, application_id, **kwargs
+    ):
+        """Summaries / reflections always go through the trainable engine."""
+        return await self.get_model_response(
+            prompt_messages, application_id, **kwargs
+        )
 
     def _maybe_oracle_summarizer(self, env, trigger: str):
         """Return an env-specific oracle summarizer, or ``None``.
