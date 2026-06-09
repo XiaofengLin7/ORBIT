@@ -243,6 +243,7 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
 
                     is_pos_field = model_inputs.get("is_positive")
+                    rollout_is_field = model_inputs.get("rollout_is_weights")
                     surrogate = compute_pg_per_token(
                         advantages=advantages,
                         log_prob=log_prob,
@@ -252,6 +253,7 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
                         clip_ratio_c=clip_ratio_c,
                         is_positive=is_pos_field,
                         topr_enabled=is_pos_field is not None,
+                        rollout_is_weights=rollout_is_field,
                     )
                     pg_per_token = surrogate["pg_per_token"]
                     pg_losses1 = surrogate["pg_losses1"]
@@ -259,6 +261,29 @@ class TrajectoryUniformPPOActor(DataParallelPPOActor):
                     clip_pg_losses1 = surrogate["clip_pg_losses1"]
                     pg_losses3 = surrogate["pg_losses3"]
                     negative_approx_kl = surrogate["negative_approx_kl"]
+
+                    # Diagnostics for the rollout/training IS correction.
+                    # Skipped when off — keeps the off-path bit-exact with
+                    # pre-TIS behavior and avoids polluting the metric set.
+                    # Verl's helper-side metrics (rollout_corr/*) already
+                    # cover clip fraction etc.; we just record per-actor
+                    # mean and max here as a lightweight sanity check
+                    # that the tensor is actually flowing into the loss.
+                    if rollout_is_field is not None:
+                        with torch.no_grad():
+                            from verl.utils import torch_functional as verl_F
+                            ris_mean = verl_F.masked_mean(
+                                rollout_is_field, response_mask
+                            )
+                            ris_max = (
+                                rollout_is_field * response_mask
+                            ).max()
+                        micro_batch_metrics["actor/rollout_is_weight_mean"] = (
+                            ris_mean.detach().item()
+                        )
+                        micro_batch_metrics["actor/rollout_is_weight_max"] = (
+                            ris_max.detach().item()
+                        )
 
                     # ---- Trajectory-uniform aggregation ----
                     # numer_local += sum_token (pg * w * mask). Weights already

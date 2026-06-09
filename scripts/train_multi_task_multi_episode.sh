@@ -69,6 +69,25 @@ MODEL_NAME=$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')
 CONFIG_NAME=$(basename "$TASKS_CONFIG" .yaml | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 EXPERIMENT_NAME="gem-multi-task-${CONFIG_NAME}-${MODEL_NAME}"
 
+# Optional: route action calls to a frozen ref-model vLLM endpoint so
+# only the summarization head is trained. Set REF_MODEL_URL to the
+# OpenAI-compatible base URL (e.g. http://localhost:8765/v1); leave
+# unset to disable. REF_MODEL_NAME must match --served-model-name.
+REF_MODEL_URL="${REF_MODEL_URL:-}"
+REF_MODEL_NAME="${REF_MODEL_NAME:-ref-model}"
+REF_MODEL_ARGS=()
+if [ -n "$REF_MODEL_URL" ]; then
+    if ! curl -fsS --max-time 5 "${REF_MODEL_URL}/models" >/dev/null 2>&1; then
+        echo "[warn] REF_MODEL_URL=${REF_MODEL_URL} unreachable; continuing anyway"
+    fi
+    REF_MODEL_ARGS=(
+        "+rllm.agent.summarization.ref_model.enable=true"
+        "+rllm.agent.summarization.ref_model.base_url=${REF_MODEL_URL}"
+        "+rllm.agent.summarization.ref_model.model_name=${REF_MODEL_NAME}"
+        "+rllm.agent.summarization.ref_model.api_key=EMPTY"
+    )
+fi
+
 # Multi-episode via environment wrapper (uses AgentExecutionEngine instead of workflow)
 python scripts/train_multi_episode.py \
     data.train_batch_size=32 \
@@ -106,8 +125,14 @@ python scripts/train_multi_episode.py \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.calculate_log_probs=true \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.adv_estimator=grpo \
+    ++algorithm.rollout_correction.rollout_is=token \
+    ++algorithm.rollout_correction.rollout_is_threshold=2.0 \
+    ++algorithm.rollout_correction.bypass_mode=false \
+    ++algorithm.rollout_correction.rollout_rs=null \
+    ++algorithm.rollout_correction.rollout_is_batch_normalize=false \
     rllm.compact_filtering.enable=False \
     rllm.compact_filtering.mask_max_prompt_length_exceeded=True \
     rllm.compact_filtering.mask_max_response_length_exceeded=True \
@@ -127,5 +152,6 @@ python scripts/train_multi_episode.py \
     trainer.test_freq=10 \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=10 \
+    "${REF_MODEL_ARGS[@]}" \
     "$@"
 

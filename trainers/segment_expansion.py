@@ -192,6 +192,7 @@ def build_expanded_dataproto(
                 "prompt_tokens": traj["prompt_tokens"],
                 "response_tokens": traj["response_tokens"],
                 "response_masks": traj["response_masks"],
+                "rollout_log_probs": traj.get("rollout_log_probs"),
             }]
 
         segments_per_traj[traj_i] = len(segs)
@@ -203,6 +204,7 @@ def build_expanded_dataproto(
                 "prompt_tokens": seg["prompt_tokens"],
                 "response_tokens": seg["response_tokens"],
                 "response_masks": seg["response_masks"].to(torch.long),
+                "rollout_log_probs": seg.get("rollout_log_probs"),
                 "mask_count": mask_count,
             })
             source_idx_per_row.append(traj_i)
@@ -248,6 +250,19 @@ def build_expanded_dataproto(
             (n_rows, max_response_length), dtype=torch.float32,
         )
 
+    # rollout_log_probs (per-token vLLM logp) is only emitted when every
+    # segment carries it — verl's TIS helper reads it to compute IS weights
+    # and would produce garbage from zero-fills, so we'd rather skip the
+    # column entirely than silently corrupt the loss.
+    any_has_rollout_lp = all(
+        plan.get("rollout_log_probs") is not None for plan in seg_plans
+    )
+    rollout_log_probs: torch.Tensor | None = None
+    if any_has_rollout_lp:
+        rollout_log_probs = torch.zeros(
+            (n_rows, max_response_length), dtype=torch.float32,
+        )
+
     a_cpu = (
         None if use_per_chunk
         else advantages_per_trajectory.detach().cpu()
@@ -273,6 +288,12 @@ def build_expanded_dataproto(
         prompts[row_i] = seg_prompt
         responses[row_i] = seg_response
         response_mask[row_i] = seg_mask
+
+        if rollout_log_probs is not None:
+            seg_rl = plan["rollout_log_probs"].to(torch.float32)
+            rollout_log_probs[row_i] = _pad_1d(
+                seg_rl, max_response_length, pad_value=0, left_pad=False
+            )
 
         # input_ids = prompt | response (prompt is left-padded, response is right-padded).
         input_ids[row_i, :max_prompt_length] = seg_prompt
@@ -345,6 +366,8 @@ def build_expanded_dataproto(
     }
     if is_positive is not None:
         tensors["is_positive"] = is_positive
+    if rollout_log_probs is not None:
+        tensors["rollout_log_probs"] = rollout_log_probs
 
     # Replicate non-tensor source fields per segment row.
     non_tensors: dict[str, np.ndarray] = {}

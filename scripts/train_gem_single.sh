@@ -42,8 +42,14 @@ python scripts/train_gem_single.py \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.calculate_log_probs=true \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.adv_estimator=grpo \
+    ++algorithm.rollout_correction.rollout_is=token \
+    ++algorithm.rollout_correction.rollout_is_threshold=2.0 \
+    ++algorithm.rollout_correction.bypass_mode=false \
+    ++algorithm.rollout_correction.rollout_rs=null \
+    ++algorithm.rollout_correction.rollout_is_batch_normalize=false \
     rllm.compact_filtering.enable=False \
     rllm.compact_filtering.mask_max_prompt_length_exceeded=True \
     rllm.compact_filtering.mask_max_response_length_exceeded=True \

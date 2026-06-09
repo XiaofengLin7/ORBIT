@@ -26,8 +26,9 @@ def compute_pg_per_token(
     clip_ratio_c: float,
     is_positive: torch.Tensor | None = None,
     topr_enabled: bool = False,
+    rollout_is_weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Per-token PPO surrogate with optional TOPR positive/negative split.
+    """Per-token PPO surrogate with optional TOPR split and rollout IS correction.
 
     Mirrors verl's standard PPO clipping (cliprange_low/high + 3-way
     clip_ratio_c floor for negative advantages) and adds the TOPR branch
@@ -35,8 +36,15 @@ def compute_pg_per_token(
     plain SL-style update ``-advantages`` (no IS ratio, no clip);
     everything else falls through to the standard surrogate.
 
+    When ``rollout_is_weights`` is provided (the truncated rollout/training
+    IS correction `w_t = clamp(exp(old_log_prob - rollout_log_prob), C)`
+    computed by verl's helper), the final per-token surrogate is multiplied
+    by ``rollout_is_weights.detach()``. Matches verl's
+    ``compute_policy_loss_vanilla`` (core_algos.py:966-967): the multiplier
+    is applied **after** clipping, with no gradient flowing through it.
+
     Returns a dict with:
-        ``pg_per_token``         the surrogate (after TOPR replacement)
+        ``pg_per_token``         the surrogate (after TOPR + TIS)
         ``pg_losses1``           ``-advantages * ratio`` (unclipped term)
         ``pg_losses2``           ``-advantages * clipped_ratio``
         ``clip_pg_losses1``      ``max(pg_losses1, pg_losses2)``
@@ -75,6 +83,11 @@ def compute_pg_per_token(
         is_weight = ratio.detach()
         pg_pos_branch = -advantages * log_prob * is_weight
         pg_per_token = torch.where(is_pos_mask, pg_pos_branch, pg_per_token)
+
+    if rollout_is_weights is not None:
+        # Rollout/training importance-sampling correction. Trainer guard
+        # ensures this only fires on the GRPO path (TOPR auto-disables).
+        pg_per_token = pg_per_token * rollout_is_weights.detach()
 
     return {
         "pg_per_token": pg_per_token,

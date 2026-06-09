@@ -1449,6 +1449,59 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     # Training data assembly
     # ------------------------------------------------------------------
 
+    def _assemble_rollout_logprobs(
+        self,
+        steps: list[dict],
+        expected_len: int,
+    ) -> torch.Tensor:
+        """Build a per-token vLLM-logprob tensor parallel to ``response_tokens``.
+
+        Walks ``steps`` the same way the parent ``assemble_steps`` does and
+        emits one float per response-token position: ``step["logprobs"][j]``
+        on assistant-completion (mask=1) positions, ``0.0`` on env-message
+        gaps (mask=0). When vLLM's ``calculate_log_probs`` is False the
+        per-step ``logprobs`` list is None/empty and we fall back to zeros —
+        downstream consumers gate on the trainer-level ``rollout_is`` config,
+        so zero-filled values never reach the loss in that case.
+        """
+        initial_prompt_ids = steps[0]["prompt_ids"]
+        accumulated = list(initial_prompt_ids)
+        out: list[float] = []
+
+        for i, step in enumerate(steps):
+            current_prompt_ids = step["prompt_ids"]
+            current_completion_ids = step["completion_ids"]
+            raw_lp = step.get("logprobs") or []
+            # Coerce to exactly len(completion_ids) — pad-or-truncate with 0.0.
+            # vLLM normally returns one logp per completion id; mismatches
+            # would indicate a truncated stream and the response_mask gates
+            # them out of the loss either way.
+            if len(raw_lp) == len(current_completion_ids):
+                step_lp = list(raw_lp)
+            else:
+                step_lp = (list(raw_lp) + [0.0] * len(current_completion_ids))[
+                    : len(current_completion_ids)
+                ]
+
+            if i == 0:
+                out.extend(step_lp)
+                accumulated.extend(current_completion_ids)
+            else:
+                # Mirror parent's mismatch break — the parent will have set
+                # is_valid_trajectory=False and stopped extending response_tokens
+                # at the same step, so we stop here too.
+                if current_prompt_ids[: len(accumulated)] != accumulated:
+                    break
+                gap = len(current_prompt_ids) - len(accumulated)
+                out.extend([0.0] * gap + step_lp)
+                accumulated = list(current_prompt_ids) + list(current_completion_ids)
+
+        if len(out) < expected_len:
+            out.extend([0.0] * (expected_len - len(out)))
+        elif len(out) > expected_len:
+            out = out[:expected_len]
+        return torch.tensor(out, dtype=torch.float32)
+
     def assemble_segments(
         self,
         steps: list[dict],
@@ -1457,7 +1510,10 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     ) -> list[dict]:
         """Assemble training data as one or more segments.
 
-        Each segment is assembled via the parent's ``assemble_steps``.
+        Each segment is assembled via the parent's ``assemble_steps`` plus
+        a companion per-token ``rollout_log_probs`` tensor (vLLM-emitted,
+        used downstream for TIS correction in PPO).
+
         Summarization boundaries define the split points: the summarization
         step is the LAST step of its segment, and the next segment starts
         at the step after the boundary.
@@ -1466,16 +1522,19 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
 
         Returns:
             List of segment dicts, each with ``prompt_tokens``,
-            ``response_tokens``, ``response_masks``, ``trajectory_reward``.
+            ``response_tokens``, ``response_masks``, ``rollout_log_probs``,
+            ``trajectory_reward``.
         """
         if not summarization_boundaries:
             # No summarization — single segment.
             prompt, resp, mask, is_valid = self.assemble_steps(steps)
+            rollout_lp = self._assemble_rollout_logprobs(steps, int(resp.shape[0]))
             return [
                 {
                     "prompt_tokens": prompt,
                     "response_tokens": resp,
                     "response_masks": mask,
+                    "rollout_log_probs": rollout_lp,
                     "trajectory_reward": trajectory_reward,
                     "token_mismatch": 0.0 if is_valid else 1.0,
                 }
@@ -1491,11 +1550,13 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 continue
 
             prompt, resp, mask, is_valid = self.assemble_steps(seg_steps)
+            rollout_lp = self._assemble_rollout_logprobs(seg_steps, int(resp.shape[0]))
             segments.append(
                 {
                     "prompt_tokens": prompt,
                     "response_tokens": resp,
                     "response_masks": mask,
+                    "rollout_log_probs": rollout_lp,
                     "trajectory_reward": trajectory_reward,
                     "token_mismatch": 0.0 if is_valid else 1.0,
                 }
@@ -1511,6 +1572,7 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                     "prompt_tokens": prompt_tokens,
                     "response_tokens": torch.tensor([], dtype=torch.long),
                     "response_masks": torch.tensor([], dtype=torch.long),
+                    "rollout_log_probs": torch.tensor([], dtype=torch.float32),
                     "trajectory_reward": trajectory_reward,
                     "token_mismatch": 0.0,
                 }

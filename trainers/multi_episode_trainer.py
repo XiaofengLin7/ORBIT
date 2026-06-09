@@ -196,6 +196,76 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         # per-segment rows for the trajectory-uniform PPO loss.
         self._cached_raw_trajectories: list[dict] | None = None
 
+        # Resolve the rollout-correction (TIS) configuration. See
+        # _resolve_rollout_correction for the gating rules.
+        self._rollout_corr_config, self._effective_rollout_is = (
+            self._resolve_rollout_correction()
+        )
+
+    def _resolve_rollout_correction(self) -> tuple[Any, str | None]:
+        """Validate ``algorithm.rollout_correction`` and resolve effective TIS mode.
+
+        Returns ``(rollout_corr_config, effective_rollout_is)``:
+
+        * ``rollout_corr_config``: the OmegaConf node under
+          ``algorithm.rollout_correction`` (or ``None`` if unset).
+        * ``effective_rollout_is``: the value of ``rollout_is`` that the
+          trainer actually applies — either ``"token"`` (TIS on) or
+          ``None`` (off). When TOPR is enabled, this is forced to ``None``
+          with a single INFO log line.
+
+        Hard-raises on unsupported verl knobs (sequence-level IS, bypass
+        mode, rejection sampling, batch-normalize). The plan defers those
+        to a future iteration; failing loudly is preferable to silently
+        following an unvalidated code path.
+        """
+        rc = OmegaConf.select(self.config, "algorithm.rollout_correction", default=None)
+        if rc is None:
+            return None, None
+
+        rollout_is = rc.get("rollout_is", None)
+        if rollout_is not in (None, "token"):
+            raise ValueError(
+                "algorithm.rollout_correction.rollout_is must be null or 'token'; "
+                f"got {rollout_is!r}. Sequence-level IS is out of scope for this trainer."
+            )
+        if rc.get("bypass_mode", False):
+            raise ValueError(
+                "algorithm.rollout_correction.bypass_mode=true is not supported. "
+                "Pin bypass_mode=false (decoupled mode); only the FSDP-old PPO ratio is validated."
+            )
+        if rc.get("rollout_rs", None) is not None:
+            raise ValueError(
+                "algorithm.rollout_correction.rollout_rs is not supported "
+                f"(got {rc.get('rollout_rs')!r}). Pin rollout_rs=null; rejection sampling is deferred."
+            )
+        if rc.get("rollout_is_batch_normalize", False):
+            raise ValueError(
+                "algorithm.rollout_correction.rollout_is_batch_normalize=true is not supported. "
+                "Pin rollout_is_batch_normalize=false."
+            )
+
+        # Soft guard: TOPR + TIS is intentionally not validated. Auto-disable.
+        topr_enabled = bool(
+            OmegaConf.select(
+                self.config,
+                "rllm.advantage_method.chunk_discounted_topr.enable",
+                default=False,
+            )
+        )
+        method_name = OmegaConf.select(
+            self.config, "rllm.advantage_method.name", default="grpo"
+        )
+        topr_active = topr_enabled and method_name == "chunk_discounted_topr"
+        if rollout_is == "token" and topr_active:
+            print(
+                "[trainer] TOPR is enabled; disabling default TIS correction "
+                "(algorithm.rollout_correction.rollout_is) for this run."
+            )
+            return rc, None
+
+        return rc, rollout_is
+
     def _get_engine_class(self):
         """Return the execution engine class to use."""
         if self.summarization_config and self.summarization_config.get("enable"):
@@ -575,8 +645,45 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
                 old_log_prob_output.batch.pop("entropys")
             expanded_batch = expanded_batch.union(old_log_prob_output)
 
+            # Optional rollout/training importance-sampling correction (TIS).
+            # Gated on algorithm.rollout_correction.rollout_is=="token" and
+            # the segments carrying per-token rollout_log_probs. Verl's
+            # helper computes w_t = clamp(exp(old - rollout), max=C),
+            # attaches `rollout_is_weights` to the batch, and updates the
+            # response_mask if rejection sampling is configured (we pin RS
+            # off via _resolve_rollout_correction, so the mask is unchanged
+            # in practice).
+            tis_metrics: dict | None = None
+            if (
+                self._effective_rollout_is == "token"
+                and "rollout_log_probs" in expanded_batch.batch.keys()
+            ):
+                # Optional pre-IS debug dump: when ORBIT_TIS_DEBUG=1, print
+                # the first few mask=1 token logp pairs (vLLM rollout vs
+                # FSDP recompute) and the trailing prompt context. Used to
+                # diagnose vLLM↔FSDP logp drift (suspect weights, kv-cache,
+                # or context mismatch). Off by default.
+                if os.environ.get("ORBIT_TIS_DEBUG") == "1":
+                    self._dump_tis_debug(expanded_batch)
+                from verl.trainer.ppo.rollout_corr_helper import (
+                    compute_rollout_correction_and_add_to_batch,
+                )
+                expanded_batch, tis_metrics = compute_rollout_correction_and_add_to_batch(
+                    expanded_batch, self._rollout_corr_config
+                )
+
             # Hand off to the trajectory-uniform actor.
             actor_output = original_update_actor(expanded_batch)
+
+            # Forward the helper's rollout_corr/* metrics (clipfrac, KL,
+            # off-policy gap, etc.) into the actor's metric stream so they
+            # land on wandb alongside actor/pg_loss.
+            if tis_metrics:
+                meta = actor_output.meta_info or {}
+                existing = dict(meta.get("metrics", {}) or {})
+                existing.update(tis_metrics)
+                meta["metrics"] = existing
+                actor_output.meta_info = meta
 
             # Clear the cache so a future stale call (if anything) raises.
             self._cached_raw_trajectories = None
@@ -605,6 +712,91 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         traj_uniform_weight = response_mask.to(_torch.float32) * weight_per_row.unsqueeze(1)
         batch.batch["traj_uniform_weight"] = traj_uniform_weight
         return batch
+
+    def _dump_tis_debug(self, expanded_batch: DataProto) -> None:
+        """Print vLLM↔FSDP logp diagnostics: per-row aggregates + worst rows.
+
+        Aggregates mean/max |diff| across all valid (mask=1) positions in
+        every segment row, then prints the 3 worst rows in full plus row 0
+        for context. A healthy run shows mean |diff| < 0.02 nats and worst
+        rows clustered near the mean; a sustained large gap on specific
+        rows points to per-trajectory issues (summary vs reflection vs
+        non-summary segments behaving differently).
+        """
+        import torch as _torch
+        rlp = expanded_batch.batch.get("rollout_log_probs")
+        olp = expanded_batch.batch.get("old_log_probs")
+        if rlp is None or olp is None:
+            return
+        mask = expanded_batch.batch["response_mask"].to(rlp.device)
+        resp = expanded_batch.batch["responses"]
+        prompt = expanded_batch.batch["prompts"]
+        pad_id = self.tokenizer.pad_token_id
+
+        diff = (rlp - olp) * mask  # mask=0 positions zero-out, harmless
+        valid_counts = mask.sum(dim=-1).clamp(min=1)
+        row_mean = diff.sum(dim=-1) / valid_counts  # signed mean per row
+        row_abs_mean = diff.abs().sum(dim=-1) / valid_counts  # |diff| mean
+        row_max = diff.abs().masked_fill(mask == 0, 0).max(dim=-1).values
+
+        batch_mean_diff = (diff.sum() / mask.sum().clamp(min=1)).item()
+        batch_abs_mean = (diff.abs().sum() / mask.sum().clamp(min=1)).item()
+        n_rows = rlp.shape[0]
+        n_valid = int(mask.sum().item())
+
+        print("\n[ORBIT_TIS_DEBUG] batch summary")
+        print(f"  rows={n_rows}  total_mask1_tokens={n_valid}")
+        print(f"  signed mean(rollout - old) over all mask=1 = "
+              f"{batch_mean_diff:+.5f}")
+        print(f"  mean |diff|                                 = "
+              f"{batch_abs_mean:.5f}")
+        print(f"  per-row signed mean: min={row_mean.min().item():+.4f}  "
+              f"max={row_mean.max().item():+.4f}  median="
+              f"{row_mean.median().item():+.4f}")
+
+        def _print_row(label: str, row: int, n_head: int = 5, n_tail: int = 5):
+            valid_pos = mask[row].nonzero(as_tuple=True)[0]
+            if valid_pos.numel() == 0:
+                print(f"  [{label}] row {row}: no mask=1 positions")
+                return
+            n_valid_row = valid_pos.numel()
+            print(f"\n  [{label}] row {row}: n_valid={n_valid_row}  "
+                  f"signed_mean={row_mean[row].item():+.4f}  "
+                  f"|diff|_mean={row_abs_mean[row].item():.4f}  "
+                  f"|diff|_max={row_max[row].item():.4f}")
+            head = valid_pos[:n_head].tolist()
+            tail = valid_pos[-n_tail:].tolist() if n_valid_row > n_head else []
+            ranges = [(head, "head")]
+            if tail and tail[0] not in head:
+                ranges.append((tail, "tail"))
+            print(f"  {'pos':>5} | {'tok_id':>6} | {'rollout_lp':>11} | "
+                  f"{'old_lp':>11} | {'diff':>10}")
+            for positions, _ in ranges:
+                for p in positions:
+                    tid = int(resp[row, p].item())
+                    rl = float(rlp[row, p].item())
+                    ol = float(olp[row, p].item())
+                    print(f"  {p:>5d} | {tid:>6d} | {rl:>+11.5f} | "
+                          f"{ol:>+11.5f} | {rl - ol:>+10.5f}")
+            # Decoded prompt tail (chat template boundary inspection).
+            prompt_tokens = prompt[row].tolist()
+            first_real = next(
+                (i for i, t in enumerate(prompt_tokens) if t != pad_id),
+                len(prompt_tokens),
+            )
+            tail_n = min(24, len(prompt_tokens) - first_real)
+            ptail = prompt_tokens[len(prompt_tokens) - tail_n:]
+            try:
+                decoded = self.tokenizer.decode(ptail)
+                print(f"  prompt tail: {decoded!r}")
+            except Exception as e:
+                print(f"  prompt tail decode failed: {e}")
+
+        _print_row("ROW_0", 0)
+        # Worst 3 rows by |diff| mean.
+        worst = row_abs_mean.topk(min(3, n_rows)).indices.tolist()
+        for k, r in enumerate(worst):
+            _print_row(f"WORST_{k+1}", r)
 
     def _validate_agent(self):
         """Override validation to include environment metrics from MultiEpisodeEnv.
