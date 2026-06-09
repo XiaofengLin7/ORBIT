@@ -52,7 +52,17 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     ``env.step``).  The summarization prompt is appended to the accumulated
     token sequence like an environment message, and the summary completion
     is trained on (mask=1).
+
+    ``training_phase`` (str, default "summarizer") — set by the trainer before
+    each batch when alternating training is enabled:
+    - ``"summarizer"``: normal behavior; action tokens routed to frozen ref
+      engine (if configured), summary/reflection tokens trained (mask=1).
+    - ``"actor"``: ref engine bypassed so action tokens are trainable (mask=1);
+      summary/reflection tokens still generated for context continuity but
+      excluded from the loss (mask=0 in assemble_segments).
     """
+
+    training_phase: str = "summarizer"
 
     # ------------------------------------------------------------------
     # The full step loop
@@ -1367,46 +1377,34 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     async def _get_action_response(
         self, prompt_messages, application_id, **kwargs
     ):
-        """Route an action-generation call to the ref engine if configured.
+        """Route an action-generation call.
 
-        Token-ID fast path: when the trajectory loop has built an
-        ``accumulated_prompt_ids`` running sequence, we hand it to the ref
-        engine's ``completion`` endpoint *as token IDs* instead of letting
-        ``OpenAIEngine.get_model_response`` re-tokenize ``prompt_messages``
-        via the chat parser. This keeps the accumulator in one canonical
-        form across ref and trainable engines — without it, every ref
-        action call would replace the incremental token sequence with a
-        fresh chat-templated render of the conversation, and any
-        ID-level drift between the two encodings (special-token
-        whitespace, BOS handling) would silently propagate into the
-        next summary call's prompt.
+        Summarizer phase: actions → frozen ref engine (actor model weights).
+        Actor phase: actions → trainable engine (actor model being trained).
+
+        Token-ID fast path: when ``accumulated_prompt_ids`` is present, hand
+        the token ID list directly to ``OpenAIEngine.completion`` so neither
+        engine re-tokenizes via the chat parser. This keeps the accumulator
+        canonical across both engines.
         """
+        # In actor phase, action tokens belong to the trainable engine.
+        if getattr(self, "training_phase", "summarizer") == "actor":
+            return await self.get_model_response(
+                prompt_messages, application_id, **kwargs
+            )
         ref_engine = self._get_ref_engine()
         if ref_engine is None:
             return await self.get_model_response(
                 prompt_messages, application_id, **kwargs
             )
-        # Pull accumulated tokens out before stripping the verl-only kwarg set;
-        # we want to USE them rather than discard them.
         accumulated = kwargs.pop("accumulated_prompt_ids", None)
         ref_kwargs = {
             k: v
             for k, v in kwargs.items()
             if k not in self._VERL_ONLY_KWARGS
         }
-        # Mirror the parent ``AgentExecutionEngine`` convention: the
-        # trajectory loop already handles prompt-length budget
-        # (truncation / PROMPT_TRUNCATION breaks), so the inner rollout
-        # engine should NOT enforce again. ``OpenAIEngine`` defaults to
-        # ``enforce_max_prompt_length=True``, which would raise
-        # ``TerminationEvent`` for any prompt above the (often small)
-        # ``data.max_prompt_length`` even though the trajectory loop
-        # would have handled it. Override here.
         ref_kwargs.setdefault("enforce_max_prompt_length", False)
         if accumulated is not None:
-            # Direct completion call bypasses the chat-template re-render.
-            # OpenAIEngine.completion accepts either a string prompt or
-            # a list[int] of token IDs (openai_engine.py:157-160).
             return await ref_engine.completion(
                 list(accumulated), application_id=application_id, **ref_kwargs
             )
@@ -1417,7 +1415,23 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     async def _get_summary_response(
         self, prompt_messages, application_id, **kwargs
     ):
-        """Summaries / reflections always go through the trainable engine."""
+        """Route a summary / reflection call.
+
+        Summarizer phase: summaries → trainable engine (summarizer model being trained).
+        Actor phase: summaries → frozen ref engine (summarizer model weights).
+        """
+        if getattr(self, "training_phase", "summarizer") == "actor":
+            ref_engine = self._get_ref_engine()
+            if ref_engine is not None:
+                ref_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k not in self._VERL_ONLY_KWARGS
+                }
+                ref_kwargs.setdefault("enforce_max_prompt_length", False)
+                return await ref_engine.get_model_response(
+                    prompt_messages, application_id=application_id, **ref_kwargs
+                )
         return await self.get_model_response(
             prompt_messages, application_id, **kwargs
         )
@@ -1449,6 +1463,48 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
     # Training data assembly
     # ------------------------------------------------------------------
 
+    def _assemble_summarization_mask(
+        self,
+        steps: list[dict],
+        expected_len: int,
+    ) -> torch.Tensor:
+        """Return a bool tensor marking response-token positions that belong to
+        a summarization (or reflection) step.
+
+        Mirrors ``_assemble_rollout_logprobs`` — walks ``steps`` in the same
+        lockstep as ``assemble_steps`` and marks every completion token that
+        came from a step where ``step["is_summarization"] is True``. Gap
+        positions (env-message tokens, mask=0 by construction) are always
+        ``False``.  Used during the actor training phase to zero out
+        summary/reflection positions in ``assemble_segments``.
+        """
+        initial_prompt_ids = steps[0]["prompt_ids"]
+        accumulated = list(initial_prompt_ids)
+        flags: list[bool] = []
+
+        for i, step in enumerate(steps):
+            current_prompt_ids = step["prompt_ids"]
+            current_completion_ids = step["completion_ids"]
+            is_summ = bool(step.get("is_summarization", False))
+
+            if i == 0:
+                flags.extend([is_summ] * len(current_completion_ids))
+                accumulated.extend(current_completion_ids)
+            else:
+                if current_prompt_ids[: len(accumulated)] != accumulated:
+                    break
+                gap = len(current_prompt_ids) - len(accumulated)
+                flags.extend([False] * gap)
+                flags.extend([is_summ] * len(current_completion_ids))
+                accumulated = list(current_prompt_ids) + list(current_completion_ids)
+
+        if len(flags) < expected_len:
+            flags.extend([False] * (expected_len - len(flags)))
+        elif len(flags) > expected_len:
+            flags = flags[:expected_len]
+
+        return torch.tensor(flags, dtype=torch.bool)
+
     def assemble_segments(
         self,
         steps: list[dict],
@@ -1468,9 +1524,14 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
             List of segment dicts, each with ``prompt_tokens``,
             ``response_tokens``, ``response_masks``, ``trajectory_reward``.
         """
+        actor_phase = getattr(self, "training_phase", "summarizer") == "actor"
+
         if not summarization_boundaries:
             # No summarization — single segment.
             prompt, resp, mask, is_valid = self.assemble_steps(steps)
+            if actor_phase:
+                summ_pos = self._assemble_summarization_mask(steps, int(resp.shape[0]))
+                mask = mask * (~summ_pos).long()
             return [
                 {
                     "prompt_tokens": prompt,
@@ -1491,6 +1552,9 @@ class SummarizingAgentExecutionEngine(MultiEpisodeAsyncAgentExecutionEngine):
                 continue
 
             prompt, resp, mask, is_valid = self.assemble_steps(seg_steps)
+            if actor_phase:
+                summ_pos = self._assemble_summarization_mask(seg_steps, int(resp.shape[0]))
+                mask = mask * (~summ_pos).long()
             segments.append(
                 {
                     "prompt_tokens": prompt,

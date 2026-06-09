@@ -196,6 +196,172 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         # per-segment rows for the trajectory-uniform PPO loss.
         self._cached_raw_trajectories: list[dict] | None = None
 
+        # Alternating actor/summarizer training.
+        # When enabled, training alternates every T steps between:
+        #   "summarizer" — actor frozen (ref-routing), only summary/reflection trained
+        #   "actor"      — summarizer frozen (mask=0 on summary tokens), only actions trained
+        alt_cfg = OmegaConf.select(
+            self.config, "rllm.agent.summarization.alternating", default=None
+        )
+        self._alt_enabled: bool = bool(
+            alt_cfg is not None and alt_cfg.get("enable", False)
+        )
+        self._phase_T: int | None = (
+            int(alt_cfg.get("T", 100)) if self._alt_enabled else None
+        )
+        self._training_phase: str = (
+            str(alt_cfg.get("initial_phase", "summarizer"))
+            if self._alt_enabled
+            else "summarizer"
+        )
+        self._phase_steps_done: int = 0
+        # Option B: checkpoint swap + ref vLLM restart at each phase boundary.
+        self._alt_actor_ckpt: str | None = (
+            str(alt_cfg.get("actor_ckpt_dir", "checkpoints/alternating/actor"))
+            if self._alt_enabled else None
+        )
+        self._alt_summ_ckpt: str | None = (
+            str(alt_cfg.get("summarizer_ckpt_dir", "checkpoints/alternating/summarizer"))
+            if self._alt_enabled else None
+        )
+        self._alt_ref_vllm_cmd: str | None = (
+            str(alt_cfg.get(
+                "ref_vllm_cmd",
+                "vllm serve {ckpt} --served-model-name ref-model --port 8765 "
+                "--gpu-memory-utilization 0.5 --max-model-len 32768 "
+                "--dtype bfloat16 --enforce-eager"
+            )) if self._alt_enabled else None
+        )
+        self._alt_ref_startup_timeout: int = (
+            int(alt_cfg.get("ref_startup_timeout", 300)) if self._alt_enabled else 300
+        )
+        # Extract ref URL from the vllm_cmd (default to port 8765).
+        self._alt_ref_url: str = "http://localhost:8765"
+        if self._alt_enabled and self._alt_ref_vllm_cmd:
+            import re
+            m = re.search(r"--port\s+(\d+)", self._alt_ref_vllm_cmd)
+            if m:
+                self._alt_ref_url = f"http://localhost:{m.group(1)}"
+        self._alt_ref_proc = None  # subprocess.Popen handle for the ref vLLM
+        if self._alt_enabled:
+            print(
+                f"[alternating] enabled: T={self._phase_T}, "
+                f"initial_phase={self._training_phase}, "
+                f"actor_ckpt={self._alt_actor_ckpt}, "
+                f"summ_ckpt={self._alt_summ_ckpt}"
+            )
+
+    # ------------------------------------------------------------------
+    # Two-model alternating training helpers (Option B — checkpoint swap)
+    # ------------------------------------------------------------------
+
+    def _phase_ckpt_dir(self, phase: str) -> str:
+        """Return the checkpoint directory for the given phase."""
+        return self._alt_actor_ckpt if phase == "actor" else self._alt_summ_ckpt
+
+    def _save_phase_checkpoint(self, phase: str) -> None:
+        """Save the current FSDP model to the checkpoint directory for ``phase``."""
+        import ray
+        ckpt_dir = self._phase_ckpt_dir(phase)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        print(f"[alternating] saving {phase} checkpoint → {ckpt_dir}")
+        t0 = __import__("time").time()
+        ray.get(
+            self.actor_rollout_wg.save_checkpoint.remote(
+                ckpt_dir, None, getattr(self, "global_steps", 0)
+            )
+        )
+        print(f"[alternating] checkpoint saved in {__import__('time').time()-t0:.1f}s")
+
+    def _load_phase_checkpoint(self, phase: str) -> None:
+        """Load the checkpoint for ``phase`` into the FSDP slot (no-op if absent)."""
+        import ray
+        ckpt_dir = self._phase_ckpt_dir(phase)
+        if not os.path.isdir(ckpt_dir):
+            print(
+                f"[alternating] no {phase} checkpoint yet at {ckpt_dir}, "
+                "continuing with current FSDP weights"
+            )
+            return
+        print(f"[alternating] loading {phase} checkpoint ← {ckpt_dir}")
+        t0 = __import__("time").time()
+        ray.get(
+            self.actor_rollout_wg.load_checkpoint.remote(ckpt_dir)
+        )
+        print(f"[alternating] checkpoint loaded in {__import__('time').time()-t0:.1f}s")
+
+    def _restart_ref_vllm(self, ckpt_path: str) -> None:
+        """Kill the current ref vLLM process and restart it with ``ckpt_path`` weights.
+
+        Substitutes ``{ckpt}`` in ``self._alt_ref_vllm_cmd`` with ``ckpt_path``,
+        launches via subprocess, then polls ``GET /v1/models`` until the server
+        responds or ``ref_startup_timeout`` seconds elapse.
+        """
+        import subprocess, time, urllib.request
+
+        # Kill any previously tracked process.
+        if self._alt_ref_proc is not None:
+            try:
+                self._alt_ref_proc.terminate()
+                self._alt_ref_proc.wait(timeout=30)
+            except Exception as e:
+                print(f"[alternating] warning: ref vLLM termination: {e}")
+            self._alt_ref_proc = None
+
+        cmd = self._alt_ref_vllm_cmd.format(ckpt=ckpt_path)
+        print(f"[alternating] starting ref vLLM: {cmd}")
+        self._alt_ref_proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+        # Wait until health endpoint responds.
+        health_url = f"{self._alt_ref_url}/v1/models"
+        deadline = time.time() + self._alt_ref_startup_timeout
+        last_exc = None
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(health_url, timeout=3)
+                print("[alternating] ref vLLM ready")
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(5)
+        raise RuntimeError(
+            f"[alternating] ref vLLM at {health_url} did not become ready within "
+            f"{self._alt_ref_startup_timeout}s. Last error: {last_exc}"
+        )
+
+    def _do_phase_switch(self) -> None:
+        """Execute a full phase switch: save → restart ref vLLM → load → update engine."""
+        outgoing = self._training_phase
+        incoming = "actor" if outgoing == "summarizer" else "summarizer"
+        print(f"[alternating] phase switch: {outgoing} → {incoming}")
+        t_start = __import__("time").time()
+
+        # 1. Save the outgoing model so it can serve as the frozen ref.
+        self._save_phase_checkpoint(outgoing)
+
+        # 2. Restart the ref vLLM with the outgoing model's weights.
+        self._restart_ref_vllm(self._phase_ckpt_dir(outgoing))
+
+        # 3. Invalidate the ref engine cache so the engine reconnects.
+        if hasattr(self, "agent_execution_engine") and hasattr(
+            self.agent_execution_engine, "_ref_engine_cache"
+        ):
+            del self.agent_execution_engine._ref_engine_cache
+
+        # 4. Load the incoming model's latest checkpoint (weights + optimizer).
+        #    The training vLLM will pick up the new weights via verl's normal
+        #    wake + update_weights cycle at the start of the next rollout batch.
+        self._load_phase_checkpoint(incoming)
+
+        self._training_phase = incoming
+        self._phase_steps_done = 0
+        print(
+            f"[alternating] switch complete in "
+            f"{__import__('time').time() - t_start:.1f}s, now in {incoming} phase"
+        )
+
     def _get_engine_class(self):
         """Return the execution engine class to use."""
         if self.summarization_config and self.summarization_config.get("enable"):
@@ -578,6 +744,18 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
             # Hand off to the trajectory-uniform actor.
             actor_output = original_update_actor(expanded_batch)
 
+            # Alternating training: count completed steps and emit phase metrics.
+            if self._alt_enabled:
+                self._phase_steps_done += 1
+                meta = actor_output.meta_info or {}
+                existing = dict(meta.get("metrics", {}) or {})
+                existing["training/phase"] = (
+                    0.0 if self._training_phase == "summarizer" else 1.0
+                )
+                existing["training/phase_steps_done"] = float(self._phase_steps_done)
+                meta["metrics"] = existing
+                actor_output.meta_info = meta
+
             # Clear the cache so a future stale call (if anything) raises.
             self._cached_raw_trajectories = None
             return actor_output
@@ -892,11 +1070,22 @@ class MultiEpisodeAgentPPOTrainer(AgentPPOTrainer):
         return final_gen_batch_output, metrics
 
     def init_envs_and_agents(self, batch):
-        """Override to track data_source and support validation env class.
+        """Override to track data_source, support validation env class, and
+        advance the alternating-training phase before each new batch.
 
         When _is_validation_mode is True and val_env_class is set, temporarily
         swaps the env_class and env_args to use the validation-specific ones.
         """
+        # Alternating phase management: check for a phase switch BEFORE the
+        # rollout so the engine uses the correct phase during trajectory
+        # collection. Phase switches only happen during training, not validation.
+        if self._alt_enabled and not self._is_validation_mode:
+            if self._phase_steps_done >= self._phase_T:
+                self._do_phase_switch()  # save → restart ref vLLM → load → flip phase
+            # Push current phase to the engine so trajectory collection uses it.
+            if hasattr(self, "agent_execution_engine"):
+                self.agent_execution_engine.training_phase = self._training_phase
+
         # Store data_source before calling parent (in case batch gets modified)
         if hasattr(batch, "non_tensor_batch"):
             batch_data_sources = batch.non_tensor_batch.get("data_source")
